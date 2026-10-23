@@ -84,7 +84,6 @@ impl LinkHandle {
         self.inner.tunnel_setup.lock().unwrap().insert(relay.to_string(), setup);
     }
 
-    #[allow(dead_code)]
     pub fn tunnel_setup(&self) -> HashMap<String, Duration> {
         self.inner.tunnel_setup.lock().unwrap().clone()
     }
@@ -277,6 +276,11 @@ impl LinkHandle {
                         }
                     }
                     Ok(SupMsg::Welcome { .. }) => {}
+                    Ok(SupMsg::Ping { ts }) => {
+                        if let Ok(json) = serde_json::to_vec(&NodeMsg::Pong { ts }) {
+                            let _ = tx.send(Envelope { seq: 0, ack: 0, json }).await;
+                        }
+                    }
                     Err(e) => tracing::warn!(error = %e, "undecodable supervisor message"),
                 }
             }

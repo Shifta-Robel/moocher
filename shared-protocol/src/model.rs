@@ -158,6 +158,9 @@ pub struct SessionInfo {
     pub verdict: Option<Verdict>,
     #[serde(default)]
     pub role: SessionRole,
+    /// Why the supervisor put it on its node.
+    #[serde(default)]
+    pub placement: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +185,28 @@ pub struct AgentInfo {
     pub errors: Vec<String>,
     #[serde(default)]
     pub labels: std::collections::BTreeMap<String, String>,
+    /// Route plan on this node: preferred route first, then failovers.
+    #[serde(default)]
+    pub routes: Vec<String>,
+}
+
+/// Provider latency over one route of one node, measured from real calls.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouteStat {
+    pub node: String,
+    pub route: String,
+    pub provider: String,
+    /// Moving average of the time to the provider's response headers.
+    #[serde(default)]
+    pub ttfb_ms: Option<f64>,
+    pub samples: u64,
+    pub errors: u64,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// via_node routes: time to set up a tunnel through the relay.
+    #[serde(default)]
+    pub tunnel_setup_ms: Option<f64>,
+    pub updated_at: Ts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +233,9 @@ pub struct NodeInfo {
     /// Expiry of the node's link certificate (remote nodes).
     #[serde(default)]
     pub cert_expires_at: Option<Ts>,
+    /// Round trip time of the node's link to the hub (moving average).
+    #[serde(default)]
+    pub link_rtt_ms: Option<f64>,
 }
 
 fn default_role() -> String {

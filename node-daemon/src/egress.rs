@@ -11,7 +11,7 @@ use crate::link::LinkHandle;
 use crate::relay::Dialer;
 use ocl_protocol::config::Route;
 use ocl_protocol::link::NodeEvent;
-use ocl_protocol::model::{now_ms, EgressIp};
+use ocl_protocol::model::{now_ms, EgressIp, RouteStat};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -23,12 +23,24 @@ pub struct Egress {
     node: String,
     clients: Mutex<HashMap<String, reqwest::Client>>,
     ips: Mutex<BTreeMap<String, EgressIp>>,
+    /// (route, provider) -> latency stats from real calls.
+    stats: Mutex<BTreeMap<(String, String), RouteStat>>,
+    stats_dirty: std::sync::atomic::AtomicBool,
 }
 
 impl Egress {
     pub fn new(cfg: ConfigStore, dialer: Option<Dialer>, link: LinkHandle) -> Egress {
         let node = cfg.get().node.name.clone();
-        Egress { cfg, dialer, link, node, clients: Mutex::new(HashMap::new()), ips: Mutex::new(BTreeMap::new()) }
+        Egress {
+            cfg,
+            dialer,
+            link,
+            node,
+            clients: Mutex::new(HashMap::new()),
+            ips: Mutex::new(BTreeMap::new()),
+            stats: Mutex::new(BTreeMap::new()),
+            stats_dirty: Default::default(),
+        }
     }
 
     /// HTTP client for a route (cached; rebuilt when the route definition changes).
@@ -58,6 +70,52 @@ impl Egress {
 
     pub fn dialer(&self) -> Option<&Dialer> {
         self.dialer.as_ref()
+    }
+
+    /// Record one provider call: time to response headers, or an error.
+    pub fn observe_call(&self, route: &str, provider: &str, ttfb: Option<Duration>, error: Option<String>) {
+        let mut m = self.stats.lock().unwrap();
+        let s = m.entry((route.to_string(), provider.to_string())).or_insert_with(|| RouteStat {
+            node: self.node.clone(),
+            route: route.into(),
+            provider: provider.into(),
+            ttfb_ms: None,
+            samples: 0,
+            errors: 0,
+            last_error: None,
+            tunnel_setup_ms: None,
+            updated_at: 0,
+        });
+        match (ttfb, error) {
+            (Some(t), _) => {
+                let ms = t.as_secs_f64() * 1000.0;
+                // Exponential moving average; the first sample sets it.
+                s.ttfb_ms = Some(s.ttfb_ms.map_or(ms, |a| a * 0.8 + ms * 0.2));
+                s.samples += 1;
+            }
+            (None, e) => {
+                s.errors += 1;
+                s.last_error = e;
+            }
+        }
+        s.updated_at = now_ms();
+        self.stats_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Route stats with relay tunnel setup times; `None` if nothing changed.
+    pub fn take_stats(&self) -> Option<Vec<RouteStat>> {
+        if !self.stats_dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let snap = self.cfg.get();
+        let setup = self.link.tunnel_setup();
+        let mut out: Vec<RouteStat> = self.stats.lock().unwrap().values().cloned().collect();
+        for s in &mut out {
+            if let Some(Route::ViaNode { node }) = snap.route(&s.route) {
+                s.tunnel_setup_ms = setup.get(&node).map(|d| d.as_secs_f64() * 1000.0);
+            }
+        }
+        Some(out)
     }
 
     /// Public IP of a route, if known.

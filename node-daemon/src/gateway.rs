@@ -277,8 +277,12 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
         };
         g.quotas.record_request(&target, name, &g.id, &limits);
         *g.prev.lock().unwrap() = Some((target.clone(), name.clone(), usage_total));
+        let sent = std::time::Instant::now();
         let upstream = match client.request(method.clone(), &url).headers(headers.clone()).body(body.clone()).send().await {
-            Ok(r) => r,
+            Ok(r) => {
+                g.egress.observe_call(name, &provider, Some(sent.elapsed()), None);
+                r
+            }
             Err(e) => {
                 let mut why = error_chain(&e.without_url());
                 if let (Route::ViaNode { node }, Some(d)) = (&route, g.egress.dialer()) {
@@ -287,6 +291,7 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
                     }
                 }
                 tracing::warn!(agent = %g.agent, provider, route = %name, error = %why, "upstream request failed");
+                g.egress.observe_call(name, &provider, None, Some(why.clone()));
                 skipped.push(format!("{name}: upstream unreachable: {why}"));
                 all_exhausted = false;
                 continue;
@@ -416,6 +421,12 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef { name: "read_inbox", desc: "Read and clear messages left for you by other sessions.", schema: || obj(json!({}), &[]), coordinator: false },
     ToolDef { name: "list_agents", desc: "List agent profiles available in the cluster (name, description, model, node).", schema: || obj(json!({}), &[]), coordinator: false },
+    ToolDef {
+        name: "list_nodes",
+        desc: "List cluster machines: free slots, agents, link latency, egress IPs, provider allowances left (with reset times) and provider latency per route. Use it to choose where to start an agent (spawn_agent's node).",
+        schema: || obj(json!({}), &[]),
+        coordinator: false,
+    },
     ToolDef { name: "list_sessions", desc: "List live sessions with status, todos progress and token usage.", schema: || obj(json!({}), &[]), coordinator: false },
     ToolDef {
         name: "session_status",
@@ -469,6 +480,7 @@ fn to_call(name: &str, a: &Value) -> Result<AgentCall, String> {
         },
         "read_inbox" => AgentCall::Inbox,
         "list_agents" => AgentCall::ListAgents,
+        "list_nodes" => AgentCall::ListNodes,
         "list_sessions" => AgentCall::ListSessions,
         "session_status" => AgentCall::SessionStatus { session: s("session")? },
         "spawn_agent" => AgentCall::Spawn {

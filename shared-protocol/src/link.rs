@@ -19,6 +19,8 @@ pub enum NodeMsg {
     Request { req: u64, from_session: String, call: AgentCall },
     /// Certificate renewal; answered with `SupMsg::Reply { value: {cert_pem, expires_at} }`.
     RenewCert { req: u64, csr_pem: String },
+    /// Answer to `SupMsg::Ping` (link round-trip time).
+    Pong { ts: i64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +53,8 @@ pub enum NodeEvent {
     Egress { ips: Vec<EgressIp> },
     /// Current quota buckets of this node (full snapshot, debounced).
     Quotas { buckets: Vec<QuotaBucket> },
+    /// Provider latency per route (full snapshot, at most once a minute).
+    RouteStats { stats: Vec<RouteStat> },
 }
 
 /// Supervisor -> node.
@@ -67,6 +71,8 @@ pub enum SupMsg {
     Command { req: u64, cmd: NodeCommand },
     /// Reply to a node `Request`.
     Reply { req: u64, ok: bool, #[serde(default)] value: serde_json::Value, #[serde(default)] error: Option<String> },
+    /// Link round-trip measurement; the node answers `Pong { ts }` at once.
+    Ping { ts: i64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +127,8 @@ pub enum AgentCall {
     Send { to: String, text: String, #[serde(default)] delivery: Delivery },
     Inbox,
     ListAgents,
+    /// Nodes with free slots, egress IPs, provider allowances and latency.
+    ListNodes,
     ListSessions,
     SessionStatus { session: String },
     // Coordinator-only below.

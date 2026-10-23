@@ -6,6 +6,7 @@ mod link;
 mod nodes;
 mod orch;
 mod pki;
+mod placement;
 mod quotas;
 mod state;
 mod tlslink;

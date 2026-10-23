@@ -221,6 +221,19 @@ async fn run(dir: PathBuf) -> Result<()> {
             }
         });
     }
+    // Provider latency per route: report changes once a minute.
+    {
+        let (egress, link) = (egress.clone(), link.clone());
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                iv.tick().await;
+                if let Some(stats) = egress.take_stats() {
+                    link.emit(NodeEvent::RouteStats { stats });
+                }
+            }
+        });
+    }
     // Quota buckets: persist and report changes (at most every 3 s).
     {
         let (quotas, cfg, link) = (quotas.clone(), cfg.clone(), link.clone());

@@ -79,6 +79,7 @@ impl Db {
              CREATE TABLE IF NOT EXISTS node_auth(node TEXT PRIMARY KEY, status TEXT NOT NULL, role TEXT NOT NULL, labels TEXT NOT NULL, updated_at INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS allowed_sources(cidr TEXT PRIMARY KEY, note TEXT NOT NULL, added_by TEXT NOT NULL, added_at INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS egress_ips(node TEXT NOT NULL, route TEXT NOT NULL, info TEXT NOT NULL, PRIMARY KEY(node, route));
+             CREATE TABLE IF NOT EXISTS route_stats(node TEXT NOT NULL, route TEXT NOT NULL, provider TEXT NOT NULL, info TEXT NOT NULL, PRIMARY KEY(node, route, provider));
              CREATE TABLE IF NOT EXISTS quota_buckets(node TEXT NOT NULL, provider TEXT NOT NULL, scope_id TEXT NOT NULL, kind TEXT NOT NULL,
                 info TEXT NOT NULL, PRIMARY KEY(node, provider, scope_id, kind));",
         )?;
@@ -259,6 +260,21 @@ impl Db {
 
     pub fn egress(&self) -> Vec<EgressIp> {
         self.json_rows("SELECT info FROM egress_ips ORDER BY node, route", [])
+    }
+
+    pub fn put_route_stats(&self, node: &str, stats: &[RouteStat]) -> Result<()> {
+        let mut c = self.c.lock().unwrap();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM route_stats WHERE node=?1", params![node])?;
+        for s in stats {
+            tx.execute("INSERT INTO route_stats(node,route,provider,info) VALUES(?1,?2,?3,?4)", params![node, s.route, s.provider, serde_json::to_string(s)?])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn route_stats(&self) -> Vec<RouteStat> {
+        self.json_rows("SELECT info FROM route_stats ORDER BY node, route, provider", [])
     }
 
     /// Replace a node's quota buckets (full snapshot).

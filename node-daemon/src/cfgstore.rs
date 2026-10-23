@@ -54,6 +54,10 @@ impl Snapshot {
                 config_hash: a.hash.clone(),
                 errors: a.errors.clone(),
                 labels: a.cfg.labels.clone(),
+                routes: {
+                    let p = self.route_plan(&a.cfg);
+                    std::iter::once(p.prefer).chain(p.failover).collect()
+                },
             })
             .collect()
     }

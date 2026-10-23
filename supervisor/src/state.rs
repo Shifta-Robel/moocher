@@ -128,6 +128,7 @@ impl Sup {
                 step: None,
                 verdict: None,
                 role: SessionRole::Worker,
+                placement: None,
             },
         };
         self.save_session(&info);
@@ -153,33 +154,6 @@ impl Sup {
         self.db.sessions_on(node).iter().filter(|s| s.report.state.is_live()).count() as u32
     }
 
-    /// Nodes that can run `agent` now, least loaded first.
-    pub fn candidates(&self, agent: &str) -> Vec<String> {
-        let mut c: Vec<(u32, String)> = self
-            .db
-            .nodes()
-            .into_iter()
-            .filter(|n| n.connected && self.nodes.connected(&n.name))
-            .filter(|n| n.agents.iter().any(|a| a.name == agent && a.secret_ok && a.errors.is_empty()))
-            .map(|n| (self.live_on(&n.name), n))
-            .filter(|(live, n)| *live < n.max_sessions)
-            .map(|(live, n)| (live, n.name))
-            .collect();
-        c.sort();
-        c.into_iter().map(|(_, n)| n).collect()
-    }
-
-    pub fn place(&self, agent: &str, hint: Option<&str>) -> Result<String> {
-        let c = self.candidates(agent);
-        if let Some(h) = hint {
-            if c.iter().any(|n| n == h) {
-                return Ok(h.to_string());
-            }
-            bail!("node {h} cannot run agent {agent} right now (not connected, agent missing/misconfigured, or at capacity)");
-        }
-        c.into_iter().next().ok_or_else(|| anyhow!("no connected node can run agent {agent:?} right now"))
-    }
-
     // ---------------------------------------------------------- sessions
 
     pub async fn spawn(&self, actor: &Actor, o: SpawnOpts) -> Result<SessionInfo> {
@@ -195,7 +169,11 @@ impl Sup {
     }
 
     async fn spawn_inner(&self, o: &SpawnOpts) -> Result<SessionInfo> {
-        let node = self.place(&o.agent, o.node.as_deref())?;
+        let near = crate::placement::Near {
+            parent_node: o.parent.as_deref().and_then(|p| self.db.session(p)).map(|p| p.report.node),
+            workspace: o.workspace.as_ref().filter(|w| w.mode == WorkspaceMode::Shared).and_then(|w| w.name.clone()),
+        };
+        let (node, why) = self.place(&o.agent, o.node.as_deref(), &near)?;
         let id = ocl_protocol::new_id("s");
         let now = now_ms();
         let info = SessionInfo {
@@ -222,6 +200,7 @@ impl Sup {
             step: o.step.clone(),
             verdict: None,
             role: o.role,
+            placement: Some(why),
         };
         self.save_session(&info);
         let spec = SpawnSpec {
@@ -340,6 +319,9 @@ impl Sup {
                 self.log("node.egress", Some(node), None, json!({"ips": summary}));
                 let _ = self.stream.send(StreamEvent::Egress { node: node.into(), ips });
             }
+            NodeEvent::RouteStats { stats } => {
+                let _ = self.db.put_route_stats(node, &stats);
+            }
             NodeEvent::Quotas { buckets } => {
                 let _ = self.db.put_quotas(node, &buckets);
                 let _ = self.stream.send(StreamEvent::Quotas { node: node.into() });
@@ -386,6 +368,7 @@ impl Sup {
                 }
                 Ok(Value::Array(out))
             }
+            AgentCall::ListNodes => Ok(self.nodes_for_agents()),
             AgentCall::ListSessions => Ok(Value::Array(self.db.sessions(false).iter().filter(|s| s.report.state.is_live()).map(session_brief).collect())),
             AgentCall::SessionStatus { session } => {
                 let s = self.session(&session)?;
@@ -461,6 +444,7 @@ impl Sup {
         let mut nodes = self.db.nodes();
         for n in &mut nodes {
             n.running = self.live_on(&n.name);
+            n.link_rtt_ms = self.nodes.rtt(&n.name);
         }
         nodes
     }

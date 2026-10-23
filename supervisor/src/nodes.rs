@@ -164,6 +164,7 @@ impl Sup {
             enrollment: status.into(),
             observed_ip: None,
             cert_expires_at: None,
+            link_rtt_ms: None,
         });
         n.enrollment = status.into();
         n.role = role.as_str().into();

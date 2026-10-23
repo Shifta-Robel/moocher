@@ -178,6 +178,8 @@ pub struct SupervisorConfig {
     pub public_names: Vec<String>,
     #[serde(default)]
     pub enrollment: EnrollmentConfig,
+    #[serde(default)]
+    pub placement: PlacementWeights,
     /// Database and artifact directory. Default: `<config dir>/supervisor`.
     #[serde(default)]
     pub data_dir: Option<PathBuf>,
@@ -196,10 +198,54 @@ impl Default for SupervisorConfig {
             link_listen: None,
             public_names: vec![],
             enrollment: EnrollmentConfig::default(),
+            placement: PlacementWeights::default(),
             data_dir: None,
             tasks: TaskSchedulerConfig::default(),
             disconnect_grace_secs: default_grace(),
         }
+    }
+}
+
+/// Weights of the placement score (PHASE1_5 §5). Each part is 0..1.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementWeights {
+    /// Free session slots.
+    #[serde(default = "w_capacity")]
+    pub capacity: f64,
+    /// Provider allowance left on the node's routes.
+    #[serde(default = "w_quota")]
+    pub quota: f64,
+    /// Provider latency over the node's preferred route.
+    #[serde(default = "w_latency")]
+    pub latency: f64,
+    /// Same node as the parent session or the shared workspace.
+    #[serde(default = "w_locality")]
+    pub locality: f64,
+    /// Round trip time between hub and node.
+    #[serde(default = "w_link")]
+    pub link: f64,
+}
+
+fn w_capacity() -> f64 {
+    0.30
+}
+fn w_quota() -> f64 {
+    0.25
+}
+fn w_latency() -> f64 {
+    0.20
+}
+fn w_locality() -> f64 {
+    0.15
+}
+fn w_link() -> f64 {
+    0.10
+}
+
+impl Default for PlacementWeights {
+    fn default() -> Self {
+        PlacementWeights { capacity: w_capacity(), quota: w_quota(), latency: w_latency(), locality: w_locality(), link: w_link() }
     }
 }
 

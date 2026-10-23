@@ -29,6 +29,8 @@ pub struct NodeConn {
     /// Set by `Registry::disconnect` to end the stream with a reason.
     close: tokio::sync::Notify,
     close_reason: Mutex<Option<String>>,
+    /// Link round-trip time, moving average (ms).
+    rtt: Mutex<Option<f64>>,
 }
 
 #[derive(Default)]
@@ -76,6 +78,10 @@ impl Registry {
             *c.close_reason.lock().unwrap() = Some(reason.to_string());
             c.close.notify_one();
         }
+    }
+
+    pub fn rtt(&self, node: &str) -> Option<f64> {
+        self.conns.lock().unwrap().get(node).and_then(|c| *c.rtt.lock().unwrap())
     }
 
     /// Connected remote nodes and their peer addresses.
@@ -231,6 +237,7 @@ impl NodeLink for LinkService {
             peer: peer.as_ref().map(|p| p.ip()),
             close: tokio::sync::Notify::new(),
             close_reason: Mutex::new(None),
+            rtt: Mutex::new(None),
         });
         if let Some(old) = sup.nodes.conns.lock().unwrap().insert(node.clone(), conn.clone()) {
             tracing::warn!(node = %node, "replacing existing connection");
@@ -246,8 +253,13 @@ impl NodeLink for LinkService {
             let mut acked = last_seq;
             let mut processed = last_seq;
             let mut ack_tick = tokio::time::interval(Duration::from_millis(500));
+            let mut ping_tick = tokio::time::interval(Duration::from_secs(15));
             loop {
                 tokio::select! {
+                    _ = ping_tick.tick() => {
+                        let ping = serde_json::to_vec(&SupMsg::Ping { ts: now_ms() }).unwrap();
+                        if tx.send(Ok(Envelope { seq: 0, ack: 0, json: ping })).await.is_err() { break; }
+                    }
                     msg = inbound.next() => {
                         let Some(Ok(env)) = msg else { break };
                         let parsed: NodeMsg = match serde_json::from_slice(&env.json) {
@@ -288,6 +300,11 @@ impl NodeLink for LinkService {
                                     Err(e) => SupMsg::Reply { req, ok: false, value: Value::Null, error: Some(format!("{e:#}")) },
                                 };
                                 let _ = tx.send(Ok(Envelope { seq: 0, ack: 0, json: serde_json::to_vec(&reply).unwrap() })).await;
+                            }
+                            NodeMsg::Pong { ts } => {
+                                let ms = (now_ms() - ts) as f64;
+                                let mut r = conn.rtt.lock().unwrap();
+                                *r = Some(r.map_or(ms, |a| a * 0.7 + ms * 0.3));
                             }
                             NodeMsg::Hello(_) => {}
                         }
@@ -346,6 +363,7 @@ impl Sup {
             enrollment: adm.enrollment.clone(),
             observed_ip: adm.observed_ip.clone(),
             cert_expires_at: adm.cert_expires_at,
+            link_rtt_ms: None,
         };
         let _ = self.db.put_node(&info);
         self.publish_node(info);

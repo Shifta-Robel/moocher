@@ -338,14 +338,15 @@ fn print_sessions(ss: &[SessionInfo]) {
 }
 
 fn print_nodes(nodes: &[NodeInfo]) {
-    println!("{:<12} {:<8} {:<9} {:<13} {:<16} {:>8}  {}", "NODE", "ROLE", "ENROLL", "LINK", "IP", "SESSIONS", "AGENTS");
+    println!("{:<12} {:<8} {:<9} {:<13} {:>6} {:<16} {:>8}  {}", "NODE", "ROLE", "ENROLL", "LINK", "RTT", "IP", "SESSIONS", "AGENTS");
     for n in nodes {
         println!(
-            "{:<12} {:<8} {:<9} {:<13} {:<16} {:>8}  {}",
+            "{:<12} {:<8} {:<9} {:<13} {:>6} {:<16} {:>8}  {}",
             n.name,
             n.role,
             n.enrollment,
             if n.connected { "connected".to_string() } else { format!("down {}", ago(n.last_seen)) },
+            n.link_rtt_ms.map(|r| format!("{r:.0}ms")).unwrap_or("-".into()),
             n.observed_ip.as_deref().unwrap_or("-"),
             format!("{}/{}", n.running, n.max_sessions),
             n.agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
@@ -414,6 +415,11 @@ fn print_tasks(ts: &[Task]) {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // `ocl events | head` should just stop, like other CLI tools, instead of
+    // panicking on a closed stdout.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     match run(Cli::parse()).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
@@ -614,6 +620,9 @@ async fn run(cli: Cli) -> Result<()> {
             let s: SessionInfo = serde_json::from_value(v)?;
             let r = &s.report;
             println!("{} · agent {} · node {} · {}", r.id, r.agent, r.node, r.state.as_str());
+            if let Some(p) = &s.placement {
+                println!("placed: {p}");
+            }
             println!("model {}  workspace {}", r.model.as_deref().unwrap_or("-"), r.workspace.as_deref().unwrap_or("-"));
             println!(
                 "tokens in {} out {} reasoning {} cache r/w {}/{}  cost ${:.4}",
