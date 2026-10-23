@@ -100,6 +100,11 @@ pub fn router(sup: Arc<Sup>) -> Router {
         .route("/nodes/{name}", axum::routing::delete(forget_node))
         .route("/nodes/{name}/approve", post(approve_node))
         .route("/nodes/{name}/revoke", post(revoke_node))
+        .route("/nodes/{name}/routes", post(route_override))
+        .route("/nodes/{name}/probe", post(probe_egress))
+        .route("/quotas", get(quotas))
+        .route("/quotas/override", post(quota_override))
+        .route("/egress", get(egress))
         .route("/allowed-sources", get(allowed_sources).post(add_allowed_source))
         .route("/allowed-sources/remove", post(remove_allowed_source))
         .route("/agents", get(agents))
@@ -179,6 +184,30 @@ async fn remove_allowed_source(State(sup): S, Extension(c): Extension<Caller>, J
     c.need(Scope::Admin)?;
     let dropped = sup.allowlist_remove(&c.actor(), &r.source)?;
     Ok(Json(json!({"ok": true, "disconnected": dropped})))
+}
+
+async fn quotas(State(sup): S) -> Json<Vec<QuotaView>> {
+    Json(sup.quota_views())
+}
+
+async fn egress(State(sup): S) -> Json<EgressView> {
+    Json(sup.egress_view())
+}
+
+async fn quota_override(State(sup): S, Extension(c): Extension<Caller>, Json(r): Json<QuotaOverrideRequest>) -> R<Value> {
+    c.need(Scope::Operate)?;
+    Ok(Json(sup.set_quota_override(&c.actor(), r).await?))
+}
+
+async fn route_override(State(sup): S, Extension(c): Extension<Caller>, Path(name): Path<String>, Json(r): Json<RouteOverrideRequest>) -> R<Value> {
+    c.need(Scope::Operate)?;
+    sup.set_route_override(&c.actor(), &name, r).await?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn probe_egress(State(sup): S, Extension(c): Extension<Caller>, Path(name): Path<String>) -> R<Value> {
+    c.need(Scope::Operate)?;
+    Ok(Json(sup.probe_egress(&c.actor(), &name).await?))
 }
 
 async fn agents(State(sup): S) -> Json<Value> {

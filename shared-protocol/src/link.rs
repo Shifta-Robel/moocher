@@ -47,14 +47,23 @@ pub enum NodeEvent {
     Agents { agents: Vec<AgentInfo> },
     /// Fine-grained activity for the event log (tool calls, permission asks...).
     Activity { session: String, kind: String, detail: serde_json::Value },
+    /// Egress IP per route (on change).
+    Egress { ips: Vec<EgressIp> },
+    /// Current quota buckets of this node (full snapshot, debounced).
+    Quotas { buckets: Vec<QuotaBucket> },
 }
 
 /// Supervisor -> node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum SupMsg {
-    /// Reply to `Hello`: the highest event seq already persisted from this node.
-    Welcome { last_seq: u64 },
+    /// Reply to `Hello`: the highest event seq already persisted from this node,
+    /// and (remote nodes) the source address the hub sees for the link.
+    Welcome {
+        last_seq: u64,
+        #[serde(default)]
+        observed_ip: Option<String>,
+    },
     Command { req: u64, cmd: NodeCommand },
     /// Reply to a node `Request`.
     Reply { req: u64, ok: bool, #[serde(default)] value: serde_json::Value, #[serde(default)] error: Option<String> },
@@ -92,6 +101,17 @@ pub enum NodeCommand {
     Exec { session: String, command: String, timeout_secs: u64 },
     /// Relay nodes: connect to `host:port`, then open a Tunnel RPC with `Accept { id }`.
     OpenTunnel { id: String, host: String, port: u16, from: String },
+    /// Live change written to the node's overrides.yaml (`None` clears it).
+    SetRoute { agent: String, route: Option<crate::config::RouteSpec>, by: String },
+    /// Add/replace a quota override (matched on provider + scope_id); `clear` removes it.
+    SetQuota {
+        #[serde(rename = "override")]
+        ov: crate::config::QuotaOverride,
+        #[serde(default)]
+        clear: bool,
+    },
+    /// Re-probe egress IPs now.
+    ProbeEgress,
 }
 
 /// Cluster tools available to agents over MCP. `from_session` is added by the node.

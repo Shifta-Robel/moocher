@@ -495,7 +495,7 @@ impl Sup {
             return;
         }
         // Children still working? Then the coordinator is just waiting for them.
-        let busy_children = self.db.sessions(false).iter().any(|c| c.parent.as_deref() == Some(&s.report.id) && matches!(c.report.state, SessionState::Running | SessionState::Starting | SessionState::Blocked));
+        let busy_children = self.db.sessions(false).iter().any(|c| c.parent.as_deref() == Some(&s.report.id) && matches!(c.report.state, SessionState::Running | SessionState::Starting | SessionState::Blocked | SessionState::Parked));
         if busy_children && error.is_none() {
             return;
         }
@@ -537,7 +537,7 @@ impl Sup {
                 started += 1;
             }
         }
-        let busy = self.db.sessions(false).iter().any(|s| matches!(s.report.state, SessionState::Running | SessionState::Starting | SessionState::Blocked));
+        let busy = self.db.sessions(false).iter().any(|s| matches!(s.report.state, SessionState::Running | SessionState::Starting | SessionState::Blocked | SessionState::Parked));
         let now = now_ms();
         if busy || running + started > 0 {
             *idle_since = None;

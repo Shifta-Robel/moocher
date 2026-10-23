@@ -37,6 +37,9 @@ struct Inner {
     channel: Mutex<Option<tonic::transport::Channel>>,
     /// Latest tunnel setup time per relay node (link metrics).
     tunnel_setup: Mutex<HashMap<String, Duration>>,
+    /// Source address the hub sees for our link (remote nodes).
+    observed_ip: Mutex<Option<String>>,
+    pub ip_changed: Notify,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
     next_req: AtomicU64,
     wake: Notify,
@@ -51,6 +54,8 @@ impl LinkHandle {
                 tx: Mutex::new(None),
                 channel: Mutex::new(None),
                 tunnel_setup: Mutex::new(HashMap::new()),
+                observed_ip: Mutex::new(None),
+                ip_changed: Notify::new(),
                 pending: Mutex::new(HashMap::new()),
                 next_req: AtomicU64::new(1),
                 wake: Notify::new(),
@@ -64,6 +69,15 @@ impl LinkHandle {
             return None;
         }
         self.inner.channel.lock().unwrap().clone()
+    }
+
+    pub fn observed_ip(&self) -> Option<String> {
+        self.inner.observed_ip.lock().unwrap().clone()
+    }
+
+    /// Resolves when the hub reports a different source address for us.
+    pub async fn ip_changed(&self) {
+        self.inner.ip_changed.notified().await
     }
 
     pub fn note_tunnel(&self, relay: &str, setup: Duration) {
@@ -176,9 +190,18 @@ impl LinkHandle {
 
         // Expect Welcome first.
         let first = inbound.message().await?.ok_or_else(|| anyhow!("stream closed before welcome"))?;
-        let SupMsg::Welcome { last_seq } = serde_json::from_slice(&first.json)? else {
+        let SupMsg::Welcome { last_seq, observed_ip } = serde_json::from_slice(&first.json)? else {
             bail!("expected welcome");
         };
+        let ip_changed = {
+            let mut cur = self.inner.observed_ip.lock().unwrap();
+            let changed = *cur != observed_ip;
+            *cur = observed_ip;
+            changed
+        };
+        if ip_changed {
+            self.inner.ip_changed.notify_one();
+        }
         self.inner.store.outbox_ack(last_seq)?;
         *self.inner.tx.lock().unwrap() = Some(tx.clone());
         self.inner.connected.store(true, Ordering::Relaxed);

@@ -17,6 +17,8 @@ pub enum SessionState {
     Running,
     /// Waiting on a permission/question reply.
     Blocked,
+    /// Waiting for a provider allowance to reset (every route exhausted).
+    Parked,
     Error,
     Stopped,
     /// Node disconnected; metadata retained.
@@ -27,7 +29,7 @@ pub enum SessionState {
 
 impl SessionState {
     pub fn is_live(self) -> bool {
-        matches!(self, SessionState::Starting | SessionState::Idle | SessionState::Running | SessionState::Blocked)
+        matches!(self, SessionState::Starting | SessionState::Idle | SessionState::Running | SessionState::Blocked | SessionState::Parked)
     }
     pub fn as_str(self) -> &'static str {
         match self {
@@ -35,6 +37,7 @@ impl SessionState {
             SessionState::Idle => "idle",
             SessionState::Running => "running",
             SessionState::Blocked => "blocked",
+            SessionState::Parked => "parked",
             SessionState::Error => "error",
             SessionState::Stopped => "stopped",
             SessionState::Unreachable => "unreachable",
@@ -224,6 +227,55 @@ pub enum Delivery {
     Queue,
     /// Store in the session's mailbox; the agent pulls it with `inbox`.
     Inbox,
+}
+
+// ------------------------------------------------------------ egress & quota
+
+/// The public IP a route's traffic leaves from, as last observed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EgressIp {
+    pub node: String,
+    pub route: String,
+    #[serde(default)]
+    pub ip: Option<String>,
+    /// `hub` (source address of the node's link), `echo` (an ip_echo URL) or `unknown`.
+    pub source: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub observed_at: Ts,
+}
+
+/// One usage counter: a provider allowance for one IP, key or account.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuotaBucket {
+    pub provider: String,
+    /// `ip`, `key` or `account`.
+    pub scope: String,
+    /// The IP, `key:<hash>` or `account:<label>`.
+    pub scope_id: String,
+    /// `requests` or `tokens`.
+    pub kind: String,
+    #[serde(default)]
+    pub limit: Option<u64>,
+    /// Used in the current window, counted by keyproxy.
+    pub used: u64,
+    #[serde(default)]
+    pub remaining: Option<u64>,
+    #[serde(default)]
+    pub resets_at: Option<Ts>,
+    pub exhausted: bool,
+    /// Where `remaining`/`resets_at` came from: `header`, `429`, `config`, `override`, `counted`.
+    pub source: String,
+    #[serde(default)]
+    pub window: Option<String>,
+    /// Node that reported it (the supervisor merges buckets across nodes).
+    pub node: String,
+    #[serde(default)]
+    pub routes: Vec<String>,
+    /// Sessions that used the bucket in the last 10 minutes.
+    #[serde(default)]
+    pub sessions: Vec<String>,
+    pub updated_at: Ts,
 }
 
 // ------------------------------------------------------------------- tasks

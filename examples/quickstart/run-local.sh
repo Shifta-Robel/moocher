@@ -110,6 +110,13 @@ for _ in $(seq 1 80); do
   [ "$st" != running ] && [ "$st" != queued ] && ! grep -q Running <<<"$run" && break
 done
 
+# A finished task stops its sessions a moment later (after the coordinator's reply).
+for _ in $(seq 1 15); do
+  live=$($O sessions --json | python3 -c 'import sys,json;print(sum(1 for s in json.load(sys.stdin) if s["state"] in ("starting","idle","running","blocked","parked")))')
+  [ "$live" = 0 ] && break
+  sleep 1
+done
+
 say "results"
 $O workflow runs | sed -n 1p
 $O task show "$TASK" --json | python3 -c 'import sys,json;t=json.load(sys.stdin);print("task #%s: %s - %s" % (t["id"], t["status"], t["result"]))'

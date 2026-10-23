@@ -238,7 +238,7 @@ impl NodeLink for LinkService {
         }
         let last_seq = sup.db.node_seq(&node);
         sup.on_hello(&hello, &admission);
-        let welcome = serde_json::to_vec(&SupMsg::Welcome { last_seq }).unwrap();
+        let welcome = serde_json::to_vec(&SupMsg::Welcome { last_seq, observed_ip: admission.observed_ip.clone() }).unwrap();
         let _ = tx.send(Ok(Envelope { seq: 0, ack: 0, json: welcome })).await;
         tracing::info!(node = %node, last_seq, sessions = hello.sessions.len(), peer = ?admission.observed_ip, "node attached");
 

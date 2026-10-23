@@ -29,8 +29,8 @@ use tokio::task::JoinHandle;
 
 pub struct Manager {
     pub cfg: ConfigStore,
-    /// `via_node` routes go through this local SOCKS5 entry point.
-    pub dialer: Option<crate::relay::Dialer>,
+    /// Shared by every session's gateway: config, link, egress routes, quotas.
+    pub gw: crate::gateway::GatewayDeps,
     store: Arc<Store>,
     rt: Runtime,
     pub link: LinkHandle,
@@ -56,6 +56,9 @@ pub struct Instance {
     /// replaying a message update never double counts.
     msg_usage: Mutex<HashMap<String, TokenUsage>>,
     usage: Arc<Mutex<TokenUsage>>,
+    /// Set by the gateway while every route's allowance is used up.
+    parked: crate::gateway::Parked,
+    gateway: Mutex<Option<Gateway>>,
     /// Tool calls already reported as activity (part ids).
     seen_tools: Mutex<HashSet<String>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -76,7 +79,7 @@ fn random_token(prefix: &str) -> String {
 }
 
 impl Manager {
-    pub fn new(cfg: ConfigStore, store: Arc<Store>, rt: Runtime, link: LinkHandle, dialer: Option<crate::relay::Dialer>) -> Result<Arc<Manager>> {
+    pub fn new(cfg: ConfigStore, store: Arc<Store>, rt: Runtime, link: LinkHandle, gw: crate::gateway::GatewayDeps) -> Result<Arc<Manager>> {
         let snap = cfg.get();
         let data_root = snap.node.runtime.data_dir.clone().unwrap_or_else(|| snap.dir.join("data"));
         let run_root = snap.node.runtime.run_dir.clone().unwrap_or_else(|| {
@@ -101,7 +104,7 @@ impl Manager {
         Ok(Arc::new(Manager {
             node: snap.node.name.clone(),
             cfg,
-            dialer,
+            gw,
             store,
             rt,
             link,
@@ -162,6 +165,47 @@ impl Manager {
                 inst.oc.reply_permission(&request, &reply).await?;
                 Ok(json!({"ok": true}))
             }
+            NodeCommand::SetRoute { agent, route, by } => {
+                let snap = self.cfg.get();
+                if let Some(r) = &route {
+                    for n in r.names() {
+                        if snap.route(&n).is_none() {
+                            bail!("node {} has no route {n:?} (routes.yaml)", self.node);
+                        }
+                    }
+                }
+                if !snap.agents.contains_key(&agent) {
+                    bail!("node {} has no agent {agent:?}", self.node);
+                }
+                self.write_overrides(|o| {
+                    match route {
+                        Some(r) => {
+                            o.routes.insert(agent.clone(), r);
+                        }
+                        None => {
+                            o.routes.remove(&agent);
+                        }
+                    }
+                    tracing::info!(agent, by, "route override changed");
+                })?;
+                self.gw.egress.probe().await;
+                Ok(json!({"ok": true}))
+            }
+            NodeCommand::SetQuota { ov, clear } => {
+                self.write_overrides(|o| {
+                    let now = now_ms();
+                    o.quotas.retain(|x| x.resets_at.is_none_or(|r| r > now) && !(x.provider == ov.provider && x.scope_id == ov.scope_id));
+                    if !clear {
+                        o.quotas.push(ov.clone());
+                    }
+                })?;
+                self.gw.quotas.touch();
+                Ok(json!({"ok": true}))
+            }
+            NodeCommand::ProbeEgress => {
+                self.gw.egress.probe().await;
+                Ok(json!({"ips": self.gw.egress.snapshot()}))
+            }
             NodeCommand::OpenTunnel { id, host, port, from } => {
                 let snap = self.cfg.get();
                 crate::relay::accept(&snap.node, &self.link, &id, &host, port, &from).await?;
@@ -173,6 +217,23 @@ impl Manager {
                 Ok(json!({"code": code, "output": output}))
             }
         }
+    }
+
+    /// Apply a change to overrides.yaml and reload the config now.
+    fn write_overrides(&self, f: impl FnOnce(&mut OverridesFile)) -> Result<()> {
+        let snap = self.cfg.get();
+        let mut o = snap.overrides.clone();
+        f(&mut o);
+        let path = snap.dir.join("overrides.yaml");
+        let body = format!(
+            "# Live changes made from the opencode-cluster UI/CLI, written by opencode-node.\n# Kept apart from your version-controlled files; safe to edit or delete.\n{}",
+            serde_yaml::to_string(&o)?
+        );
+        let tmp = path.with_extension("yaml.tmp");
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, &path)?;
+        self.cfg.reload()?;
+        Ok(())
     }
 
     fn workspace_dir(&self, id: &str, ws: &WorkspaceSpec) -> Result<(PathBuf, String)> {
@@ -205,7 +266,9 @@ impl Manager {
             oc_agent,
             oc_id: Mutex::new(report.opencode_id.clone()),
             usage: Arc::new(Mutex::new(report.tokens)),
-            turn_open: AtomicBool::new(matches!(report.state, SessionState::Running | SessionState::Blocked)),
+            parked: Arc::new(Mutex::new(None)),
+            gateway: Mutex::new(None),
+            turn_open: AtomicBool::new(matches!(report.state, SessionState::Running | SessionState::Blocked | SessionState::Parked)),
             report: Mutex::new(report),
             msg_usage: Mutex::new(HashMap::new()),
             seen_tools: Mutex::new(HashSet::new()),
@@ -310,7 +373,8 @@ impl Manager {
     }
 
     fn start_gateway(&self, inst: &Arc<Instance>, cap: &str) -> Result<()> {
-        let gw = Gateway::new(&inst.id, &inst.agent, inst.role, cap, self.cfg.clone(), inst.usage.clone(), self.link.clone(), self.dialer.clone());
+        let gw = Gateway::new(&inst.id, &inst.agent, inst.role, cap, inst.usage.clone(), inst.parked.clone(), &self.gw);
+        *inst.gateway.lock().unwrap() = Some(gw.clone());
         let h = gw.serve(inst.paths.node_sock())?;
         inst.tasks.lock().unwrap().push(h);
         Ok(())
@@ -514,9 +578,15 @@ impl Manager {
                         st["attempt"].as_u64().unwrap_or(0),
                         st["message"].as_str().unwrap_or("provider error").chars().take(200).collect::<String>()
                     );
+                    // While parked, the countdown explains more than OpenCode's retry note.
+                    let parked = inst.parked.lock().unwrap().clone();
+                    let task = match &parked {
+                        Some((until, why)) => format!("resets in {}: {why}", crate::gateway::human_in(until - now_ms())).chars().take(300).collect(),
+                        None => msg,
+                    };
                     self.update(inst, |r| {
-                        r.state = SessionState::Running;
-                        r.current_task = Some(msg);
+                        r.state = if parked.is_some() { SessionState::Parked } else { SessionState::Running };
+                        r.current_task = Some(task);
                     });
                 }
                 Some(_) => {
@@ -638,6 +708,9 @@ impl Manager {
         if let Ok(t) = inst.oc.todos(&oc_id).await {
             self.update(inst, |r| r.todos = t);
         }
+        if let Some(gw) = inst.gateway.lock().unwrap().clone() {
+            gw.settle_tokens();
+        }
         if inst.stopping.load(Ordering::Relaxed) {
             return; // stopped while we were collecting; not a finished turn
         }
@@ -734,8 +807,25 @@ impl Manager {
         let insts: Vec<_> = self.instances.lock().unwrap().values().cloned().collect();
         for inst in &insts {
             let state = inst.report.lock().unwrap().state;
-            if !matches!(state, SessionState::Running | SessionState::Blocked) {
+            if !matches!(state, SessionState::Running | SessionState::Blocked | SessionState::Parked) {
                 continue;
+            }
+            // Parked: show the countdown; leave once a request goes through again.
+            let parked = inst.parked.lock().unwrap().clone();
+            match parked {
+                Some((until, why)) => {
+                    let task = format!("resets in {}: {why}", crate::gateway::human_in(until - now_ms()));
+                    self.update(inst, |r| {
+                        r.state = SessionState::Parked;
+                        r.current_task = Some(task.chars().take(300).collect());
+                    });
+                    continue;
+                }
+                None if state == SessionState::Parked => self.update(inst, |r| {
+                    r.state = SessionState::Running;
+                    r.current_task = current_task(&r.todos);
+                }),
+                None => {}
             }
             let perms = inst.oc.pending_permissions().await.unwrap_or_default();
             if !perms.is_empty() && state != SessionState::Blocked {

@@ -9,7 +9,9 @@
 //!   tools agents use to message, spawn and report to the cluster.
 
 use crate::cfgstore::ConfigStore;
+use crate::egress::Egress;
 use crate::link::LinkHandle;
+use crate::quota::{self, Quotas, Target};
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -17,14 +19,16 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
-use ocl_protocol::config::{AuthStyle, Route};
-use ocl_protocol::link::AgentCall;
-use ocl_protocol::model::{SessionRole, TokenUsage};
+use ocl_protocol::config::{AuthStyle, OnExhausted, Route};
+use ocl_protocol::link::{AgentCall, NodeEvent};
+use ocl_protocol::model::{now_ms, SessionRole, TokenUsage, Ts};
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::net::UnixListener;
+
+/// Set while every route's allowance is used up: (until, explanation).
+pub type Parked = Arc<Mutex<Option<(Ts, String)>>>;
 
 #[derive(Clone)]
 pub struct Gateway {
@@ -35,25 +39,40 @@ pub struct Gateway {
     cfg: ConfigStore,
     pub usage: Arc<Mutex<TokenUsage>>,
     link: LinkHandle,
-    dialer: Option<crate::relay::Dialer>,
-    http: Arc<Mutex<HashMap<String, reqwest::Client>>>,
+    egress: Arc<Egress>,
+    quotas: Arc<Quotas>,
+    pub parked: Parked,
+    /// The bucket that served the previous request, and the session's token
+    /// total when it was sent: its tokens are attributed on the next request.
+    prev: Arc<Mutex<Option<(Target, String, u64)>>>,
+    /// Route of the last successful call (to report failovers once).
+    last_route: Arc<Mutex<Option<String>>>,
 }
 
 const MAX_BODY: usize = 32 * 1024 * 1024;
 
+pub struct GatewayDeps {
+    pub cfg: ConfigStore,
+    pub link: LinkHandle,
+    pub egress: Arc<Egress>,
+    pub quotas: Arc<Quotas>,
+}
+
 impl Gateway {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(id: &str, agent: &str, role: SessionRole, cap: &str, cfg: ConfigStore, usage: Arc<Mutex<TokenUsage>>, link: LinkHandle, dialer: Option<crate::relay::Dialer>) -> Self {
+    pub fn new(id: &str, agent: &str, role: SessionRole, cap: &str, usage: Arc<Mutex<TokenUsage>>, parked: Parked, deps: &GatewayDeps) -> Self {
         Gateway {
             id: id.into(),
             agent: agent.into(),
             role,
             cap: Arc::new(cap.into()),
-            cfg,
+            cfg: deps.cfg.clone(),
             usage,
-            link,
-            dialer,
-            http: Arc::new(Mutex::new(HashMap::new())),
+            link: deps.link.clone(),
+            egress: deps.egress.clone(),
+            quotas: deps.quotas.clone(),
+            parked,
+            prev: Arc::new(Mutex::new(None)),
+            last_route: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -96,29 +115,6 @@ impl Gateway {
             }
         }
         presented.iter().any(|p| ct_eq(p.as_bytes(), self.cap.as_bytes()))
-    }
-
-    fn client_for(&self, route: &Route) -> Result<reqwest::Client, String> {
-        let key = format!("{route:?}");
-        if let Some(c) = self.http.lock().unwrap().get(&key) {
-            return Ok(c.clone());
-        }
-        let mut b = reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(20));
-        match route {
-            Route::Direct => {
-                if let Some(ip) = self.cfg.get().node.egress_bind.as_deref() {
-                    b = b.local_address(Some(ip.parse::<std::net::IpAddr>().map_err(|_| format!("egress_bind {ip:?} is not an IP"))?));
-                }
-            }
-            Route::Proxy { url } => b = b.proxy(reqwest::Proxy::all(url).map_err(|e| format!("bad proxy url: {e}"))?),
-            Route::ViaNode { node } => {
-                let d = self.dialer.as_ref().ok_or("via_node routes are not available on this node")?;
-                b = b.proxy(reqwest::Proxy::all(d.proxy_url(node)).map_err(|e| format!("relay proxy: {e}"))?);
-            }
-        }
-        let c = b.build().map_err(|e| e.to_string())?;
-        self.http.lock().unwrap().insert(key, c.clone());
-        Ok(c)
     }
 }
 
@@ -171,7 +167,7 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
     let Some(pdef) = snap.providers.get(&provider).cloned() else {
         return llm_error(StatusCode::BAD_GATEWAY, "provider not configured");
     };
-    {
+    let usage_total = {
         let u = *g.usage.lock().unwrap();
         if let Some(b) = agent.cfg.limits.budget_usd {
             if u.cost_usd >= b {
@@ -183,7 +179,8 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
                 return llm_error(StatusCode::TOO_MANY_REQUESTS, &format!("session token cap {m} reached"));
             }
         }
-    }
+        u.total()
+    };
     let method = req.method().clone();
     let mut headers = req.headers().clone();
     let body = match axum::body::to_bytes(req.into_body(), MAX_BODY).await {
@@ -236,33 +233,165 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
         url.push('?');
         url.push_str(&q.join("&"));
     }
-    let route = snap.route_for(&agent.cfg);
-    let client = match g.client_for(&route) {
-        Ok(c) => c,
-        Err(e) => return llm_error(StatusCode::BAD_GATEWAY, &e),
-    };
-    let upstream = match client.request(method, &url).headers(headers).body(body).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            let mut why = error_chain(&e.without_url());
-            if let (Route::ViaNode { node }, Some(d)) = (&route, &g.dialer) {
-                if let Some(r) = d.last_error(node) {
-                    why = format!("relay {node}: {r}");
-                }
-            }
-            tracing::warn!(agent = %g.agent, provider, error = %why, "upstream request failed");
-            return llm_error(StatusCode::BAD_GATEWAY, &format!("upstream unreachable: {why}"));
-        }
-    };
-    let status = upstream.status();
-    let mut out = Response::builder().status(status.as_u16());
-    for (k, v) in upstream.headers() {
-        if !HOP.contains(&k.as_str()) {
-            out = out.header(k, v);
+
+    // The previous request's tokens are known now; account them where it went.
+    let spec = quota::spec_for(&pdef);
+    let limits = spec.limits.clone();
+    g.settle_tokens();
+
+    // Try the preferred route, then the failovers, skipping exhausted allowances.
+    let plan = snap.route_plan(&agent.cfg);
+    let mut names: Vec<String> = vec![];
+    for n in std::iter::once(plan.prefer.clone()).chain(plan.failover.iter().cloned()) {
+        if !names.contains(&n) {
+            names.push(n);
         }
     }
-    let stream = upstream.bytes_stream().map(|r| r.map_err(std::io::Error::other));
-    out.body(Body::from_stream(stream)).unwrap_or_else(|_| llm_error(StatusCode::BAD_GATEWAY, "bad upstream response"))
+    let scope = quota::default_scope(&pdef, secret.is_some());
+    let account = agent.cfg.provider.key.as_ref().and_then(|k| k.account.clone());
+    let mut skipped: Vec<String> = vec![];
+    let mut soonest: Option<Ts> = None;
+    let mut all_exhausted = true;
+    for (i, name) in names.iter().enumerate() {
+        let Some(route) = snap.route(name) else {
+            skipped.push(format!("{name}: unknown route"));
+            all_exhausted = false;
+            continue;
+        };
+        let ip = g.egress.ip_of(name);
+        let target = Target { provider: provider.clone(), scope, scope_id: quota::scope_id(scope, &snap.node.name, name, ip.as_deref(), secret.as_deref(), account.as_deref()) };
+        g.quotas.ensure(&target, name, &limits);
+        let now = now_ms();
+        if let Some(until) = g.quotas.exhausted(&target, &limits, &snap.overrides.quotas, now) {
+            skipped.push(format!("{name} ({}): allowance used up, resets in {}", target.scope_id, human_in(until - now)));
+            soonest = Some(soonest.map_or(until, |s: Ts| s.min(until)));
+            continue;
+        }
+        let client = match g.egress.client(&route) {
+            Ok(c) => c,
+            Err(e) => {
+                skipped.push(format!("{name}: {e}"));
+                all_exhausted = false;
+                continue;
+            }
+        };
+        g.quotas.record_request(&target, name, &g.id, &limits);
+        *g.prev.lock().unwrap() = Some((target.clone(), name.clone(), usage_total));
+        let upstream = match client.request(method.clone(), &url).headers(headers.clone()).body(body.clone()).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let mut why = error_chain(&e.without_url());
+                if let (Route::ViaNode { node }, Some(d)) = (&route, g.egress.dialer()) {
+                    if let Some(r) = d.last_error(node) {
+                        why = format!("relay {node}: {r}");
+                    }
+                }
+                tracing::warn!(agent = %g.agent, provider, route = %name, error = %why, "upstream request failed");
+                skipped.push(format!("{name}: upstream unreachable: {why}"));
+                all_exhausted = false;
+                continue;
+            }
+        };
+        let status = upstream.status();
+        if status.as_u16() == 429 {
+            let rh = upstream.headers().clone();
+            let rb = upstream.bytes().await.unwrap_or_default();
+            let until = g.quotas.observe(&target, 429, &rh, &rb, &spec.learn).unwrap_or(now_ms() + 60_000);
+            soonest = Some(soonest.map_or(until, |s: Ts| s.min(until)));
+            skipped.push(format!("{name} ({}): provider says rate limited, resets in {}", target.scope_id, human_in(until - now_ms())));
+            if i + 1 < names.len() {
+                continue; // nothing has reached OpenCode yet: try the next route
+            }
+            if plan.on_exhausted == OnExhausted::Wait {
+                g.park(until, &provider, &skipped);
+            }
+            let mut out = Response::builder().status(429);
+            for (k, v) in &rh {
+                if !HOP.contains(&k.as_str()) {
+                    out = out.header(k, v);
+                }
+            }
+            return out.body(Body::from(rb)).unwrap_or_else(|_| llm_error(StatusCode::TOO_MANY_REQUESTS, "rate limited"));
+        }
+        g.quotas.observe(&target, status.as_u16(), upstream.headers(), b"", &spec.learn);
+        g.unpark();
+        g.note_route(name, &names[0], &skipped, &target.scope_id);
+        let mut out = Response::builder().status(status.as_u16());
+        for (k, v) in upstream.headers() {
+            if !HOP.contains(&k.as_str()) {
+                out = out.header(k, v);
+            }
+        }
+        let stream = upstream.bytes_stream().map(|r| r.map_err(std::io::Error::other));
+        return out.body(Body::from_stream(stream)).unwrap_or_else(|_| llm_error(StatusCode::BAD_GATEWAY, "bad upstream response"));
+    }
+
+    // Nothing could serve the request.
+    let detail = skipped.join("; ");
+    match (all_exhausted, soonest, plan.on_exhausted) {
+        (true, Some(until), OnExhausted::Wait) => {
+            g.park(until, &provider, &skipped);
+            let secs = ((until - now_ms()) / 1000).max(1);
+            let mut r = llm_error(StatusCode::TOO_MANY_REQUESTS, &format!("every route's allowance for {provider} is used up; waiting {}: {detail}", human_in(secs * 1000)));
+            r.headers_mut().insert("retry-after", HeaderValue::from(secs as u64));
+            r
+        }
+        (true, Some(_), OnExhausted::Fail) => llm_error(StatusCode::FORBIDDEN, &format!("every route's allowance for {provider} is used up (on_exhausted: fail): {detail}")),
+        _ => llm_error(StatusCode::BAD_GATEWAY, &format!("upstream unreachable: {detail}")),
+    }
+}
+
+/// `3h 24m`, `5m 10s`, `42s`.
+pub fn human_in(ms: i64) -> String {
+    let s = (ms.max(0) + 999) / 1000;
+    match s {
+        s if s >= 86_400 => format!("{}d {}h", s / 86_400, s % 86_400 / 3600),
+        s if s >= 3600 => format!("{}h {}m", s / 3600, s % 3600 / 60),
+        s if s >= 60 => format!("{}m {}s", s / 60, s % 60),
+        s => format!("{s}s"),
+    }
+}
+
+impl Gateway {
+    /// Attribute tokens used since the last request to the bucket that served
+    /// it (called before each request and when a turn ends).
+    pub fn settle_tokens(&self) {
+        let Some((t, route, before)) = self.prev.lock().unwrap().take() else { return };
+        let now_total = self.usage.lock().unwrap().total();
+        let limits = self.cfg.get().providers.get(&t.provider).map(|p| quota::spec_for(p).limits).unwrap_or_default();
+        self.quotas.record_tokens(&t, &route, &self.id, &limits, now_total.saturating_sub(before));
+        // Later tokens of the same request (e.g. a resync) still belong there.
+        *self.prev.lock().unwrap() = Some((t, route, now_total.max(before)));
+    }
+
+    fn park(&self, until: Ts, provider: &str, why: &[String]) {
+        let msg = format!("waiting for the {provider} allowance on every route: {}", why.join("; "));
+        let was = self.parked.lock().unwrap().replace((until, msg.clone()));
+        if was.is_none() {
+            tracing::info!(session = %self.id, provider, until, "parked: every route's allowance is used up");
+            self.link.emit(NodeEvent::Activity { session: self.id.clone(), kind: "quota.parked".into(), detail: json!({"provider": provider, "until": until, "why": why}) });
+        }
+    }
+
+    fn unpark(&self) {
+        if self.parked.lock().unwrap().take().is_some() {
+            self.link.emit(NodeEvent::Activity { session: self.id.clone(), kind: "quota.resumed".into(), detail: json!({}) });
+        }
+    }
+
+    /// Report when the route serving this session changes (failover and back).
+    fn note_route(&self, route: &str, preferred: &str, skipped: &[String], scope_id: &str) {
+        let prev = self.last_route.lock().unwrap().replace(route.to_string());
+        if prev.as_deref() != Some(route) && (prev.is_some() || route != preferred) {
+            let kind = if route == preferred { "route.restored" } else { "route.failover" };
+            tracing::info!(session = %self.id, route, from = ?prev, "{kind}");
+            self.link.emit(NodeEvent::Activity {
+                session: self.id.clone(),
+                kind: kind.into(),
+                detail: json!({"route": route, "from": prev, "scope_id": scope_id, "skipped": skipped}),
+            });
+        }
+    }
 }
 
 // ---------------------------------------------------------------------- MCP

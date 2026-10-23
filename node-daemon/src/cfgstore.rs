@@ -28,6 +28,8 @@ pub struct Snapshot {
     pub node: NodeConfig,
     pub providers: BTreeMap<String, ProviderDef>,
     pub routes: BTreeMap<String, Route>,
+    /// Live changes from the UI/CLI (`overrides.yaml`).
+    pub overrides: OverridesFile,
     pub agents: BTreeMap<String, LoadedAgent>,
     /// Files that failed to parse: path -> error (kept so the UI can show them).
     pub file_errors: BTreeMap<String, String>,
@@ -56,12 +58,36 @@ impl Snapshot {
             .collect()
     }
 
-    pub fn route_for(&self, agent: &AgentConfig) -> Route {
-        let name = agent.route.clone().or_else(|| self.node.default_route.clone());
-        match name {
-            None => Route::Direct,
-            Some(n) => self.routes.get(&n).cloned().unwrap_or(Route::Direct),
+    /// Route plan for an agent: overrides.yaml, then the agent's `route`,
+    /// then the node's `default_route`, else `direct`.
+    pub fn route_plan(&self, agent: &AgentConfig) -> RoutePlan {
+        self.overrides
+            .routes
+            .get(&agent.name)
+            .or(agent.route.as_ref())
+            .cloned()
+            .or_else(|| self.node.default_route.clone().map(RouteSpec::Name))
+            .unwrap_or_else(|| RouteSpec::Name("direct".into()))
+            .plan()
+    }
+
+    /// `direct` always exists (unless routes.yaml redefines it).
+    pub fn route(&self, name: &str) -> Option<Route> {
+        self.routes.get(name).cloned().or_else(|| (name == "direct").then_some(Route::Direct))
+    }
+
+    /// Route names any agent on this node may use (for egress IP probing).
+    pub fn used_routes(&self) -> Vec<String> {
+        let mut v: Vec<String> = vec!["direct".into()];
+        for a in self.agents.values() {
+            let p = self.route_plan(&a.cfg);
+            for n in std::iter::once(p.prefer).chain(p.failover) {
+                if !v.contains(&n) {
+                    v.push(n);
+                }
+            }
         }
+        v
     }
 }
 
@@ -91,6 +117,16 @@ pub fn load(dir: &Path) -> Result<Snapshot> {
             }
         }
     }
+    let mut overrides = OverridesFile::default();
+    let of = dir.join("overrides.yaml");
+    if of.exists() {
+        match load_yaml::<OverridesFile>(&of) {
+            Ok(f) => overrides = f,
+            Err(e) => {
+                file_errors.insert(of.display().to_string(), e.to_string());
+            }
+        }
+    }
     let mut agents = BTreeMap::new();
     for (path, res) in load_dir::<AgentConfig>(&dir.join("agents")) {
         let cfg = match res {
@@ -101,8 +137,9 @@ pub fn load(dir: &Path) -> Result<Snapshot> {
             }
         };
         let mut errors = cfg.validate(&providers);
-        if let Some(r) = &cfg.route {
-            if !routes.contains_key(r) {
+        let spec = overrides.routes.get(&cfg.name).or(cfg.route.as_ref());
+        for r in spec.map(|s| s.names()).unwrap_or_default() {
+            if r != "direct" && !routes.contains_key(&r) {
                 errors.push(format!("unknown route {r:?}"));
             }
         }
@@ -133,7 +170,7 @@ pub fn load(dir: &Path) -> Result<Snapshot> {
         }
         agents.insert(cfg.name.clone(), LoadedAgent { cfg, role_text, hash, errors, secret_ok });
     }
-    Ok(Snapshot { dir: dir.to_path_buf(), node, providers, routes, agents, file_errors })
+    Ok(Snapshot { dir: dir.to_path_buf(), node, providers, routes, overrides, agents, file_errors })
 }
 
 /// Shared, swappable config snapshot.
@@ -148,6 +185,13 @@ impl ConfigStore {
     }
     pub fn get(&self) -> Arc<Snapshot> {
         self.inner.read().unwrap().clone()
+    }
+
+    /// Reload now (after the node itself wrote a file); the watcher also fires.
+    pub fn reload(&self) -> Result<Arc<Snapshot>> {
+        let s = Arc::new(load(&self.get().dir)?);
+        *self.inner.write().unwrap() = s.clone();
+        Ok(s)
     }
 
     /// Watch the directory; on change reload and send the new snapshot. A broken

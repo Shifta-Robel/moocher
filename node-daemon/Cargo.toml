@@ -34,3 +34,7 @@ base64 = "0.22"
 rcgen.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
+time = { workspace = true, features = ["parsing"] }
+
+[dev-dependencies]
+tempfile = "3"

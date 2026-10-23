@@ -36,10 +36,10 @@ mod tests {
     #[test]
     fn env_and_file() {
         std::env::set_var("OCL_TEST_SECRET", " abc \n");
-        assert_eq!(resolve(&SecretRef { reference: "env:OCL_TEST_SECRET".into() }).unwrap(), "abc");
+        assert_eq!(resolve(&SecretRef { reference: "env:OCL_TEST_SECRET".into(), account: None }).unwrap(), "abc");
         let p = std::env::temp_dir().join("ocl-secret-test");
         std::fs::write(&p, "xyz\n").unwrap();
-        assert_eq!(resolve(&SecretRef { reference: format!("file:{}", p.display()) }).unwrap(), "xyz");
-        assert!(resolve(&SecretRef { reference: "vault:x".into() }).is_err());
+        assert_eq!(resolve(&SecretRef { reference: format!("file:{}", p.display()), account: None }).unwrap(), "xyz");
+        assert!(resolve(&SecretRef { reference: "vault:x".into(), account: None }).is_err());
     }
 }

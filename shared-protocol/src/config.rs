@@ -7,6 +7,7 @@
 //! supervisor.yaml      SupervisorConfig  (hub only)
 //! providers.yaml       ProvidersFile     (optional; merged over built-in defaults)
 //! routes.yaml          RoutesFile        (optional)
+//! overrides.yaml       OverridesFile     (optional; written by the node for live UI/CLI changes)
 //! agents/*.yaml        AgentConfig       (one file per agent profile)
 //! workflows/*.yaml     WorkflowConfig    (hub only)
 //! prompts/*.md         referenced by agents via role.system_prompt_file
@@ -55,6 +56,11 @@ pub struct NodeConfig {
     /// IPs (applies to `direct` routes and to traffic relayed for others).
     #[serde(default)]
     pub egress_bind: Option<String>,
+    /// URLs that answer with the caller's public IP, used to learn the egress
+    /// IP of each route (per-IP quotas). Empty disables probing; remote nodes
+    /// still learn their direct IP from the hub.
+    #[serde(default = "default_ip_echo")]
+    pub ip_echo: Vec<String>,
     /// Default egress route for agents that do not set one.
     #[serde(default)]
     pub default_route: Option<String>,
@@ -68,6 +74,10 @@ fn default_node_max_sessions() -> u32 {
 
 fn default_relay_ports() -> Vec<u16> {
     vec![443]
+}
+
+fn default_ip_echo() -> Vec<String> {
+    vec!["https://api.ipify.org".into()]
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -337,6 +347,131 @@ pub struct ProviderDef {
     pub prices: BTreeMap<String, Price>,
     #[serde(default)]
     pub description: Option<String>,
+    /// Usage limits and how they are tracked (PHASE1_5 §3). Without this,
+    /// limits are still learned from rate-limit headers and 429 responses.
+    #[serde(default)]
+    pub quota: Option<QuotaSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaSpec {
+    /// What the provider counts against. Default: `ip` for keyless providers, `key` otherwise.
+    #[serde(default)]
+    pub scope: Option<QuotaScope>,
+    #[serde(default)]
+    pub limits: Vec<QuotaLimit>,
+    /// Signals trusted over the configured limits.
+    #[serde(default = "default_learn")]
+    pub learn: Vec<QuotaLearn>,
+}
+
+fn default_learn() -> Vec<QuotaLearn> {
+    vec![QuotaLearn::Headers, QuotaLearn::Http429]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaScope {
+    /// Per egress IP (keyless gateways).
+    Ip,
+    /// Per API key.
+    Key,
+    /// Per account: keys with the same `account` label share one bucket.
+    Account,
+}
+
+impl QuotaScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QuotaScope::Ip => "ip",
+            QuotaScope::Key => "key",
+            QuotaScope::Account => "account",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaLearn {
+    /// `x-ratelimit-*`, `anthropic-ratelimit-*`, `retry-after`.
+    Headers,
+    /// A 429 marks the bucket exhausted until its reset / retry-after.
+    #[serde(rename = "http_429")]
+    Http429,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaKind {
+    Requests,
+    Tokens,
+}
+
+impl QuotaKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QuotaKind::Requests => "requests",
+            QuotaKind::Tokens => "tokens",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaLimit {
+    pub kind: QuotaKind,
+    pub max: u64,
+    /// Window length: `60s`, `5h`, `1d`.
+    pub window: String,
+    /// Fixed windows: wall-clock time a window starts, `HH:MM` (e.g. daily reset at `00:00`).
+    #[serde(default)]
+    pub at: Option<String>,
+    /// Time zone of `at`: `UTC` (default) or an offset like `+02:00` / `-07:00`.
+    #[serde(default)]
+    pub tz: Option<String>,
+    /// Rolling window (usage expires `window` after it happened) instead of fixed.
+    #[serde(default)]
+    pub rolling: bool,
+}
+
+/// `90s`, `5m`, `5h`, `1d`, `1h30m`, `250ms` -> milliseconds.
+pub fn parse_duration_ms(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(secs) = s.parse::<f64>() {
+        return Some((secs * 1000.0) as i64);
+    }
+    let mut total = 0f64;
+    let mut num = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() || c == '.' {
+            num.push(c);
+            continue;
+        }
+        let n: f64 = num.parse().ok()?;
+        num.clear();
+        let unit = if c == 'm' && chars.peek() == Some(&'s') {
+            chars.next();
+            0.001
+        } else {
+            match c {
+                's' => 1.0,
+                'm' => 60.0,
+                'h' => 3600.0,
+                'd' => 86400.0,
+                _ => return None,
+            }
+        };
+        total += n * unit;
+    }
+    if !num.is_empty() {
+        return None;
+    }
+    Some((total * 1000.0) as i64)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -398,6 +533,7 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderDef> {
             tier,
             prices: BTreeMap::new(),
             description: Some(desc.into()),
+            quota: None,
         }
     }
     use ApiKind::*;
@@ -455,6 +591,87 @@ pub enum Route {
     Proxy { url: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum RouteSpec {
+    Name(String),
+    Plan(RoutePlan),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutePlan {
+    #[serde(default = "default_direct")]
+    pub prefer: String,
+    /// Tried in order when the provider's bucket for the current route is exhausted.
+    #[serde(default)]
+    pub failover: Vec<String>,
+    #[serde(default)]
+    pub on_exhausted: OnExhausted,
+}
+
+fn default_direct() -> String {
+    "direct".into()
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OnExhausted {
+    /// Park until the soonest reset (OpenCode retries after `retry-after`).
+    #[default]
+    Wait,
+    /// End the turn with an error so a coordinator can reassign the work.
+    Fail,
+}
+
+impl RouteSpec {
+    pub fn plan(&self) -> RoutePlan {
+        match self {
+            RouteSpec::Name(n) => RoutePlan { prefer: n.clone(), failover: vec![], on_exhausted: OnExhausted::Wait },
+            RouteSpec::Plan(p) => p.clone(),
+        }
+    }
+    /// Every route name this spec mentions.
+    pub fn names(&self) -> Vec<String> {
+        let p = self.plan();
+        std::iter::once(p.prefer).chain(p.failover).collect()
+    }
+}
+
+// ----------------------------------------------------------- overrides.yaml
+
+/// Live changes made from the UI/CLI, kept apart from the version-controlled
+/// files. The node writes it; `promote` copies a change into the real YAML.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OverridesFile {
+    /// Agent name -> route spec (replaces the agent's `route`).
+    #[serde(default)]
+    pub routes: BTreeMap<String, RouteSpec>,
+    #[serde(default)]
+    pub quotas: Vec<QuotaOverride>,
+}
+
+/// "On this node, provider X's bucket resets at T / has N left."
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaOverride {
+    pub provider: String,
+    /// One bucket (an IP, `key:…`, `account:…`), or every bucket of the provider on this node.
+    #[serde(default)]
+    pub scope_id: Option<String>,
+    /// Unix millis. Until then the override applies; afterwards it expires.
+    #[serde(default)]
+    pub resets_at: Option<i64>,
+    /// Requests left until `resets_at` (0 = exhausted until then).
+    #[serde(default)]
+    pub remaining: Option<u64>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub set_by: Option<String>,
+}
+
 // ------------------------------------------------------------- agents/*.yaml
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -468,9 +685,11 @@ pub struct AgentConfig {
     #[serde(default)]
     pub description: String,
     pub provider: ProviderRef,
-    /// Egress route name from routes.yaml (default: node's default_route, else direct).
+    /// Egress route: a name from routes.yaml (default: node's default_route,
+    /// else `direct`), or `{prefer, failover, on_exhausted}` to switch to
+    /// other routes (other IPs) when a provider allowance runs out.
     #[serde(default)]
-    pub route: Option<String>,
+    pub route: Option<RouteSpec>,
     #[serde(default)]
     pub role: Role,
     #[serde(default)]
@@ -520,6 +739,9 @@ pub struct ProviderRef {
 pub struct SecretRef {
     #[serde(rename = "ref")]
     pub reference: String,
+    /// Usage of keys with the same label is shown as one account (scope `account`).
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -829,6 +1051,7 @@ pub fn schemas() -> BTreeMap<&'static str, serde_json::Value> {
     m.insert("supervisor", serde_json::to_value(schemars::schema_for!(SupervisorConfig)).unwrap());
     m.insert("providers", serde_json::to_value(schemars::schema_for!(ProvidersFile)).unwrap());
     m.insert("routes", serde_json::to_value(schemars::schema_for!(RoutesFile)).unwrap());
+    m.insert("overrides", serde_json::to_value(schemars::schema_for!(OverridesFile)).unwrap());
     m.insert("workflow", serde_json::to_value(schemars::schema_for!(WorkflowConfig)).unwrap());
     m
 }
@@ -872,5 +1095,22 @@ success: { todos: ["write module"], checks: [ { exit_code: "pytest -q" } ] }
         )
         .unwrap();
         assert_eq!(r.routes["b"], Route::ViaNode { node: "vps-de".into() });
+    }
+
+    #[test]
+    fn route_specs_and_durations() {
+        let a: AgentConfig = serde_yaml::from_str("name: a\nprovider: { id: kilo-free, model: auto }\nroute: via-vps").unwrap();
+        assert_eq!(a.route.unwrap().names(), vec!["via-vps"]);
+        let b: AgentConfig =
+            serde_yaml::from_str("name: b\nprovider: { id: kilo-free, model: auto }\nroute: { failover: [via-vps, home], on_exhausted: fail }").unwrap();
+        let p = b.route.unwrap().plan();
+        assert_eq!((p.prefer.as_str(), p.failover.len(), p.on_exhausted), ("direct", 2, OnExhausted::Fail));
+        assert_eq!(parse_duration_ms("1h30m"), Some(5_400_000));
+        assert_eq!(parse_duration_ms("6m0s"), Some(360_000));
+        assert_eq!(parse_duration_ms("250ms"), Some(250));
+        assert_eq!(parse_duration_ms("1.5s"), Some(1500));
+        assert_eq!(parse_duration_ms("17"), Some(17_000));
+        assert_eq!(parse_duration_ms("1d"), Some(86_400_000));
+        assert_eq!(parse_duration_ms("x"), None);
     }
 }

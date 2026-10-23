@@ -1,11 +1,13 @@
 //! opencode-node — one per machine. See docs/ARCHITECTURE.md §2.
 
 mod cfgstore;
+mod egress;
 mod gateway;
 mod link;
 mod manager;
 mod oc;
 mod pki;
+mod quota;
 mod relay;
 mod runtime;
 mod secrets;
@@ -179,7 +181,10 @@ async fn run(dir: PathBuf) -> Result<()> {
     let cfg = cfgstore::ConfigStore::new(snap);
     let link = link::LinkHandle::new(store.clone());
     let dialer = relay::Dialer::start(node_name.clone(), link.clone()).await?;
-    let mgr = manager::Manager::new(cfg.clone(), store, rt, link.clone(), Some(dialer))?;
+    let egress = Arc::new(egress::Egress::new(cfg.clone(), Some(dialer), link.clone()));
+    let quotas = Arc::new(quota::Quotas::new(&node_name, store.clone()));
+    let deps = gateway::GatewayDeps { cfg: cfg.clone(), link: link.clone(), egress: egress.clone(), quotas: quotas.clone() };
+    let mgr = manager::Manager::new(cfg.clone(), store, rt, link.clone(), deps)?;
     tracing::info!(node = %node_name, supervisor = %supervisor, data = %mgr.data_root().display(), "starting");
 
     if relay_only {
@@ -188,14 +193,46 @@ async fn run(dir: PathBuf) -> Result<()> {
         mgr.reconcile().await?;
     }
 
-    // Hot reload -> tell the supervisor which agents exist now.
+    // Hot reload -> tell the supervisor which agents exist now; routes may have changed.
+    let reprobe = Arc::new(tokio::sync::Notify::new());
     let mut reloads = cfg.watch()?;
     {
-        let link = link.clone();
+        let (link, quotas, reprobe) = (link.clone(), quotas.clone(), reprobe.clone());
         tokio::spawn(async move {
             while let Some(s) = reloads.recv().await {
                 let agents = if s.node.role == ocl_protocol::config::NodeRole::Relay { vec![] } else { s.agent_infos() };
                 link.emit(NodeEvent::Agents { agents });
+                quotas.touch();
+                reprobe.notify_one();
+            }
+        });
+    }
+    // Egress IPs: at start, every 30 min, on config change and when the hub sees a new address.
+    if !relay_only {
+        let (egress, link, reprobe) = (egress.clone(), link.clone(), reprobe.clone());
+        tokio::spawn(async move {
+            loop {
+                egress.probe().await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1800)) => {}
+                    _ = reprobe.notified() => {}
+                    _ = link.ip_changed() => {}
+                }
+            }
+        });
+    }
+    // Quota buckets: persist and report changes (at most every 3 s).
+    {
+        let (quotas, cfg, link) = (quotas.clone(), cfg.clone(), link.clone());
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(std::time::Duration::from_secs(3));
+            loop {
+                iv.tick().await;
+                if quotas.flush() {
+                    let s = cfg.get();
+                    let limits = s.providers.iter().map(|(k, p)| (k.clone(), quota::spec_for(p).limits)).collect();
+                    link.emit(NodeEvent::Quotas { buckets: quotas.snapshot(&limits, &s.overrides.quotas) });
+                }
             }
         });
     }

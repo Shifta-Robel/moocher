@@ -77,7 +77,10 @@ impl Db {
                 issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
              CREATE INDEX IF NOT EXISTS node_certs_node ON node_certs(node);
              CREATE TABLE IF NOT EXISTS node_auth(node TEXT PRIMARY KEY, status TEXT NOT NULL, role TEXT NOT NULL, labels TEXT NOT NULL, updated_at INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS allowed_sources(cidr TEXT PRIMARY KEY, note TEXT NOT NULL, added_by TEXT NOT NULL, added_at INTEGER NOT NULL);",
+             CREATE TABLE IF NOT EXISTS allowed_sources(cidr TEXT PRIMARY KEY, note TEXT NOT NULL, added_by TEXT NOT NULL, added_at INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS egress_ips(node TEXT NOT NULL, route TEXT NOT NULL, info TEXT NOT NULL, PRIMARY KEY(node, route));
+             CREATE TABLE IF NOT EXISTS quota_buckets(node TEXT NOT NULL, provider TEXT NOT NULL, scope_id TEXT NOT NULL, kind TEXT NOT NULL,
+                info TEXT NOT NULL, PRIMARY KEY(node, provider, scope_id, kind));",
         )?;
         {
             use std::os::unix::fs::PermissionsExt;
@@ -238,6 +241,43 @@ impl Db {
     pub fn set_meta(&self, k: &str, v: &str) -> Result<()> {
         self.c.lock().unwrap().execute("INSERT INTO meta(k,v) VALUES(?1,?2) ON CONFLICT(k) DO UPDATE SET v=excluded.v", params![k, v])?;
         Ok(())
+    }
+
+    // ----------------------------------------------------- egress & quota
+
+    /// Replace a node's egress IPs (full snapshot).
+    pub fn put_egress(&self, node: &str, ips: &[EgressIp]) -> Result<()> {
+        let mut c = self.c.lock().unwrap();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM egress_ips WHERE node=?1", params![node])?;
+        for e in ips {
+            tx.execute("INSERT INTO egress_ips(node,route,info) VALUES(?1,?2,?3)", params![node, e.route, serde_json::to_string(e)?])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn egress(&self) -> Vec<EgressIp> {
+        self.json_rows("SELECT info FROM egress_ips ORDER BY node, route", [])
+    }
+
+    /// Replace a node's quota buckets (full snapshot).
+    pub fn put_quotas(&self, node: &str, buckets: &[QuotaBucket]) -> Result<()> {
+        let mut c = self.c.lock().unwrap();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM quota_buckets WHERE node=?1", params![node])?;
+        for b in buckets {
+            tx.execute(
+                "INSERT INTO quota_buckets(node,provider,scope_id,kind,info) VALUES(?1,?2,?3,?4,?5)",
+                params![node, b.provider, b.scope_id, b.kind, serde_json::to_string(b)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn quotas(&self) -> Vec<QuotaBucket> {
+        self.json_rows("SELECT info FROM quota_buckets ORDER BY provider, scope_id, kind, node", [])
     }
 
     // ------------------------------------------------------------- nodes

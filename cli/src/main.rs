@@ -40,6 +40,23 @@ enum Cmd {
         #[command(subcommand)]
         cmd: AllowCmd,
     },
+    /// Provider allowances per IP / key / account, with reset countdowns.
+    Quotas {
+        /// Only this provider.
+        provider: Option<String>,
+    },
+    /// Egress IP of every route, and which nodes/sessions share an IP.
+    Ips,
+    /// Tell the cluster when a provider allowance resets / how much is left.
+    Quota {
+        #[command(subcommand)]
+        cmd: QuotaCmd,
+    },
+    /// Live route changes for an agent on a node (kept in that node's overrides.yaml).
+    Route {
+        #[command(subcommand)]
+        cmd: RouteCmd,
+    },
     /// Agent profiles available per node.
     Agents,
     Sessions {
@@ -170,6 +187,55 @@ enum NodeCmd {
     Revoke { name: String },
     /// Remove a disconnected node from the list (history is kept).
     Forget { name: String },
+    /// Re-learn the node's egress IPs now.
+    Probe { name: String },
+}
+
+#[derive(Subcommand)]
+enum QuotaCmd {
+    /// e.g. `ocl quota set kilo-free --scope-id 203.0.113.7 --resets-at 03:15 --remaining 0`
+    Set {
+        provider: String,
+        /// An IP, `key:…` or `account:…` (default: every bucket of the provider).
+        #[arg(long)]
+        scope_id: Option<String>,
+        /// Default: every node reporting this provider.
+        #[arg(long)]
+        node: Option<String>,
+        /// `03:15` (next occurrence, local time), `03:15Z` (UTC), `+2h30m`, or RFC 3339.
+        #[arg(long)]
+        resets_at: Option<String>,
+        #[arg(long)]
+        remaining: Option<u64>,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    Clear {
+        provider: String,
+        #[arg(long)]
+        scope_id: Option<String>,
+        #[arg(long)]
+        node: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RouteCmd {
+    /// e.g. `ocl route set worker-a builder --prefer direct --failover via-vps,home-proxy`
+    Set {
+        node: String,
+        agent: String,
+        #[arg(long, default_value = "direct")]
+        prefer: String,
+        /// Comma-separated route names, tried in order when the allowance runs out.
+        #[arg(long, value_delimiter = ',')]
+        failover: Vec<String>,
+        /// wait (park until reset) or fail (end the turn with an error).
+        #[arg(long, default_value = "wait")]
+        on_exhausted: String,
+    },
+    /// Back to the agent's own YAML.
+    Clear { node: String, agent: String },
 }
 
 #[derive(Subcommand)]
@@ -287,6 +353,58 @@ fn print_nodes(nodes: &[NodeInfo]) {
     }
 }
 
+/// `3h 24m` from now (or `now` / `-` when unknown).
+fn until(ts: Option<i64>) -> String {
+    match ts {
+        None => "-".into(),
+        Some(t) if t <= now_ms() => "now".into(),
+        Some(t) => {
+            let s = (t - now_ms() + 999) / 1000;
+            match s {
+                s if s >= 86_400 => format!("{}d {}h", s / 86_400, s % 86_400 / 3600),
+                s if s >= 3600 => format!("{}h {}m", s / 3600, s % 3600 / 60),
+                s if s >= 60 => format!("{}m {}s", s / 60, s % 60),
+                s => format!("{s}s"),
+            }
+        }
+    }
+}
+
+/// `03:15` (next occurrence, local), `03:15Z` (UTC), `+2h30m`, RFC 3339 -> unix ms.
+fn parse_when(s: &str) -> Result<i64> {
+    use chrono::{Local, NaiveTime, TimeZone, Utc};
+    let s = s.trim();
+    if let Some(d) = s.strip_prefix('+').or_else(|| s.strip_prefix("in ")) {
+        let ms = ocl_protocol::config::parse_duration_ms(d).context("bad duration (e.g. +2h30m)")?;
+        return Ok(now_ms() + ms);
+    }
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(t.timestamp_millis());
+    }
+    let (clock, utc) = match s.strip_suffix('Z').or_else(|| s.strip_suffix(" UTC")) {
+        Some(c) => (c, true),
+        None => (s, false),
+    };
+    let t = NaiveTime::parse_from_str(clock, "%H:%M").context("expected HH:MM, +duration or RFC 3339")?;
+    let next = |today: chrono::NaiveDate| today.and_time(t);
+    let ms = if utc {
+        let now = Utc::now();
+        let mut at = Utc.from_utc_datetime(&next(now.date_naive()));
+        if at <= now {
+            at += chrono::Duration::days(1);
+        }
+        at.timestamp_millis()
+    } else {
+        let now = Local::now();
+        let mut at = Local.from_local_datetime(&next(now.date_naive())).single().context("ambiguous local time")?;
+        if at <= now {
+            at += chrono::Duration::days(1);
+        }
+        at.timestamp_millis()
+    };
+    Ok(ms)
+}
+
 fn print_tasks(ts: &[Task]) {
     println!("{:>4} {:<10} {:<10} {:>5}  {}", "ID", "STATUS", "LABEL", "RANK", "TITLE");
     for t in ts {
@@ -360,6 +478,85 @@ async fn run(cli: Cli) -> Result<()> {
             NodeCmd::Forget { name } => {
                 api.req(reqwest::Method::DELETE, &format!("/nodes/{name}"), None).await?;
                 println!("{name} removed");
+            }
+            NodeCmd::Probe { name } => out(&api.post(&format!("/nodes/{name}/probe"), json!({})).await?),
+        },
+        Cmd::Quotas { provider } => {
+            let v = api.get("/quotas").await?;
+            if raw {
+                return Ok(out(&v));
+            }
+            let qs: Vec<QuotaView> = serde_json::from_value(v)?;
+            println!("{:<12} {:<6} {:<22} {:<8} {:>11} {:>9} {:<10} {:<8} {:<20} {}", "PROVIDER", "SCOPE", "ID", "KIND", "USED/LIMIT", "LEFT", "RESETS IN", "SOURCE", "NODES", "SESSIONS");
+            for q in qs.iter().filter(|q| provider.as_deref().is_none_or(|p| p == q.provider)) {
+                println!(
+                    "{:<12} {:<6} {:<22} {:<8} {:>11} {:>9} {:<10} {:<8} {:<20} {}",
+                    q.provider,
+                    q.scope,
+                    q.scope_id,
+                    q.kind,
+                    format!("{}/{}", q.used, q.limit.map(|l| l.to_string()).unwrap_or("?".into())),
+                    match (q.exhausted, q.remaining) {
+                        (true, _) => "EXHAUSTED".to_string(),
+                        (false, Some(r)) => r.to_string(),
+                        (false, None) => "-".into(),
+                    },
+                    until(q.resets_at),
+                    q.source,
+                    q.nodes.join(","),
+                    q.sessions.join(",")
+                );
+            }
+        }
+        Cmd::Ips => {
+            let v = api.get("/egress").await?;
+            if raw {
+                return Ok(out(&v));
+            }
+            let e: EgressView = serde_json::from_value(v)?;
+            println!("{:<12} {:<14} {:<18} {:<7} {}", "NODE", "ROUTE", "IP", "SOURCE", "NOTE");
+            for i in &e.ips {
+                println!("{:<12} {:<14} {:<18} {:<7} {}", i.node, i.route, i.ip.as_deref().unwrap_or("?"), i.source, i.error.as_deref().unwrap_or(""));
+            }
+            println!("\nSHARED IPS");
+            for s in &e.shared {
+                println!(
+                    "  {:<18} nodes {:<20} routes {:<34} providers {:<16} sessions {}",
+                    s.ip,
+                    s.nodes.join(","),
+                    s.routes.join(","),
+                    if s.providers.is_empty() { "-".into() } else { s.providers.join(",") },
+                    if s.sessions.is_empty() { "-".into() } else { s.sessions.join(",") }
+                );
+            }
+        }
+        Cmd::Quota { cmd } => match cmd {
+            QuotaCmd::Set { provider, scope_id, node, resets_at, remaining, note } => {
+                let resets_at = resets_at.as_deref().map(parse_when).transpose()?;
+                let v = api
+                    .post("/quotas/override", json!({"provider": provider, "scope_id": scope_id, "node": node, "resets_at": resets_at, "remaining": remaining, "note": note}))
+                    .await?;
+                if raw {
+                    return Ok(out(&v));
+                }
+                println!("override set on {}{}", v["nodes"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default(), resets_at.map(|t| format!("; resets in {}", until(Some(t)))).unwrap_or_default());
+            }
+            QuotaCmd::Clear { provider, scope_id, node } => {
+                let v = api.post("/quotas/override", json!({"provider": provider, "scope_id": scope_id, "node": node, "clear": true})).await?;
+                if raw {
+                    return Ok(out(&v));
+                }
+                println!("override cleared");
+            }
+        },
+        Cmd::Route { cmd } => match cmd {
+            RouteCmd::Set { node, agent, prefer, failover, on_exhausted } => {
+                api.post(&format!("/nodes/{node}/routes"), json!({"agent": agent, "route": {"prefer": prefer, "failover": failover, "on_exhausted": on_exhausted}})).await?;
+                println!("{node}/{agent}: prefer {prefer}{}", if failover.is_empty() { String::new() } else { format!(", then {}", failover.join(" → ")) });
+            }
+            RouteCmd::Clear { node, agent } => {
+                api.post(&format!("/nodes/{node}/routes"), json!({"agent": agent, "route": null})).await?;
+                println!("{node}/{agent}: route override removed");
             }
         },
         Cmd::Allow { cmd } => match cmd {

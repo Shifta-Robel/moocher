@@ -34,7 +34,9 @@ impl Store {
              CREATE TABLE IF NOT EXISTS instances(
                id TEXT PRIMARY KEY, report TEXT NOT NULL, cap TEXT NOT NULL, password TEXT NOT NULL,
                role TEXT NOT NULL DEFAULT 'worker', last_seq INTEGER NOT NULL DEFAULT 0, spec TEXT NOT NULL DEFAULT '{}');
-             CREATE TABLE IF NOT EXISTS outbox(seq INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL);",
+             CREATE TABLE IF NOT EXISTS outbox(seq INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS quota(provider TEXT NOT NULL, scope_id TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL,
+               PRIMARY KEY(provider, scope_id, kind));",
         )?;
         #[cfg(unix)]
         {
@@ -78,6 +80,26 @@ impl Store {
 
     pub fn delete_instance(&self, id: &str) -> Result<()> {
         self.conn.lock().unwrap().execute("DELETE FROM instances WHERE id=?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn quota_rows(&self) -> Result<Vec<(String, String, String, String)>> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c.prepare("SELECT provider, scope_id, kind, body FROM quota")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.filter_map(|r| r.ok()).collect();
+        Ok(rows)
+    }
+
+    pub fn put_quota_rows(&self, rows: &[(String, String, String, String)]) -> Result<()> {
+        let mut c = self.conn.lock().unwrap();
+        let tx = c.transaction()?;
+        for (p, s, k, b) in rows {
+            tx.execute(
+                "INSERT INTO quota(provider,scope_id,kind,body) VALUES(?1,?2,?3,?4) ON CONFLICT(provider,scope_id,kind) DO UPDATE SET body=excluded.body",
+                params![p, s, k, b],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 

@@ -334,6 +334,16 @@ impl Sup {
             NodeEvent::Activity { session, kind, detail } => {
                 self.log(&kind, Some(node), Some(&session), detail);
             }
+            NodeEvent::Egress { ips } => {
+                let _ = self.db.put_egress(node, &ips);
+                let summary: Vec<Value> = ips.iter().map(|e| json!({"route": e.route, "ip": e.ip, "source": e.source, "error": e.error})).collect();
+                self.log("node.egress", Some(node), None, json!({"ips": summary}));
+                let _ = self.stream.send(StreamEvent::Egress { node: node.into(), ips });
+            }
+            NodeEvent::Quotas { buckets } => {
+                let _ = self.db.put_quotas(node, &buckets);
+                let _ = self.stream.send(StreamEvent::Quotas { node: node.into() });
+            }
             NodeEvent::TurnEnded { session, last_text, todos, error } => {
                 self.log(
                     "session.turn_ended",
