@@ -102,6 +102,11 @@ impl Sup {
     /// Merge a node's session report, keeping supervisor-side metadata.
     pub fn merge_report(&self, report: SessionReport) -> SessionInfo {
         let info = match self.db.session(&report.id) {
+            Some(s) if s.report.state == SessionState::Stopped && report.state != SessionState::Stopped => {
+                // `stopped` is terminal: a late report from before the stop must not revive it.
+                tracing::debug!(session = %report.id, state = report.state.as_str(), "ignoring report for stopped session");
+                return s;
+            }
             Some(mut s) => {
                 if s.report.state != report.state {
                     self.log("session.state", Some(&report.node), Some(&report.id), json!({"from": s.report.state, "to": report.state}));
@@ -435,13 +440,23 @@ impl Sup {
         }
     }
 
+    /// Nodes with `running` recomputed from live sessions (the stored value is
+    /// only refreshed when a node attaches).
+    pub fn node_views(&self) -> Vec<NodeInfo> {
+        let mut nodes = self.db.nodes();
+        for n in &mut nodes {
+            n.running = self.live_on(&n.name);
+        }
+        nodes
+    }
+
     pub fn overview(&self) -> Overview {
         let sessions = self.db.sessions(false);
         let mut totals = TokenUsage::default();
         for s in self.db.sessions(true) {
             totals.add(&s.report.tokens);
         }
-        Overview { nodes: self.db.nodes(), sessions, tasks: self.db.tasks(), totals }
+        Overview { nodes: self.node_views(), sessions, tasks: self.db.tasks(), totals }
     }
 
     /// Housekeeping: sessions on long-disconnected nodes become `lost`.
@@ -480,5 +495,45 @@ pub fn truncate(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", s.chars().take(n).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report(id: &str, state: SessionState) -> SessionReport {
+        SessionReport {
+            id: id.into(),
+            node: "hub".into(),
+            agent: "builder".into(),
+            state,
+            opencode_id: None,
+            tokens: TokenUsage::default(),
+            todos: vec![],
+            current_task: None,
+            last_text: None,
+            error: None,
+            model: None,
+            workspace: None,
+            started_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn late_report_does_not_revive_stopped_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let sup = Sup::new(db, SupervisorConfig::default(), dir.path().into());
+        sup.merge_report(report("s-1", SessionState::Running));
+        sup.merge_report(report("s-1", SessionState::Stopped));
+        // A turn that ended just as the stop arrived reports idle afterwards.
+        sup.merge_report(report("s-1", SessionState::Idle));
+        assert_eq!(sup.session("s-1").unwrap().report.state, SessionState::Stopped);
+        // Other transitions are unaffected.
+        sup.merge_report(report("s-2", SessionState::Running));
+        sup.merge_report(report("s-2", SessionState::Idle));
+        assert_eq!(sup.session("s-2").unwrap().report.state, SessionState::Idle);
     }
 }

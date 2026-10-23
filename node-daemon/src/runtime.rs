@@ -286,8 +286,14 @@ impl Runtime {
         let out = tokio::time::timeout(timeout, cmd.output()).await.map_err(|_| anyhow::anyhow!("check timed out after {timeout:?}"))??;
         let mut text = String::from_utf8_lossy(&out.stdout).to_string();
         text.push_str(&String::from_utf8_lossy(&out.stderr));
-        let tail: String = text.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect();
-        Ok((out.status.code().unwrap_or(-1), tail))
+        let mut tail: String = text.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect();
+        let code = out.status.code().unwrap_or(-1);
+        // With no container, checks run with the host's tools; a missing tool
+        // looks like a failed check (e.g. pytest not installed on the host).
+        if self.kind == RuntimeKind::Process && (code == 127 || tail.contains("No module named")) {
+            tail.push_str("\n[opencode-cluster] runtime=process runs checks on the host: install the tool there, or use the podman runtime (the agent image has it).");
+        }
+        Ok((code, tail))
     }
 
     async fn podman(&self, args: &[&str]) -> Result<String> {

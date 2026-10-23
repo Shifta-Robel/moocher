@@ -341,11 +341,17 @@ impl Manager {
         self.link.emit(NodeEvent::TurnEnded { session: inst.id.clone(), last_text: None, todos: vec![], error: Some(msg) });
     }
 
-    /// Mutate the report, persist it and emit a snapshot.
+    /// Mutate the report, persist it and emit a snapshot. Once an instance is
+    /// stopping, late updates from in-flight tasks (a turn that ended just as
+    /// the stop arrived) may not move it out of `stopped`.
     fn update(&self, inst: &Arc<Instance>, f: impl FnOnce(&mut SessionReport)) {
         let snap = {
             let mut r = inst.report.lock().unwrap();
+            let before = r.state;
             f(&mut r);
+            if inst.stopping.load(Ordering::Relaxed) && r.state != SessionState::Stopped {
+                r.state = before;
+            }
             r.tokens = *inst.usage.lock().unwrap();
             r.updated_at = now_ms();
             r.clone()
@@ -585,6 +591,9 @@ impl Manager {
         }
         if let Ok(t) = inst.oc.todos(&oc_id).await {
             self.update(inst, |r| r.todos = t);
+        }
+        if inst.stopping.load(Ordering::Relaxed) {
+            return; // stopped while we were collecting; not a finished turn
         }
         let (last_text, todos, error) = {
             let r = inst.report.lock().unwrap();

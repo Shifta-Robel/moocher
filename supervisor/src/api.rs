@@ -132,7 +132,7 @@ async fn overview(State(sup): S) -> Json<Overview> {
 }
 
 async fn nodes(State(sup): S) -> Json<Vec<NodeInfo>> {
-    Json(sup.db.nodes())
+    Json(sup.node_views())
 }
 
 async fn agents(State(sup): S) -> Json<Value> {
