@@ -93,6 +93,14 @@ pub struct SpawnSpec {
     /// Coordinator sessions get the coordinator-only cluster tools.
     #[serde(default)]
     pub role: SessionRole,
+    /// Checked against the agent's `overridable` on the node.
+    #[serde(default)]
+    pub overrides: crate::config::SpawnOverrides,
+    /// For the preamble.
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub task: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +126,15 @@ pub enum NodeCommand {
     },
     /// Re-probe egress IPs now.
     ProbeEgress,
+    /// The hub's template library and cluster preamble (replaces the previous set).
+    SyncTemplates {
+        templates: Vec<crate::config::AgentConfig>,
+        #[serde(default)]
+        preamble: Option<String>,
+        hash: String,
+    },
+    /// The rendered instructions a session was started with.
+    ReadPreamble { session: String },
 }
 
 /// Cluster tools available to agents over MCP. `from_session` is added by the node.
@@ -132,7 +149,18 @@ pub enum AgentCall {
     ListSessions,
     SessionStatus { session: String },
     // Coordinator-only below.
-    Spawn { agent: String, prompt: String, #[serde(default)] node: Option<String>, #[serde(default)] title: Option<String>, #[serde(default)] share_workspace: bool },
+    Spawn {
+        agent: String,
+        prompt: String,
+        #[serde(default)]
+        node: Option<String>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        share_workspace: bool,
+        #[serde(default)]
+        overrides: crate::config::SpawnOverrides,
+    },
     Stop { session: String },
     TaskGet,
     TaskNote { note: String },

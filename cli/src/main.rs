@@ -64,7 +64,14 @@ enum Cmd {
         all: bool,
     },
     /// Details of one session (todos, output, tokens).
-    Show { session: String },
+    Show {
+        session: String,
+        /// Print the rendered instructions it was started with.
+        #[arg(long)]
+        preamble: bool,
+    },
+    /// The hub's template library and where each template can run.
+    Templates,
     /// Start a session from an agent profile.
     Spawn {
         agent: String,
@@ -77,6 +84,15 @@ enum Cmd {
         /// Use (or create) a shared workspace with this name.
         #[arg(long)]
         shared: Option<String>,
+        /// Extra instructions for this instance (template must allow role_append).
+        #[arg(long)]
+        append: Option<String>,
+        /// Budget for this instance in USD (up to the template's overridable.budget_usd).
+        #[arg(long)]
+        budget: Option<f64>,
+        /// Preferred egress route (one of the template's overridable.routes).
+        #[arg(long)]
+        route: Option<String>,
     },
     /// Send a message to a session (default: picked up at its next step).
     Send {
@@ -591,14 +607,15 @@ async fn run(cli: Cli) -> Result<()> {
             if raw {
                 return Ok(out(&v));
             }
-            println!("{:<12} {:<16} {:<34} {:<6}  {}", "NODE", "AGENT", "MODEL", "READY", "DESCRIPTION");
+            println!("{:<12} {:<16} {:<6} {:<34} {:<6}  {}", "NODE", "AGENT", "SOURCE", "MODEL", "READY", "DESCRIPTION");
             for a in v.as_array().into_iter().flatten() {
                 let ag = &a["agent"];
                 let ready = ag["secret_ok"].as_bool() == Some(true) && ag["errors"].as_array().is_none_or(|e| e.is_empty()) && a["connected"].as_bool() == Some(true);
                 println!(
-                    "{:<12} {:<16} {:<34} {:<6}  {}",
+                    "{:<12} {:<16} {:<6} {:<34} {:<6}  {}",
                     a["node"].as_str().unwrap_or(""),
                     ag["name"].as_str().unwrap_or(""),
+                    ag["source"].as_str().unwrap_or("local"),
                     format!("{}/{}", ag["provider"].as_str().unwrap_or(""), ag["model"].as_str().unwrap_or("")),
                     if ready { "yes" } else { "no" },
                     ag["description"].as_str().unwrap_or("")
@@ -612,7 +629,49 @@ async fn run(cli: Cli) -> Result<()> {
             }
             print_sessions(&serde_json::from_value::<Vec<SessionInfo>>(v)?);
         }
-        Cmd::Show { session } => {
+        Cmd::Show { session, preamble: true } => {
+            let v = api.get(&format!("/sessions/{session}/preamble")).await?;
+            if raw {
+                return Ok(out(&v));
+            }
+            println!("{}", v["preamble"].as_str().unwrap_or_default());
+        }
+        Cmd::Templates => {
+            let v = api.get("/templates").await?;
+            if raw {
+                return Ok(out(&v));
+            }
+            println!("{:<16} {:<30} {:<12} {:>9}  {:<24} {}", "TEMPLATE", "MODEL", "SECRET", "LIVE/MAX", "RUNNABLE ON", "OVERRIDABLE");
+            for t in v["templates"].as_array().into_iter().flatten() {
+                let o = &t["overridable"];
+                let mut ov = vec![];
+                if o["role_append"].as_bool() == Some(true) {
+                    ov.push("role_append".to_string());
+                }
+                if let Some(b) = o["budget_usd"].as_f64() {
+                    ov.push(format!("budget<=${b}"));
+                }
+                if let Some(r) = o["routes"].as_array().filter(|r| !r.is_empty()) {
+                    ov.push(format!("routes {}", r.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join("|")));
+                }
+                println!(
+                    "{:<16} {:<30} {:<12} {:>9}  {:<24} {}",
+                    t["name"].as_str().unwrap_or(""),
+                    t["model"].as_str().unwrap_or(""),
+                    t["secret"].as_str().unwrap_or("-"),
+                    format!("{}/{}", t["instances"]["live"], t["instances"]["max"].as_u64().map(|m| m.to_string()).unwrap_or("∞".into())),
+                    t["runnable_on"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(",")).filter(|s| !s.is_empty()).unwrap_or("-".into()),
+                    if ov.is_empty() { "-".into() } else { ov.join(", ") }
+                );
+                for b in t["not_runnable"].as_array().into_iter().flatten() {
+                    println!("    not on {}: {}", b["node"].as_str().unwrap_or(""), b["problems"].as_array().map(|p| p.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join("; ")).unwrap_or_default());
+                }
+            }
+            for e in v["errors"].as_array().into_iter().flatten() {
+                println!("error: {}", e.as_str().unwrap_or(""));
+            }
+        }
+        Cmd::Show { session, preamble: false } => {
             let v = api.get(&format!("/sessions/{session}")).await?;
             if raw {
                 return Ok(out(&v));
@@ -648,9 +707,19 @@ async fn run(cli: Cli) -> Result<()> {
                 println!("last output:\n{t}");
             }
         }
-        Cmd::Spawn { agent, prompt, node, title, shared } => {
+        Cmd::Spawn { agent, prompt, node, title, shared, append, budget, route } => {
             let ws = shared.map(|n| json!({"mode": "shared", "name": n}));
-            let v = api.post("/sessions", json!({"agent": agent, "prompt": prompt, "node": node, "title": title, "workspace": ws})).await?;
+            let mut ov = serde_json::Map::new();
+            if let Some(a) = append {
+                ov.insert("role_append".into(), json!(a));
+            }
+            if let Some(b) = budget {
+                ov.insert("budget_usd".into(), json!(b));
+            }
+            if let Some(r) = route {
+                ov.insert("route".into(), json!(r));
+            }
+            let v = api.post("/sessions", json!({"agent": agent, "prompt": prompt, "node": node, "title": title, "workspace": ws, "overrides": ov})).await?;
             if raw {
                 return Ok(out(&v));
             }

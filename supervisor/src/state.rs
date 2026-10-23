@@ -64,6 +64,7 @@ pub struct SpawnOpts {
     pub step: Option<String>,
     pub role: SessionRole,
     pub extra_instructions: Option<String>,
+    pub overrides: ocl_protocol::config::SpawnOverrides,
 }
 
 impl Sup {
@@ -173,6 +174,14 @@ impl Sup {
             parent_node: o.parent.as_deref().and_then(|p| self.db.session(p)).map(|p| p.report.node),
             workspace: o.workspace.as_ref().filter(|w| w.mode == WorkspaceMode::Shared).and_then(|w| w.name.clone()),
         };
+        // Cluster-wide instance cap from the template.
+        let max = self.db.nodes().iter().flat_map(|n| n.agents.iter()).filter(|a| a.name == o.agent).filter_map(|a| a.max_instances).min();
+        if let Some(max) = max {
+            let live = self.db.sessions(false).iter().filter(|s| s.report.agent == o.agent && s.report.state.is_live()).count() as u32;
+            if live >= max {
+                bail!("agent {} already has {live} live instance(s), its template allows {max}", o.agent);
+            }
+        }
         let (node, why) = self.place(&o.agent, o.node.as_deref(), &near)?;
         let id = ocl_protocol::new_id("s");
         let now = now_ms();
@@ -211,6 +220,9 @@ impl Sup {
             title: o.title.clone(),
             extra_instructions: o.extra_instructions.clone(),
             role: o.role,
+            overrides: o.overrides.clone(),
+            parent: o.parent.clone(),
+            task: o.task_id,
         };
         if let Err(e) = self.nodes.call(&node, NodeCommand::Spawn(spec), CMD_TIMEOUT).await {
             let mut s = self.db.session(&id).unwrap_or(info);
@@ -284,6 +296,12 @@ impl Sup {
             .map(|_| ());
         self.audit(actor, "session.permission", id, json!({"request": request, "reply": reply}), res.is_ok());
         res
+    }
+
+    pub async fn preamble(&self, id: &str) -> Result<String> {
+        let s = self.session(id)?;
+        let v = self.nodes.call(&s.report.node, NodeCommand::ReadPreamble { session: id.into() }, CMD_TIMEOUT).await?;
+        Ok(v["preamble"].as_str().unwrap_or_default().to_string())
     }
 
     pub async fn exec(&self, id: &str, command: &str, timeout_secs: u64) -> Result<(i64, String)> {
@@ -363,7 +381,16 @@ impl Sup {
                 let mut out: Vec<Value> = vec![];
                 for n in self.db.nodes().into_iter().filter(|n| n.connected) {
                     for a in n.agents.iter().filter(|a| a.secret_ok && a.errors.is_empty()) {
-                        out.push(json!({"agent": a.name, "description": a.description, "model": format!("{}/{}", a.provider, a.model), "node": n.name, "tier": a.tier}));
+                        out.push(json!({
+                            "agent": a.name,
+                            "description": a.description,
+                            "model": format!("{}/{}", a.provider, a.model),
+                            "node": n.name,
+                            "tier": a.tier,
+                            "source": a.source,
+                            "max_instances": a.max_instances,
+                            "overridable": a.overridable,
+                        }));
                     }
                 }
                 Ok(Value::Array(out))
@@ -378,7 +405,7 @@ impl Sup {
                 v["error"] = json!(s.report.error);
                 Ok(v)
             }
-            AgentCall::Spawn { agent, prompt, node: hint, title, share_workspace } => {
+            AgentCall::Spawn { agent, prompt, node: hint, title, share_workspace, overrides } => {
                 let (workspace, node_hint) = if share_workspace {
                     let ws = caller.report.workspace.as_deref().and_then(|w| w.strip_prefix("shared:")).map(|n| WorkspaceSpec { mode: WorkspaceMode::Shared, name: Some(n.into()) });
                     if ws.is_none() {
@@ -400,6 +427,7 @@ impl Sup {
                             workspace,
                             parent: Some(from.into()),
                             task_id: caller.task_id,
+                            overrides,
                             ..Default::default()
                         },
                     )

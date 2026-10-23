@@ -9,6 +9,7 @@ mod pki;
 mod placement;
 mod quotas;
 mod state;
+mod templates;
 mod tlslink;
 
 use anyhow::{Context, Result};
@@ -227,6 +228,7 @@ async fn run(dir: PathBuf, cfg: SupervisorConfig) -> Result<()> {
             }
         });
     }
+    tokio::spawn(sup.clone().watch_library());
     sup.audit(&state::Actor::System, "supervisor.start", "-", serde_json::json!({"version": ocl_protocol::VERSION}), true);
     tracing::info!(api = %api_listen, link = %sock.display(), "supervisor running");
     let sup2: Arc<state::Sup> = sup.clone();

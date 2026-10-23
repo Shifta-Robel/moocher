@@ -19,7 +19,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
-use ocl_protocol::config::{AuthStyle, OnExhausted, Route};
+use ocl_protocol::config::{AuthStyle, OnExhausted, Route, SpawnOverrides};
 use ocl_protocol::link::{AgentCall, NodeEvent};
 use ocl_protocol::model::{now_ms, SessionRole, TokenUsage, Ts};
 use serde_json::{json, Value};
@@ -47,6 +47,8 @@ pub struct Gateway {
     prev: Arc<Mutex<Option<(Target, String, u64)>>>,
     /// Route of the last successful call (to report failovers once).
     last_route: Arc<Mutex<Option<String>>>,
+    /// Per-instance changes allowed by the template (budget, preferred route).
+    overrides: Arc<SpawnOverrides>,
 }
 
 const MAX_BODY: usize = 32 * 1024 * 1024;
@@ -59,7 +61,8 @@ pub struct GatewayDeps {
 }
 
 impl Gateway {
-    pub fn new(id: &str, agent: &str, role: SessionRole, cap: &str, usage: Arc<Mutex<TokenUsage>>, parked: Parked, deps: &GatewayDeps) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(id: &str, agent: &str, role: SessionRole, cap: &str, usage: Arc<Mutex<TokenUsage>>, parked: Parked, overrides: SpawnOverrides, deps: &GatewayDeps) -> Self {
         Gateway {
             id: id.into(),
             agent: agent.into(),
@@ -73,6 +76,7 @@ impl Gateway {
             parked,
             prev: Arc::new(Mutex::new(None)),
             last_route: Arc::new(Mutex::new(None)),
+            overrides: Arc::new(overrides),
         }
     }
 
@@ -169,7 +173,7 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
     };
     let usage_total = {
         let u = *g.usage.lock().unwrap();
-        if let Some(b) = agent.cfg.limits.budget_usd {
+        if let Some(b) = g.overrides.budget_usd.or(agent.cfg.limits.budget_usd) {
             if u.cost_usd >= b {
                 return llm_error(StatusCode::TOO_MANY_REQUESTS, &format!("session budget ${b:.2} exhausted"));
             }
@@ -195,10 +199,10 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
             }
         }
     }
-    let secret = match &agent.cfg.provider.key {
-        None => None,
-        Some(r) => match crate::secrets::resolve(r) {
-            Ok(s) => Some(s),
+    let (secret, account) = match &agent.cfg.provider.key {
+        None => (None, None),
+        Some(r) => match snap.secret(r) {
+            Ok((s, account)) => (Some(s), account),
             Err(e) => {
                 tracing::warn!(agent = %g.agent, error = %e, "secret unresolvable");
                 return llm_error(StatusCode::BAD_GATEWAY, "provider credential unavailable on this node");
@@ -240,7 +244,14 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
     g.settle_tokens();
 
     // Try the preferred route, then the failovers, skipping exhausted allowances.
-    let plan = snap.route_plan(&agent.cfg);
+    let mut plan = snap.route_plan(&agent.cfg);
+    if let Some(r) = &g.overrides.route {
+        // The spawner chose where this instance prefers to go; failovers stay.
+        plan.failover.retain(|f| f != r);
+        if plan.prefer != *r {
+            plan.failover.insert(0, std::mem::replace(&mut plan.prefer, r.clone()));
+        }
+    }
     let mut names: Vec<String> = vec![];
     for n in std::iter::once(plan.prefer.clone()).chain(plan.failover.iter().cloned()) {
         if !names.contains(&n) {
@@ -248,7 +259,6 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
         }
     }
     let scope = quota::default_scope(&pdef, secret.is_some());
-    let account = agent.cfg.provider.key.as_ref().and_then(|k| k.account.clone());
     let mut skipped: Vec<String> = vec![];
     let mut soonest: Option<Ts> = None;
     let mut all_exhausted = true;
@@ -436,10 +446,19 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "spawn_agent",
-        desc: "Start a new agent session from a profile (see list_agents) with an initial prompt. Returns its session id. You are notified when it finishes a turn. share_workspace=true gives it your workspace.",
+        desc: "Start a new agent instance from a template (see list_agents) with an initial prompt. Returns its session id. You are notified when it finishes a turn. share_workspace=true gives it your workspace. role_append / budget_usd / route customise this instance where the template's `overridable` allows it.",
         schema: || {
             obj(
-                json!({"agent": {"type": "string"}, "prompt": {"type": "string"}, "title": {"type": "string"}, "node": {"type": "string"}, "share_workspace": {"type": "boolean"}}),
+                json!({
+                    "agent": {"type": "string"},
+                    "prompt": {"type": "string"},
+                    "title": {"type": "string"},
+                    "node": {"type": "string", "description": "pin to a node (see list_nodes); default: the supervisor chooses"},
+                    "share_workspace": {"type": "boolean"},
+                    "role_append": {"type": "string", "description": "extra standing instructions for this instance"},
+                    "budget_usd": {"type": "number"},
+                    "route": {"type": "string", "description": "preferred egress route"}
+                }),
                 &["agent", "prompt"],
             )
         },
@@ -456,6 +475,16 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef { name: "task_fail", desc: "Give up on your task with a reason.", schema: || obj(json!({"reason": {"type": "string"}}), &["reason"]), coordinator: true },
 ];
+
+/// Cluster tools a session with this role and allowlist can call (for the preamble).
+pub fn tool_names(role: SessionRole, allow: Option<&[String]>) -> Vec<&'static str> {
+    TOOLS
+        .iter()
+        .filter(|t| !t.coordinator || role == SessionRole::Coordinator)
+        .filter(|t| allow.is_none_or(|l| l.iter().any(|n| n == t.name)))
+        .map(|t| t.name)
+        .collect()
+}
 
 impl Gateway {
     fn tool_allowed(&self, t: &ToolDef) -> bool {
@@ -489,6 +518,7 @@ fn to_call(name: &str, a: &Value) -> Result<AgentCall, String> {
             node: s("node").ok(),
             title: s("title").ok(),
             share_workspace: a.get("share_workspace").and_then(|v| v.as_bool()).unwrap_or(false),
+            overrides: SpawnOverrides { role_append: s("role_append").ok(), budget_usd: a.get("budget_usd").and_then(|v| v.as_f64()), route: s("route").ok() },
         },
         "stop_session" => AgentCall::Stop { session: s("session")? },
         "task_get" => AgentCall::TaskGet,

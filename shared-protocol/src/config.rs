@@ -10,6 +10,8 @@
 //! overrides.yaml       OverridesFile     (optional; written by the node for live UI/CLI changes)
 //! agents/*.yaml        AgentConfig       (one file per agent profile)
 //! workflows/*.yaml     WorkflowConfig    (hub only)
+//! templates/*.yaml     AgentConfig       (hub only; pushed to every node)
+//! preambles/cluster.md                   (hub only; first part of every agent's instructions)
 //! prompts/*.md         referenced by agents via role.system_prompt_file
 //! ```
 //!
@@ -56,6 +58,10 @@ pub struct NodeConfig {
     /// IPs (applies to `direct` routes and to traffic relayed for others).
     #[serde(default)]
     pub egress_bind: Option<String>,
+    /// Secret aliases for hub templates: `openrouter: { ref: "env:OPENROUTER_API_KEY", account: personal }`.
+    /// A template names the alias (`key: { secret: openrouter }`); each node maps it to its own secret.
+    #[serde(default)]
+    pub secrets: BTreeMap<String, SecretRef>,
     /// URLs that answer with the caller's public IP, used to learn the egress
     /// IP of each route (per-IP quotas). Empty disables probing; remote nodes
     /// still learn their direct IP from the hub.
@@ -753,6 +759,73 @@ pub struct AgentConfig {
     pub success: SuccessSpec,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// Cluster-wide limits on instances of this template.
+    #[serde(default)]
+    pub instances: InstanceLimits,
+    /// What whoever spawns an instance (operator or coordinator) may change.
+    #[serde(default)]
+    pub overridable: Overridable,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InstanceLimits {
+    /// Live instances across the whole cluster.
+    #[serde(default)]
+    pub max: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Overridable {
+    /// Extra instructions for one instance.
+    #[serde(default)]
+    pub role_append: bool,
+    /// Highest per-instance budget a spawner may set.
+    #[serde(default)]
+    pub budget_usd: Option<f64>,
+    /// Route names a spawner may choose from.
+    #[serde(default)]
+    pub routes: Vec<String>,
+}
+
+/// Per-instance changes requested at spawn, checked against `overridable`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_append: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+}
+
+impl SpawnOverrides {
+    pub fn is_empty(&self) -> bool {
+        self == &SpawnOverrides::default()
+    }
+
+    /// Why these overrides are not allowed for `agent`, if they are not.
+    pub fn check(&self, agent: &AgentConfig) -> Result<(), String> {
+        let o = &agent.overridable;
+        if self.role_append.is_some() && !o.role_append {
+            return Err(format!("agent {} does not allow role_append (overridable.role_append)", agent.name));
+        }
+        if let Some(b) = self.budget_usd {
+            match o.budget_usd {
+                Some(max) if b <= max && b > 0.0 => {}
+                Some(max) => return Err(format!("budget_usd {b} is outside 0..{max} allowed for {}", agent.name)),
+                None => return Err(format!("agent {} does not allow a budget override (overridable.budget_usd)", agent.name)),
+            }
+        }
+        if let Some(r) = &self.route {
+            if !o.routes.contains(r) {
+                return Err(format!("route {r:?} is not in {}'s overridable.routes {:?}", agent.name, o.routes));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn default_api_version() -> String {
@@ -779,14 +852,18 @@ pub struct ProviderRef {
 }
 
 /// Reference to a secret held on the node: `env:NAME`, `file:/path`,
-/// `systemd-creds:NAME` (from `$CREDENTIALS_DIRECTORY`), `pass:entry`.
+/// `systemd-creds:NAME` (from `$CREDENTIALS_DIRECTORY`), `pass:entry` —
+/// or `secret: <alias>`, resolved through the node's `secrets:` map.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SecretRef {
-    #[serde(rename = "ref")]
+    #[serde(rename = "ref", default, skip_serializing_if = "String::is_empty")]
     pub reference: String,
+    /// Alias from node.yaml `secrets:` (hub templates use these).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
     /// Usage of keys with the same label is shown as one account (scope `account`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
 }
 
@@ -802,6 +879,10 @@ pub struct Role {
     /// Built-in OpenCode agent to start in (`build`, `plan`, ...).
     #[serde(default = "default_oc_agent")]
     pub opencode_agent: String,
+    /// Template-specific preamble, after the cluster preamble and before the
+    /// role prompt. Variables as in preambles/cluster.md.
+    #[serde(default)]
+    pub preamble: Option<String>,
 }
 
 fn default_oc_agent() -> String {
@@ -1074,6 +1155,11 @@ impl AgentConfig {
         if !valid_name(&self.name) {
             errs.push(format!("agent name {:?} must match [a-z0-9-]{{1,48}}", self.name));
         }
+        if let Some(k) = &self.provider.key {
+            if k.reference.is_empty() == k.secret.is_none() {
+                errs.push("provider.key needs exactly one of `ref` or `secret`".into());
+            }
+        }
         match providers.get(&self.provider.id) {
             None => errs.push(format!("unknown provider {:?}", self.provider.id)),
             Some(p) => {
@@ -1141,6 +1227,23 @@ success: { todos: ["write module"], checks: [ { exit_code: "pytest -q" } ] }
         )
         .unwrap();
         assert_eq!(r.routes["b"], Route::ViaNode { node: "vps-de".into() });
+    }
+
+    #[test]
+    fn overrides_follow_the_template() {
+        let a: AgentConfig = serde_yaml::from_str(
+            "name: t\nprovider: { id: groq, model: m, key: { secret: groq } }\noverridable: { role_append: true, budget_usd: 1.0, routes: [direct] }",
+        )
+        .unwrap();
+        assert!(a.validate(&builtin_providers()).is_empty(), "a secret alias counts as a key");
+        let ok = SpawnOverrides { role_append: Some("x".into()), budget_usd: Some(0.5), route: Some("direct".into()) };
+        assert!(ok.check(&a).is_ok());
+        assert!(SpawnOverrides { budget_usd: Some(2.0), ..Default::default() }.check(&a).is_err());
+        assert!(SpawnOverrides { route: Some("via-x".into()), ..Default::default() }.check(&a).is_err());
+        let strict: AgentConfig = serde_yaml::from_str("name: s\nprovider: { id: kilo-free, model: auto }").unwrap();
+        assert!(SpawnOverrides { role_append: Some("x".into()), ..Default::default() }.check(&strict).is_err());
+        let both: AgentConfig = serde_yaml::from_str("name: b\nprovider: { id: groq, model: m, key: { ref: 'env:X', secret: y } }").unwrap();
+        assert_eq!(both.validate(&builtin_providers()).len(), 1);
     }
 
     #[test]

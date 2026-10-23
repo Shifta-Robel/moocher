@@ -59,6 +59,7 @@ pub struct Instance {
     /// Set by the gateway while every route's allowance is used up.
     parked: crate::gateway::Parked,
     gateway: Mutex<Option<Gateway>>,
+    overrides: Mutex<SpawnOverrides>,
     /// Tool calls already reported as activity (part ids).
     seen_tools: Mutex<HashSet<String>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -202,6 +203,21 @@ impl Manager {
                 self.gw.quotas.touch();
                 Ok(json!({"ok": true}))
             }
+            NodeCommand::SyncTemplates { templates, preamble, hash } => {
+                if self.cfg.get().hub_hash != hash {
+                    let n = templates.len();
+                    let s = self.cfg.set_hub(&crate::cfgstore::HubSet { templates, preamble, hash })?;
+                    tracing::info!(templates = n, "hub template library updated");
+                    let agents = if s.node.role == NodeRole::Relay { vec![] } else { s.agent_infos() };
+                    self.link.emit(NodeEvent::Agents { agents });
+                }
+                Ok(json!({"ok": true}))
+            }
+            NodeCommand::ReadPreamble { session } => {
+                let inst = self.get(&session)?;
+                let text = std::fs::read_to_string(inst.paths.etc.join("ROLE.md")).context("reading the session's instructions")?;
+                Ok(json!({"preamble": text}))
+            }
             NodeCommand::ProbeEgress => {
                 self.gw.egress.probe().await;
                 Ok(json!({"ips": self.gw.egress.snapshot()}))
@@ -268,6 +284,7 @@ impl Manager {
             usage: Arc::new(Mutex::new(report.tokens)),
             parked: Arc::new(Mutex::new(None)),
             gateway: Mutex::new(None),
+            overrides: Mutex::new(SpawnOverrides::default()),
             turn_open: AtomicBool::new(matches!(report.state, SessionState::Running | SessionState::Blocked | SessionState::Parked)),
             report: Mutex::new(report),
             msg_usage: Mutex::new(HashMap::new()),
@@ -292,6 +309,12 @@ impl Manager {
         }
         if !valid_id(&spec.id) {
             bail!("invalid session id {:?}", spec.id);
+        }
+        spec.overrides.check(&agent.cfg).map_err(|e| anyhow!(e))?;
+        if let Some(r) = &spec.overrides.route {
+            if snap.route(r).is_none() {
+                bail!("node {} has no route {r:?}", self.node);
+            }
         }
         {
             let map = self.instances.lock().unwrap();
@@ -334,6 +357,7 @@ impl Manager {
             updated_at: now,
         };
         let inst = self.new_instance(&spec.id, &spec.agent, spec.role, paths.clone(), &password, report.clone());
+        *inst.overrides.lock().unwrap() = spec.overrides.clone();
         self.store.put_instance(&InstanceRow {
             id: spec.id.clone(),
             report: report.clone(),
@@ -373,7 +397,8 @@ impl Manager {
     }
 
     fn start_gateway(&self, inst: &Arc<Instance>, cap: &str) -> Result<()> {
-        let gw = Gateway::new(&inst.id, &inst.agent, inst.role, cap, inst.usage.clone(), inst.parked.clone(), &self.gw);
+        let ov = inst.overrides.lock().unwrap().clone();
+        let gw = Gateway::new(&inst.id, &inst.agent, inst.role, cap, inst.usage.clone(), inst.parked.clone(), ov, &self.gw);
         *inst.gateway.lock().unwrap() = Some(gw.clone());
         let h = gw.serve(inst.paths.node_sock())?;
         inst.tasks.lock().unwrap().push(h);
@@ -762,6 +787,9 @@ impl Manager {
             let paths = InstancePaths { run: self.run_root.join(&row.id), etc: inst_dir.join("etc"), home: inst_dir.join("home"), workspace: ws };
             let role = if row.role == "coordinator" { SessionRole::Coordinator } else { SessionRole::Worker };
             let inst = self.new_instance(&row.id, &row.report.agent, role, paths, &row.password, row.report.clone());
+            if let Ok(spec) = serde_json::from_str::<SpawnSpec>(&row.spec_json) {
+                *inst.overrides.lock().unwrap() = spec.overrides;
+            }
             self.instances.lock().unwrap().insert(row.id.clone(), inst.clone());
             let Some(f) = f else {
                 tracing::warn!(session = %row.id, "container gone; marking lost");
@@ -908,17 +936,23 @@ fn perm_json(p: &PermRule) -> Value {
     }
 }
 
-const CLUSTER_BRIEFING: &str = r#"
-## Operating in opencode-cluster
+/// Built-in cluster preamble, used unless the hub ships `preambles/cluster.md`.
+/// Variables: {{instance.id}} {{template}} {{node}} {{parent}} {{task}}
+/// {{budget}} {{model}} {{tools}} {{question_mode}}.
+pub const DEFAULT_PREAMBLE: &str = r#"## Operating in opencode-cluster
 
-You are one agent in a cluster of OpenCode agents supervised by an operator.
+You are instance `{{instance.id}}` of the `{{template}}` agent, running on node
+`{{node}}` with model {{model}}. You answer to {{parent}}. Task: {{task}}.
 
 - Keep a todo list with the `todowrite` tool from the start of every task and keep
   it current. Your work is judged by it: a task counts as done only when every
   item is `completed`. Mark items `cancelled` only if they truly cannot be done.
-- Cluster tools are available as `cluster_*` (send_message, read_inbox,
-  list_agents, list_sessions, session_status, and for coordinators spawn_agent,
-  task_* ...). Messages from other agents and the operator may arrive between turns.
+- Cluster tools available to you: {{tools}} (called as `cluster_<name>`).
+  Messages from other agents and the operator may arrive between turns.
+- Budget: {{budget}}. If a provider allowance runs out you may be paused until it
+  resets; that is expected, just continue when you are resumed.
+- Questions: the operator's mode is `{{question_mode}}`. Decide what you can
+  yourself; ask (or tell whoever started you) only about what you cannot.
 - Your workspace is the current directory. Other agents only see files you
   share explicitly or that live in a shared workspace.
 - Never try to read or print credentials; you do not have any.
@@ -941,13 +975,38 @@ fn write_opencode_config(
         RuntimeKind::Podman => "/etc/ocl".to_string(),
         RuntimeKind::Process => paths.etc.display().to_string(),
     };
+    // Layered instructions: cluster preamble, template preamble, role prompt,
+    // orchestration briefing (e.g. coordinator), the spawner's additions.
+    let budget = spec.overrides.budget_usd.or(a.limits.budget_usd).map(|b| format!("${b:.2} for this session")).unwrap_or_else(|| "no fixed limit".into());
+    let tools = crate::gateway::tool_names(spec.role, a.tools.cluster.as_deref()).join(", ");
+    let vars: [(&str, String); 9] = [
+        ("{{instance.id}}", spec.id.clone()),
+        ("{{template}}", a.name.clone()),
+        ("{{node}}", snap.node.name.clone()),
+        ("{{parent}}", spec.parent.as_ref().map(|p| format!("session `{p}`")).unwrap_or_else(|| "the operator".into())),
+        ("{{task}}", spec.task.map(|t| format!("#{t}")).unwrap_or_else(|| "none".into())),
+        ("{{budget}}", budget),
+        ("{{model}}", format!("{}/{}", a.provider.id, a.provider.model)),
+        ("{{tools}}", tools),
+        ("{{question_mode}}", "important_and_vital".into()),
+    ];
+    let render = |s: &str| vars.iter().fold(s.to_string(), |acc, (k, v)| acc.replace(k, v));
     let mut role = String::new();
-    role.push_str(&format!("# Role: {}\n\nYou are agent `{}` (cluster session `{}`). {}\n\n", a.name, a.name, spec.id, a.description));
+    role.push_str(&render(snap.hub_preamble.as_deref().unwrap_or(DEFAULT_PREAMBLE)));
+    role.push_str(&format!("\n# Role: {}\n\n{}\n\n", a.name, a.description));
+    if let Some(p) = &a.role.preamble {
+        role.push_str(&render(p));
+        role.push_str("\n\n");
+    }
     role.push_str(&agent.role_text);
-    role.push_str("\n");
-    role.push_str(CLUSTER_BRIEFING);
+    role.push('\n');
     if let Some(extra) = &spec.extra_instructions {
-        role.push_str("\n");
+        role.push('\n');
+        role.push_str(extra);
+        role.push('\n');
+    }
+    if let Some(extra) = &spec.overrides.role_append {
+        role.push_str("\n## Instructions for this instance\n\n");
         role.push_str(extra);
         role.push('\n');
     }

@@ -14,6 +14,8 @@ pub struct SpawnRequest {
     pub title: Option<String>,
     #[serde(default)]
     pub workspace: Option<crate::config::WorkspaceSpec>,
+    #[serde(default)]
+    pub overrides: crate::config::SpawnOverrides,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

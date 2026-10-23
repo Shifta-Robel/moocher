@@ -111,6 +111,8 @@ pub fn router(sup: Arc<Sup>) -> Router {
         .route("/sessions", get(sessions).post(spawn))
         .route("/sessions/{id}", get(session).delete(stop))
         .route("/sessions/{id}/message", post(message))
+        .route("/sessions/{id}/preamble", get(preamble))
+        .route("/templates", get(templates))
         .route("/sessions/{id}/interrupt", post(interrupt))
         .route("/sessions/{id}/permissions/{req}", post(permission))
         .route("/tasks", get(tasks).post(create_task))
@@ -186,6 +188,14 @@ async fn remove_allowed_source(State(sup): S, Extension(c): Extension<Caller>, J
     Ok(Json(json!({"ok": true, "disconnected": dropped})))
 }
 
+async fn preamble(State(sup): S, Path(id): Path<String>) -> R<Value> {
+    Ok(Json(json!({"session": id, "preamble": sup.preamble(&id).await?})))
+}
+
+async fn templates(State(sup): S) -> Json<Value> {
+    Json(sup.templates_view())
+}
+
 async fn quotas(State(sup): S) -> Json<Vec<QuotaView>> {
     Json(sup.quota_views())
 }
@@ -237,7 +247,7 @@ async fn session(State(sup): S, Path(id): Path<String>) -> R<SessionInfo> {
 async fn spawn(State(sup): S, Extension(c): Extension<Caller>, Json(r): Json<SpawnRequest>) -> R<SessionInfo> {
     c.need(Scope::Operate)?;
     let s = sup
-        .spawn(&c.actor(), SpawnOpts { agent: r.agent, prompt: r.prompt, node: r.node, title: r.title, workspace: r.workspace, ..Default::default() })
+        .spawn(&c.actor(), SpawnOpts { agent: r.agent, prompt: r.prompt, node: r.node, title: r.title, workspace: r.workspace, overrides: r.overrides, ..Default::default() })
         .await?;
     Ok(Json(s))
 }

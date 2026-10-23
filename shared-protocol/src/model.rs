@@ -188,6 +188,17 @@ pub struct AgentInfo {
     /// Route plan on this node: preferred route first, then failovers.
     #[serde(default)]
     pub routes: Vec<String>,
+    /// `local` (agents/ on the node) or `hub` (the hub's template library).
+    #[serde(default = "default_source")]
+    pub source: String,
+    #[serde(default)]
+    pub max_instances: Option<u32>,
+    #[serde(default)]
+    pub overridable: crate::config::Overridable,
+}
+
+fn default_source() -> String {
+    "local".into()
 }
 
 /// Provider latency over one route of one node, measured from real calls.

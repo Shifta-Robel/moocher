@@ -248,6 +248,14 @@ impl NodeLink for LinkService {
         let welcome = serde_json::to_vec(&SupMsg::Welcome { last_seq, observed_ip: admission.observed_ip.clone() }).unwrap();
         let _ = tx.send(Ok(Envelope { seq: 0, ack: 0, json: welcome })).await;
         tracing::info!(node = %node, last_seq, sessions = hello.sessions.len(), peer = ?admission.observed_ip, "node attached");
+        {
+            let sup = sup.clone();
+            let node = node.clone();
+            tokio::spawn(async move {
+                let lib = sup.load_library();
+                sup.sync_templates(&node, &lib).await;
+            });
+        }
 
         tokio::spawn(async move {
             let mut acked = last_seq;
