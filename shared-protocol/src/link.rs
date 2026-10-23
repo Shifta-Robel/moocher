@@ -21,6 +21,8 @@ pub enum NodeMsg {
     RenewCert { req: u64, csr_pem: String },
     /// Answer to `SupMsg::Ping` (link round-trip time).
     Pong { ts: i64 },
+    /// Resource samples, best effort (not kept in the outbox).
+    Stats { host: HostStats, instances: Vec<InstanceStats> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

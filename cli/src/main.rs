@@ -47,6 +47,8 @@ enum Cmd {
     },
     /// Egress IP of every route, and which nodes/sessions share an IP.
     Ips,
+    /// Host and per-instance CPU, memory, processes and disk.
+    Stats,
     /// Tell the cluster when a provider allowance resets / how much is left.
     Quota {
         #[command(subcommand)]
@@ -527,6 +529,36 @@ async fn run(cli: Cli) -> Result<()> {
                     q.source,
                     q.nodes.join(","),
                     q.sessions.join(",")
+                );
+            }
+        }
+        Cmd::Stats => {
+            let v = api.get("/stats").await?;
+            if raw {
+                return Ok(out(&v));
+            }
+            let mib = |b: Option<u64>| b.map(|b| format!("{:.0}M", b as f64 / (1 << 20) as f64)).unwrap_or("-".into());
+            println!("{:<12} {:>5} {:>6} {:>17} {:>19}", "HOST", "CPUS", "LOAD", "MEM AVAIL/TOTAL", "DISK FREE/TOTAL");
+            for h in v["hosts"].as_array().into_iter().flatten() {
+                println!(
+                    "{:<12} {:>5} {:>6.2} {:>17} {:>19}",
+                    h["node"].as_str().unwrap_or(""),
+                    h["cpus"].as_u64().unwrap_or(0),
+                    h["load1"].as_f64().unwrap_or(0.0),
+                    format!("{}/{}", mib(h["mem_available"].as_u64()), mib(h["mem_total"].as_u64())),
+                    format!("{}/{}", mib(h["disk_free"].as_u64()), mib(h["disk_total"].as_u64()))
+                );
+            }
+            println!("\n{:<14} {:<12} {:>6} {:>13} {:>5} {:>13}", "SESSION", "NODE", "CPU%", "MEM/LIMIT", "PIDS", "DISK/LIMIT");
+            for s in v["instances"].as_array().into_iter().flatten() {
+                println!(
+                    "{:<14} {:<12} {:>6} {:>13} {:>5} {:>13}",
+                    s["session"].as_str().unwrap_or(""),
+                    s["node"].as_str().unwrap_or(""),
+                    s["cpu_pct"].as_f64().map(|c| format!("{c:.1}")).unwrap_or("-".into()),
+                    format!("{}/{}", mib(s["mem_bytes"].as_u64()), mib(s["mem_limit"].as_u64())),
+                    s["pids"].as_u64().map(|p| p.to_string()).unwrap_or("-".into()),
+                    format!("{}/{}", mib(s["disk_bytes"].as_u64()), mib(s["disk_limit"].as_u64()))
                 );
             }
         }

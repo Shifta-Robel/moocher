@@ -30,6 +30,7 @@ pub struct Sup {
     /// Last audit time per (node, rejection reason): a rejected node retries
     /// for as long as it runs, which should not flood the audit log.
     pub rejections: std::sync::Mutex<std::collections::HashMap<String, Ts>>,
+    pub stats: std::sync::Mutex<crate::resources::StatsMem>,
 }
 
 /// Who performed an action, for the audit log.
@@ -70,7 +71,7 @@ pub struct SpawnOpts {
 impl Sup {
     pub fn new(db: Db, cfg: SupervisorConfig, config_dir: PathBuf) -> Arc<Sup> {
         let (stream, _) = broadcast::channel(1024);
-        Arc::new(Sup { db, cfg, config_dir, nodes: Registry::default(), stream, orch_lock: tokio::sync::Mutex::new(()), ca: std::sync::OnceLock::new(), rejections: Default::default() })
+        Arc::new(Sup { db, cfg, config_dir, nodes: Registry::default(), stream, orch_lock: tokio::sync::Mutex::new(()), ca: std::sync::OnceLock::new(), rejections: Default::default(), stats: Default::default() })
     }
 
     pub fn audit(&self, actor: &Actor, action: &str, target: &str, detail: Value, ok: bool) {

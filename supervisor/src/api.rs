@@ -112,6 +112,8 @@ pub fn router(sup: Arc<Sup>) -> Router {
         .route("/sessions/{id}", get(session).delete(stop))
         .route("/sessions/{id}/message", post(message))
         .route("/sessions/{id}/preamble", get(preamble))
+        .route("/sessions/{id}/stats", get(session_stats))
+        .route("/stats", get(stats))
         .route("/templates", get(templates))
         .route("/sessions/{id}/interrupt", post(interrupt))
         .route("/sessions/{id}/permissions/{req}", post(permission))
@@ -190,6 +192,15 @@ async fn remove_allowed_source(State(sup): S, Extension(c): Extension<Caller>, J
 
 async fn preamble(State(sup): S, Path(id): Path<String>) -> R<Value> {
     Ok(Json(json!({"session": id, "preamble": sup.preamble(&id).await?})))
+}
+
+async fn stats(State(sup): S) -> Json<Value> {
+    Json(sup.stats_view())
+}
+
+async fn session_stats(State(sup): S, Path(id): Path<String>) -> R<Value> {
+    sup.session(&id)?;
+    Ok(Json(sup.session_stats(&id)))
 }
 
 async fn templates(State(sup): S) -> Json<Value> {

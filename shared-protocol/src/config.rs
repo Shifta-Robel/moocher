@@ -961,11 +961,22 @@ pub struct ContainerSpec {
     /// `none` (default): no network at all, everything goes through the node socket.
     #[serde(default)]
     pub egress: Egress,
+    /// Disk the instance may use (workspace + OpenCode home), e.g. `5g`. Soft
+    /// limit: at 90% the agent is told, at 100% it is interrupted.
+    #[serde(default)]
+    pub disk: Option<String>,
+    /// Size of the in-memory `/tmp` (tmpfs).
+    #[serde(default = "default_tmp")]
+    pub tmp: String,
+}
+
+fn default_tmp() -> String {
+    "512m".into()
 }
 
 impl Default for ContainerSpec {
     fn default() -> Self {
-        ContainerSpec { image: None, memory: default_memory(), cpus: default_cpus(), pids: default_pids(), egress: Egress::None }
+        ContainerSpec { image: None, memory: default_memory(), cpus: default_cpus(), pids: default_pids(), egress: Egress::None, disk: None, tmp: default_tmp() }
     }
 }
 

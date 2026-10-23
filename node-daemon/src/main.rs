@@ -11,6 +11,7 @@ mod quota;
 mod relay;
 mod runtime;
 mod secrets;
+mod stats;
 mod store;
 
 use anyhow::{Context, Result};
@@ -218,6 +219,18 @@ async fn run(dir: PathBuf) -> Result<()> {
                     _ = reprobe.notified() => {}
                     _ = link.ip_changed() => {}
                 }
+            }
+        });
+    }
+    // Resource samples every 10 s (best effort; the hub keeps the history).
+    {
+        let (mgr, link) = (mgr.clone(), link.clone());
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                iv.tick().await;
+                let (host, instances) = mgr.collect_stats().await;
+                link.send_live(&ocl_protocol::link::NodeMsg::Stats { host, instances }).await;
             }
         });
     }

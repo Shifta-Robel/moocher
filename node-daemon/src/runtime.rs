@@ -59,6 +59,8 @@ pub struct Runtime {
     bridge_bin: PathBuf,
     /// process runtime: id -> (child pid, gateway port)
     procs: Mutex<HashMap<String, (u32, u16)>>,
+    /// podman: id -> cgroup v2 directory (looked up once)
+    cgroups: Mutex<HashMap<String, PathBuf>>,
 }
 
 pub fn container_name(id: &str) -> String {
@@ -81,6 +83,7 @@ impl Runtime {
             opencode_bin: opencode_bin.unwrap_or_else(|| "opencode".into()),
             bridge_bin,
             procs: Mutex::new(HashMap::new()),
+            cgroups: Mutex::new(HashMap::new()),
         })
     }
 
@@ -147,12 +150,12 @@ impl Runtime {
                 "--cap-drop=all",
                 "--security-opt=no-new-privileges",
                 "--read-only",
-                "--tmpfs",
-                "/tmp:rw,size=512m",
                 "--init",
             ]
             .map(String::from),
         );
+        a.push("--tmpfs".into());
+        a.push(format!("/tmp:rw,size={}", s.container.tmp));
         a.push(format!("--memory={}", s.container.memory));
         a.push(format!("--cpus={}", s.container.cpus));
         a.push(format!("--pids-limit={}", s.container.pids));
@@ -218,7 +221,33 @@ impl Runtime {
         Ok(())
     }
 
+    /// Where to read an instance's resource usage from.
+    pub async fn stats_source(&self, id: &str) -> crate::stats::Source {
+        match self.kind {
+            RuntimeKind::Process => match self.procs.lock().unwrap().get(id) {
+                Some((pid, _)) if *pid != 0 => crate::stats::Source::Pid(*pid),
+                _ => crate::stats::Source::None,
+            },
+            RuntimeKind::Podman => {
+                if let Some(d) = self.cgroups.lock().unwrap().get(id) {
+                    return crate::stats::Source::Cgroup(d.clone());
+                }
+                let Ok(out) = self.podman(&["inspect", "--format", "{{.State.CgroupPath}}", &container_name(id)]).await else {
+                    return crate::stats::Source::None;
+                };
+                let rel = out.trim().trim_start_matches('/');
+                if rel.is_empty() {
+                    return crate::stats::Source::None;
+                }
+                let dir = Path::new("/sys/fs/cgroup").join(rel);
+                self.cgroups.lock().unwrap().insert(id.to_string(), dir.clone());
+                crate::stats::Source::Cgroup(dir)
+            }
+        }
+    }
+
     pub async fn stop(&self, id: &str) -> Result<()> {
+        self.cgroups.lock().unwrap().remove(id);
         match self.kind {
             RuntimeKind::Podman => {
                 self.podman(&["stop", "-t", "10", &container_name(id)]).await?;

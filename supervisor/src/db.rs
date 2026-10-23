@@ -79,6 +79,8 @@ impl Db {
              CREATE TABLE IF NOT EXISTS node_auth(node TEXT PRIMARY KEY, status TEXT NOT NULL, role TEXT NOT NULL, labels TEXT NOT NULL, updated_at INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS allowed_sources(cidr TEXT PRIMARY KEY, note TEXT NOT NULL, added_by TEXT NOT NULL, added_at INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS egress_ips(node TEXT NOT NULL, route TEXT NOT NULL, info TEXT NOT NULL, PRIMARY KEY(node, route));
+             CREATE TABLE IF NOT EXISTS instance_stats(ts INTEGER NOT NULL, session TEXT NOT NULL, node TEXT NOT NULL, info TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS instance_stats_session ON instance_stats(session, ts);
              CREATE TABLE IF NOT EXISTS route_stats(node TEXT NOT NULL, route TEXT NOT NULL, provider TEXT NOT NULL, info TEXT NOT NULL, PRIMARY KEY(node, route, provider));
              CREATE TABLE IF NOT EXISTS quota_buckets(node TEXT NOT NULL, provider TEXT NOT NULL, scope_id TEXT NOT NULL, kind TEXT NOT NULL,
                 info TEXT NOT NULL, PRIMARY KEY(node, provider, scope_id, kind));",
@@ -260,6 +262,22 @@ impl Db {
 
     pub fn egress(&self) -> Vec<EgressIp> {
         self.json_rows("SELECT info FROM egress_ips ORDER BY node, route", [])
+    }
+
+    pub fn add_instance_stats(&self, s: &InstanceStats) -> Result<()> {
+        self.c.lock().unwrap().execute(
+            "INSERT INTO instance_stats(ts,session,node,info) VALUES(?1,?2,?3,?4)",
+            params![s.ts, s.session, s.node, serde_json::to_string(s)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn instance_stats(&self, session: &str, since: Ts) -> Vec<InstanceStats> {
+        self.json_rows("SELECT info FROM instance_stats WHERE session=?1 AND ts>=?2 ORDER BY ts", params![session, since])
+    }
+
+    pub fn prune_instance_stats(&self, before: Ts) -> Result<usize> {
+        Ok(self.c.lock().unwrap().execute("DELETE FROM instance_stats WHERE ts < ?1", params![before])?)
     }
 
     pub fn put_route_stats(&self, node: &str, stats: &[RouteStat]) -> Result<()> {

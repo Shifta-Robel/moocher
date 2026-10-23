@@ -89,6 +89,8 @@ pub enum StreamEvent {
     /// A node's quota buckets changed (refetch `/quotas` for the merged view).
     Quotas { node: String },
     Egress { node: String, ips: Vec<EgressIp> },
+    /// New resource samples from a node (`/stats` has them).
+    Stats { node: String },
 }
 
 /// A quota bucket merged across the nodes that report it (same provider and

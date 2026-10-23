@@ -123,6 +123,11 @@ impl LinkHandle {
         }
     }
 
+    /// Best effort, not kept in the outbox (e.g. resource samples).
+    pub async fn send_live(&self, msg: &NodeMsg) {
+        let _ = self.send_now(msg, 0).await;
+    }
+
     async fn send_now(&self, msg: &NodeMsg, seq: u64) -> Result<()> {
         let tx = self.inner.tx.lock().unwrap().clone().ok_or_else(|| anyhow!("not connected"))?;
         tx.send(Envelope { seq, ack: 0, json: serde_json::to_vec(msg)? }).await.map_err(|_| anyhow!("not connected"))

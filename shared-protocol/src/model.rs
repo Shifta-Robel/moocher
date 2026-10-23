@@ -317,6 +317,56 @@ pub struct QuotaBucket {
     pub updated_at: Ts,
 }
 
+// ---------------------------------------------------------------- resources
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostStats {
+    pub node: String,
+    pub cpus: u32,
+    pub load1: f64,
+    pub mem_total: u64,
+    pub mem_available: u64,
+    /// Filesystem of the node's data dir (workspaces).
+    pub disk_total: u64,
+    pub disk_free: u64,
+    pub ts: Ts,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstanceStats {
+    pub session: String,
+    pub node: String,
+    #[serde(default)]
+    pub cpu_pct: Option<f64>,
+    #[serde(default)]
+    pub mem_bytes: Option<u64>,
+    #[serde(default)]
+    pub mem_limit: Option<u64>,
+    #[serde(default)]
+    pub pids: Option<u64>,
+    /// Workspace + OpenCode home on disk.
+    #[serde(default)]
+    pub disk_bytes: Option<u64>,
+    #[serde(default)]
+    pub disk_limit: Option<u64>,
+    pub ts: Ts,
+}
+
+/// `512m`, `1g`, `1.5G`, `2048` (bytes) -> bytes (binary units, like Podman).
+pub fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim().to_lowercase();
+    let s = s.strip_suffix("ib").or_else(|| s.strip_suffix('b')).unwrap_or(&s).to_string();
+    let (num, mult) = match s.chars().last()? {
+        'k' => (&s[..s.len() - 1], 1u64 << 10),
+        'm' => (&s[..s.len() - 1], 1 << 20),
+        'g' => (&s[..s.len() - 1], 1 << 30),
+        't' => (&s[..s.len() - 1], 1 << 40),
+        _ => (s.as_str(), 1),
+    };
+    let n: f64 = num.trim().parse().ok()?;
+    (n >= 0.0).then(|| (n * mult as f64) as u64)
+}
+
 // ------------------------------------------------------------------- tasks
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,6 +511,17 @@ pub struct LogEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sizes() {
+        assert_eq!(parse_size("512m"), Some(512 << 20));
+        assert_eq!(parse_size("1G"), Some(1 << 30));
+        assert_eq!(parse_size("1.5g"), Some(3 << 29));
+        assert_eq!(parse_size("2048"), Some(2048));
+        assert_eq!(parse_size("10GiB"), Some(10 << 30));
+        assert_eq!(parse_size("lots"), None);
+    }
+
     fn t(c: &str, s: &str) -> Todo {
         Todo { content: c.into(), status: s.into(), priority: "high".into() }
     }

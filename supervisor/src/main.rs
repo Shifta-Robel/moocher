@@ -8,6 +8,7 @@ mod orch;
 mod pki;
 mod placement;
 mod quotas;
+mod resources;
 mod state;
 mod templates;
 mod tlslink;

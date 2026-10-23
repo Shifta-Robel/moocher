@@ -309,6 +309,7 @@ impl NodeLink for LinkService {
                                 };
                                 let _ = tx.send(Ok(Envelope { seq: 0, ack: 0, json: serde_json::to_vec(&reply).unwrap() })).await;
                             }
+                            NodeMsg::Stats { host, instances } => sup.on_stats(&node, host, instances),
                             NodeMsg::Pong { ts } => {
                                 let ms = (now_ms() - ts) as f64;
                                 let mut r = conn.rtt.lock().unwrap();

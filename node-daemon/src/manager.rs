@@ -29,6 +29,7 @@ use tokio::task::JoinHandle;
 
 pub struct Manager {
     pub cfg: ConfigStore,
+    stats: crate::stats::Collector,
     /// Shared by every session's gateway: config, link, egress routes, quotas.
     pub gw: crate::gateway::GatewayDeps,
     store: Arc<Store>,
@@ -60,6 +61,9 @@ pub struct Instance {
     parked: crate::gateway::Parked,
     gateway: Mutex<Option<Gateway>>,
     overrides: Mutex<SpawnOverrides>,
+    /// Disk limit state: the agent was warned (90%) / it is over the limit.
+    disk_warned: AtomicBool,
+    disk_over: AtomicBool,
     /// Tool calls already reported as activity (part ids).
     seen_tools: Mutex<HashSet<String>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -105,6 +109,7 @@ impl Manager {
         Ok(Arc::new(Manager {
             node: snap.node.name.clone(),
             cfg,
+            stats: Default::default(),
             gw,
             store,
             rt,
@@ -285,6 +290,8 @@ impl Manager {
             parked: Arc::new(Mutex::new(None)),
             gateway: Mutex::new(None),
             overrides: Mutex::new(SpawnOverrides::default()),
+            disk_warned: AtomicBool::new(false),
+            disk_over: AtomicBool::new(false),
             turn_open: AtomicBool::new(matches!(report.state, SessionState::Running | SessionState::Blocked | SessionState::Parked)),
             report: Mutex::new(report),
             msg_usage: Mutex::new(HashMap::new()),
@@ -769,6 +776,7 @@ impl Manager {
             r.current_task = None;
         });
         self.instances.lock().unwrap().remove(id);
+        self.stats.forget(id);
         self.store.delete_instance(id)?;
         Ok(())
     }
@@ -827,6 +835,66 @@ impl Manager {
             });
         }
         Ok(())
+    }
+
+    /// Resource samples for the host and every live instance; enforces the
+    /// soft disk limit (`container.disk`).
+    pub async fn collect_stats(self: &Arc<Self>) -> (HostStats, Vec<InstanceStats>) {
+        let snap = self.cfg.get();
+        let host = crate::stats::host(&self.node, &self.data_root);
+        let insts: Vec<_> = self.instances.lock().unwrap().values().cloned().collect();
+        let mut out = vec![];
+        for inst in insts {
+            let state = inst.report.lock().unwrap().state;
+            if !state.is_live() {
+                continue;
+            }
+            let agent = snap.agents.get(&inst.agent);
+            let mem_limit = agent.and_then(|a| parse_size(&a.cfg.container.memory));
+            let disk_limit = agent.and_then(|a| a.cfg.container.disk.as_deref()).and_then(parse_size);
+            let src = self.rt.stats_source(&inst.id).await;
+            let st = self.stats.instance(&inst.id, &self.node, &src, &[&inst.paths.workspace, &inst.paths.home], mem_limit, disk_limit);
+            if let (Some(used), Some(limit)) = (st.disk_bytes, disk_limit) {
+                self.enforce_disk(&inst, used, limit, state).await;
+            }
+            out.push(st);
+        }
+        (host, out)
+    }
+
+    async fn enforce_disk(self: &Arc<Self>, inst: &Arc<Instance>, used: u64, limit: u64, state: SessionState) {
+        let pct = used as f64 * 100.0 / limit.max(1) as f64;
+        let human = |b: u64| format!("{:.1} MiB", b as f64 / (1 << 20) as f64);
+        if pct < 85.0 {
+            inst.disk_warned.store(false, Ordering::Relaxed);
+            inst.disk_over.store(false, Ordering::Relaxed);
+            return;
+        }
+        if pct >= 100.0 {
+            if !inst.disk_over.swap(true, Ordering::Relaxed) || state == SessionState::Running {
+                let msg = format!("disk limit exceeded: {} used of {}", human(used), human(limit));
+                tracing::warn!(session = %inst.id, used, limit, "disk limit exceeded; interrupting");
+                let oc_id = inst.oc_id.lock().unwrap().clone();
+                if let Some(oc_id) = oc_id {
+                    let _ = inst.oc.abort(&oc_id).await;
+                }
+                self.update(inst, |r| r.error = Some(msg.clone()));
+                self.link.emit(NodeEvent::Activity { session: inst.id.clone(), kind: "disk.exceeded".into(), detail: json!({"used": used, "limit": limit}) });
+            }
+            return;
+        }
+        if pct >= 90.0 && !inst.disk_warned.swap(true, Ordering::Relaxed) {
+            self.link.emit(NodeEvent::Activity { session: inst.id.clone(), kind: "disk.warning".into(), detail: json!({"used": used, "limit": limit, "pct": pct.round()}) });
+            // Tell a working agent at its next step; never wake an idle one for this.
+            if state == SessionState::Running {
+                let text = format!(
+                    "[cluster] Disk usage is {pct:.0}% of your {} limit ({} used). Delete build artifacts or caches you no longer need; at 100% your work is interrupted.",
+                    human(limit),
+                    human(used)
+                );
+                let _ = self.prompt(inst, &text, Delivery::Queue).await;
+            }
+        }
     }
 
     /// Periodic housekeeping: idle/blocked safety net and wall-clock limits.
