@@ -1,6 +1,6 @@
 # Phase 1.5 — Design additions before Phase 2
 
-> Status: **design reviewed** (2026-10-23; decisions in §15). No code yet.
+> Status: **design reviewed** (2026-10-23; decisions in §15). The Phase 2 items in §14 are implemented: see [PHASE2.md](./PHASE2.md).
 > Covers the requirements added after Phase 0 that ARCHITECTURE.md does not yet describe. Each section names the phase that builds it (§14).
 > Builds on: keyproxy (D2), cluster MCP (D3), mTLS links (D5), egress routes (D10), task bucket (§5a).
 

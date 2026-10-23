@@ -33,7 +33,7 @@ pub struct Dialer {
     password: Arc<String>,
     /// Last failure per relay. SOCKS cannot carry a reason, so keyproxy
     /// looks it up here to explain a failed upstream call.
-    errors: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    errors: Arc<Errors>,
 }
 
 impl Dialer {
@@ -42,25 +42,19 @@ impl Dialer {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let password = Arc::new(crate::manager::random_hex(16));
-        let errors: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>> = Default::default();
+        let errors: Arc<Errors> = Default::default();
         let (pw, errs) = (password.clone(), errors.clone());
         tokio::spawn(async move {
             loop {
                 let Ok((sock, _)) = listener.accept().await else { continue };
                 let (link, pw, node, errs) = (link.clone(), pw.clone(), node.clone(), errs.clone());
                 tokio::spawn(async move {
-                    match socks_session(sock, &pw, &node, &link).await {
+                    match socks_session(sock, &pw, &node, &link, &errs).await {
                         Ok(Some(relay)) => {
                             errs.lock().unwrap().remove(&relay);
                         }
                         Ok(None) => {}
-                        Err((relay, e)) => {
-                            let msg = format!("{e:#}");
-                            tracing::warn!(relay = ?relay, error = %msg, "via_node connection failed");
-                            if let Some(r) = relay {
-                                errs.lock().unwrap().insert(r, msg);
-                            }
-                        }
+                        Err((relay, e)) => tracing::warn!(relay = ?relay, error = %format!("{e:#}"), "via_node connection failed"),
                     }
                 });
             }
@@ -78,16 +72,22 @@ impl Dialer {
     }
 }
 
+type Errors = std::sync::Mutex<std::collections::HashMap<String, String>>;
+
 /// Ok(Some(relay)) after a relayed connection, Err((relay if known, reason)).
-async fn socks_session(s: TcpStream, password: &str, me: &str, link: &LinkHandle) -> Result<Option<String>, (Option<String>, anyhow::Error)> {
+async fn socks_session(s: TcpStream, password: &str, me: &str, link: &LinkHandle, errs: &Errors) -> Result<Option<String>, (Option<String>, anyhow::Error)> {
     let mut s = s;
     let (relay, host, port) = socks_handshake(&mut s, password).await.map_err(|e| (None, e))?;
     let started = std::time::Instant::now();
     let (tx, inbound) = match open(link, TunnelOpen::Dial { relay: relay.clone(), host: host.clone(), port }, me).await {
         Ok(x) => x,
         Err(e) => {
+            let e = e.context(format!("via {relay} to {host}:{port}"));
+            // Record the reason before the client learns of the failure:
+            // keyproxy reads it as soon as its request fails.
+            errs.lock().unwrap().insert(relay.clone(), format!("{e:#}"));
             let _ = reply(&mut s, 5).await;
-            return Err((Some(relay.clone()), e.context(format!("via {relay} to {host}:{port}"))));
+            return Err((Some(relay.clone()), e));
         }
     };
     link.note_tunnel(&relay, started.elapsed());

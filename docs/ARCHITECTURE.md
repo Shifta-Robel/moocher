@@ -1,6 +1,6 @@
-# opencode-cluster — Architecture (v1, after Phase 1)
+# opencode-cluster — Architecture (v1, after Phase 2)
 
-> Status: Phase 1 implemented and verified end to end (see [`PHASE1.md`](./PHASE1.md)). Phase 0 notes: [`PHASE0.md`](./PHASE0.md). Running it: [`QUICKSTART.md`](./QUICKSTART.md). Config reference: [`CONFIG.md`](./CONFIG.md). Design additions (reviewed): [`PHASE1_5.md`](./PHASE1_5.md) (§12).
+> Status: Phases 1 and 2 implemented and verified end to end (see [`PHASE1.md`](./PHASE1.md), [`PHASE2.md`](./PHASE2.md)). Operations: [`RUNBOOK.md`](./RUNBOOK.md). Phase 0 notes: [`PHASE0.md`](./PHASE0.md). Running it: [`QUICKSTART.md`](./QUICKSTART.md). Config reference: [`CONFIG.md`](./CONFIG.md). Design additions (reviewed): [`PHASE1_5.md`](./PHASE1_5.md) (§12).
 > Sections marked **(Phase N)** describe designed-but-not-yet-built parts.
 
 ## 1. Goals in one paragraph
@@ -38,7 +38,8 @@ flowchart LR
     ND <-->|UDS: /run/ocl/<session>/| BR
   end
   WEB & TUI -->|HTTPS REST + SSE<br/>cookie / API token| SUP
-  ND <-->|gRPC bidi stream, node dials out<br/>UDS on the hub · mTLS remote (Phase 2)| SUP
+  ND <-->|gRPC bidi stream, node dials out<br/>UDS on the hub · mTLS for remote nodes| SUP
+  RL[relay node<br/>role: relay] <-->|mTLS · Tunnel RPC| SUP
   KP -->|real key injected,<br/>per-agent egress route| PROV[(LLM providers<br/>BYOK + keyless)]
 ```
 
@@ -88,16 +89,17 @@ This is the "programmatic way" for an agent to start sessions without secrets: i
 
 | Hop | Transport | Why |
 |---|---|---|
-| node ⇄ supervisor | **gRPC bidirectional stream**, dialed by the node: a 0600 unix socket on the hub (Phase 1) and **mTLS** over TCP for remote nodes (Phase 2) | Typed, multiplexed and small. Commands go down and telemetry goes up on one connection. Works through NAT with no inbound ports on workers. |
+| node ⇄ supervisor | **gRPC bidirectional stream**, dialed by the node: a 0600 unix socket on the hub and **mTLS** over TCP for remote nodes (plus `Enroll` and `Tunnel` RPCs on the same port) | Typed, multiplexed and small. Commands go down and telemetry goes up on one connection. Works through NAT with no inbound ports on workers. |
 | operator ⇄ supervisor | **HTTPS REST/JSON + SSE** | Works in a phone browser, `curl` and the CLI. SSE is enough for one-way live updates. |
 | node ⇄ OpenCode | OpenCode HTTP + SSE (`/event`) over UDS | Upstream's native interface. |
 | agent ⇄ cluster | MCP (streamable HTTP) over UDS | Native in OpenCode and works with any model. |
 | message bus | **None (NATS rejected)** | Hub-and-spoke with one supervisor doesn't need a broker. Fewer daemons on 8 GB machines. NATS is the upgrade path if we ever run several supervisors. |
 
-**D5 — Node identity uses mTLS, bootstrapped by a one-time token.**
-1. `ocl node enroll --token <OTT>` creates an Ed25519 key **on the node**.
-2. The node sends a CSR, authenticated by a single-use enrollment token that expires after 15 minutes.
-3. The supervisor's private CA (rcgen) signs a 30-day certificate whose identity is `node:<name>`. It renews automatically over the live stream at two-thirds of its lifetime.
+**D5 — Node identity uses mTLS, bootstrapped by a one-time token.** Implemented in Phase 2:
+1. `ocl node invite <name> [--relay]` creates a join token `ocljoin.<secret>.<CA fingerprint>`. It is single use, expires after 15 minutes, and is bound to that name and role.
+2. `opencode-node join https://hub:7443 --token …` creates an Ed25519 key **on the node**. It connects with a TLS verifier that only accepts a server whose chain contains the CA with that fingerprint, then sends a CSR with the token over the `Enroll` RPC.
+3. The supervisor's private CA (rcgen, Ed25519) signs a 30-day client certificate. The hub decides the name and ignores whatever the CSR asked for. It records the certificate's **SHA-256 fingerprint → node**, so identity is a lookup and revocation is one row. Nodes renew over the live stream at two thirds of the lifetime, with a fresh key each time.
+4. One TLS port serves both: client certificates are *optional* at the TLS layer (so `Enroll` works), and every other RPC requires an enrolled, unrevoked, approved certificate whose name matches the node's hello. The TLS listener passes peer address and certificate fingerprint into each handler.
 
 We chose this over a pre-shared bearer token because:
 - the long-lived credential (the private key) never leaves the node;
@@ -107,13 +109,12 @@ We chose this over a pre-shared bearer token because:
 
 The operator UI uses ordinary server TLS (rustls; ACME, or a supervisor-CA certificate the operator trusts).
 
-**Adding a machine from the web UI (Phase 2 + 4), as requested:**
-1. In **Nodes → Add machine**, the operator (admin scope, re-authenticated) enters a name and optional labels.
-2. The UI shows a one-time join token (single use, 15 min, bound to that node name) and a copy-paste command:
-   `curl -fsSL https://hub:7443/join.sh | sh -s -- --token ocl_join_…`, or `opencode-node join https://hub:7443 --token …`.
+**Adding a machine (API and CLI in Phase 2, web UI in Phase 4), as requested:**
+1. The operator (admin scope) runs `ocl node invite <name> [--relay]`, or in Phase 4 uses **Nodes → Add machine** with re-authentication. The API is `POST /api/v1/nodes/invite`.
+2. The reply carries a one-time join token (single use, 15 min, bound to that name and role) and a copy-paste command: `opencode-node join https://hub:7443 --token ocljoin.…`.
 3. The new machine generates its key locally, sends the CSR with the token, and receives its certificate plus the hub's CA. Then it starts `opencode-node` under systemd.
-4. The node shows up as **pending approval** with its key fingerprint. The operator approves it in the UI (optional, on by default), and from then on its agents are eligible.
-5. Revoking a node in the UI adds its certificate to the CRL and closes its stream immediately.
+4. The node shows up as **pending approval**. The operator approves it with `ocl node approve <name>` (in the UI from Phase 4; approval is optional and on by default). From then on its agents are eligible.
+5. Revoking a node (`ocl node revoke`) flags its certificates and closes its stream immediately.
 
 Every step is in the audit log. The token is useless after first use or once expired, and a leaked token can only enroll the name it was issued for, which is still subject to approval.
 
@@ -151,10 +152,22 @@ routes:
   my-proxy:    { type: proxy, url: socks5h://10.0.0.5:1080 }   # any SOCKS5/HTTP proxy (e.g. `ssh -D`)
 ```
 
-- **`via_node`** is what you asked for. The calling node opens a CONNECT-style tunnel to `vps-de` over the existing mTLS links (node → hub → `vps-de`, or a direct node-to-node mTLS link if reachable), and `vps-de` opens the TCP connection to the provider. TLS to the provider is **end to end**, so the relay machine sees only encrypted bytes, and the API key stays on the original node. No extra software is needed on the relay; it only needs `relay: true` in its `node.yaml`.
+- **`via_node`** is what you asked for, and is implemented in Phase 2:
+  1. keyproxy sends the request through a local SOCKS5 entry point. It listens on 127.0.0.1 and needs a per-daemon password; the username names the relay.
+  2. That opens a `Tunnel` RPC to the hub: `Dial{relay, host, port}`.
+  3. The hub asks the relay (`OpenTunnel`). The relay connects to the provider from its own IP (or from `egress_bind`) and opens its own `Tunnel` RPC with `Accept{id}`.
+  4. The hub joins the two streams.
+
+  TLS to the provider is **end to end**, so the hub and the relay see only encrypted bytes, and the API key stays on the original node. Relays only dial out. A relay can be a worker with `relay: true`, or a machine with `role: relay` that runs no agents. Each relay limits destinations with `relay_ports` (default 443) and `relay_allow_hosts`.
 - **`proxy`** points at any existing proxy.
 - Routes are chosen per agent (`route:` in the agent YAML), and `node.yaml` can set a node default.
-- **(Phase 2)** An agent can list `failover` routes, which keyproxy switches to when the provider quota for the current egress IP runs out. Machines can also join as **relay-only** nodes, admitted by a source-IP allowlist. See PHASE1_5 §3–4.
+- **Failover plans:** `route: { prefer: direct, failover: [via-vps-de, home], on_exhausted: wait }`.
+  - Keyproxy skips routes whose quota bucket is exhausted.
+  - It retries a 429, or an unreachable route, on the next route before anything has reached OpenCode.
+  - When every route is used up, it answers 429 with `retry-after` until the soonest reset. The session shows `parked` with a countdown, and OpenCode resumes by itself.
+- **Quota buckets** are kept per provider and per egress IP, key, or account label. They are learned from rate-limit headers, `retry-after` and 429s, or from configured windows, and merged across nodes at the hub (CONFIG `quota:`).
+- **Egress IPs** come from the hub-observed link address or an `ip_echo` probe through each route.
+- **Relay admission:** relay-only nodes must connect from an allowed source (`ocl allow`).
 
 ## 4. Data flow — two-agent handoff (target design)
 
@@ -193,7 +206,14 @@ sequenceDiagram
 
   Messages will carry `art://` references, never file bytes (Phase 3).
 - **Workflows.** Workflows are YAML state machines (`steps: build → review`). Each step has an agent profile, a prompt template (`{{input}}`, `{{prev.output}}`, `{{feedback}}`, …), seeded todos, checks, and `next` / `on_fail` transitions. `max_step_runs` bounds review↔build loops. Step state is persisted. All steps of a run share one workspace, so in Phase 1 a run is placed on a node that has every step's agent. Free-form messaging between any two sessions sits alongside workflows.
-- **Placement.** A node becomes eligible when it is connected, has the profile installed locally (secret ref resolvable), and has free memory/session slots. Placement can also be pinned with `node:`.
+- **Placement.** A node is eligible when it is attached, has the agent (local or hub template) with a resolvable secret, and has a free slot. Eligible nodes are then **scored** (weights in `supervisor.yaml placement:`):
+  - capacity;
+  - quota headroom on the agent's routes;
+  - provider latency over its preferred route, measured passively from real calls;
+  - locality (parent session or shared workspace on the node);
+  - hub link RTT.
+
+  Per-IP buckets apply to every node behind that IP. Nodes whose every route is exhausted are skipped while others have headroom. Each session stores the reason (`ocl show`), and every decision is logged as `placement.decided` with all candidates' scores. `node:` pins a node. Coordinators see the same data with `cluster_list_nodes`.
 
 ## 5a. Task bucket and the main agent
 
@@ -218,7 +238,17 @@ The operator keeps a **bucket of tasks** (CLI now, web UI in Phase 4) and the cl
 
 ## 6. Observability
 
-- **Session state** is derived from OpenCode events: `idle` / `running` (step started) / `blocked` (permission or question pending) / `error` (step failed or retry exhausted) / `lost`.
+- **Session state** is derived from OpenCode events: `idle` / `running` (step started) / `blocked` (permission or question pending) / `parked` (every route's allowance used up) / `error` (step failed or retry exhausted) / `lost`. While OpenCode retries a failed provider call, the current task says why (`retrying (attempt N…): …`).
+- **Resources:** nodes sample every 10 s, best effort and outside the outbox.
+  - Host: memory, load and disk.
+  - Per instance: CPU %, memory against its limit, processes (cgroup v2 for Podman, `/proc` for the process runtime) and disk (workspace + home).
+  - The hub keeps an hour of samples in memory and one per minute for a week (`ocl stats`, `GET /sessions/{id}/stats`).
+  - `container.disk` is a soft limit: a warning at 90%, an interrupt at 100%.
+- **Links and providers:**
+  - Hub ↔ node RTT from pings every 15 s.
+  - Per route and provider: time to response headers and errors.
+  - Relay tunnel setup times.
+  - `/metrics` adds `ocl_relay_tunnels_total` and `ocl_relay_bytes_total`.
 - **Tokens and cost** come from OpenCode's per-step assistant messages. Cost uses OpenCode's figure when it is non-zero, otherwise the `prices` table in `providers.yaml`; keyless gateways cost `$0`. Keyproxy enforces `budget_usd` / `max_tokens` against the same counters. Parsing usage directly from provider responses is Phase 5.
 - **Event log:** append-only `events` table (session state changes, tool calls, turn ends, verdicts, task and run transitions). Read it with `GET /api/v1/events` or `ocl events -f`. Daily export to `events-YYYYMMDD.jsonl.zst` is Phase 5.
 - **Logs and metrics:** JSON logs (`tracing`, level via `OCL_LOG`). The supervisor's `/metrics` (bearer token) exposes `ocl_nodes_connected`, `ocl_sessions{state}`, `ocl_tokens_total{agent,kind}`, `ocl_cost_usd_total{agent}` and `ocl_tasks{status}`.
@@ -303,8 +333,17 @@ Agents use `artifact_put/get` or `cluster_sync`, and the operator uses `ocl arti
 | Node private key | Node `0600` file or systemd-cred | That node. |
 | Operator API tokens | Supervisor DB, SHA-256 hashed, scoped `read`/`operate`/`admin` | Shown once at creation. |
 | Operator password | Supervisor DB (Argon2id) **(Phase 4)** | — |
+| Cluster CA key | Hub `<data>/supervisor/pki/ca.key` (0600) | The supervisor. Replacing it means re-enrolling nodes (RUNBOOK §4.4). |
+| Join tokens | Supervisor DB, SHA-256 hashed | Shown once; single use; 15 min; bound to one name and role. |
+| Secret aliases | Each node's `node.yaml` `secrets:` (references only) | Hub templates name the alias; the value is resolved on the node. The hub never holds keys. |
 
-- Network hops: same-machine links use 0600 unix sockets. Remote nodes will use mTLS (Phase 2) and the UI server TLS (Phase 4). Until then, keep `api_listen` on loopback or put a TLS reverse proxy in front; the supervisor warns otherwise. Container↔node traffic stays on the host over UDS.
+- **Network hops:**
+  - Same-machine links use 0600 unix sockets.
+  - Remote nodes use mTLS (TLS 1.3, Ed25519) with certificate-fingerprint identity, approval, revocation, and an optional source allowlist (`enforce_for: relay|all`).
+  - The UI gets server TLS in Phase 4. Until then, keep `api_listen` on loopback or put a TLS reverse proxy in front; the supervisor warns otherwise.
+  - Container↔node traffic stays on the host over UDS.
+- **Relayed LLM traffic** is TLS end to end. A relay sees only ciphertext and the destination host:port, and it only connects to its allowed ports and hosts. The local SOCKS entry point needs a per-daemon password, and containers cannot reach it anyway (`--network=none`).
+- **Live changes:** route and quota overrides from the operator are written to the node's `overrides.yaml` and audited at the hub. Nodes can refuse hub templates (`hub_templates: false`).
 - Verified from inside an agent container in Phase 1:
   - the real key appears nowhere in its env or config;
   - there is no network at all;
@@ -318,26 +357,28 @@ Agents use `artifact_put/get` or `cluster_sync`, and the operator uses `ocl arti
 
 ```
 opencode-cluster/
-  shared-protocol/   proto/link.proto; src/{config,model,link,api}.rs
-  supervisor/        src/{main,api,link,state,orch,db}.rs
-  node-daemon/       src/{main,cfgstore,manager,oc,gateway,link,runtime,secrets,store}.rs
+  shared-protocol/   proto/link.proto; src/{config,model,link,api,tls}.rs
+  supervisor/        src/{main,api,link,tlslink,nodes,pki,state,orch,placement,quotas,templates,resources,db}.rs
+  node-daemon/       src/{main,cfgstore,manager,oc,gateway,egress,quota,relay,pki,stats,link,runtime,secrets,store}.rs
   bridge/            ocl-bridge (static musl)
   cli/               ocl (clap)
   ui/                web (SolidJS) + tui (ratatui) — Phase 4
   images/agent/      Containerfile
-  examples/          quickstart/ (hub config + run-local.sh), mock-llm/ (scripted OpenAI-compatible mock)
-  docs/              ARCHITECTURE, PHASE0, PHASE1, QUICKSTART, CONFIG (RUNBOOK: Phase 4)
+  examples/          quickstart/ (hub config + run-local.sh), remote/ (hub, worker, relay configs), mock-llm/
+  tests/e2e/         enroll, relay, quota, templates, stats, resilience suites (process runtime + mock LLM)
+  docs/              ARCHITECTURE, PHASE0, PHASE1, PHASE1_5, PHASE2, QUICKSTART, CONFIG, USAGE, RUNBOOK
 ```
 
 ## 12. Additions designed after Phase 1 (see [`PHASE1_5.md`](./PHASE1_5.md))
 
 | Area | Summary | Phase |
 |---|---|---|
-| Templates → instances | Hub template library, secret aliases resolved per node, `overridable` caps, spawn from UI/CLI/MCP | 2 |
-| Egress IPs and quotas | Per-IP / per-key / per-account buckets, learned from provider headers and 429s, reset countdowns, failover routes, `parked` state | 2 |
-| Relay-only nodes | Proxy machines with no agents, admitted by an allowlist editable in the UI | 2 |
-| Placement | Scored using capacity, quota headroom, measured latency and locality, with an explained decision | 2 |
+| Templates → instances | Hub template library, secret aliases resolved per node, `overridable` caps, spawn from UI/CLI/MCP | 2 ✔ (UI: 4) |
+| Egress IPs and quotas | Per-IP / per-key / per-account buckets, learned from provider headers and 429s, reset countdowns, failover routes, `parked` state | 2 ✔ |
+| Relay-only nodes | Proxy machines with no agents, admitted by an allowlist editable in the UI | 2 ✔ (UI: 4) |
+| Placement | Scored using capacity, quota headroom, measured latency and locality, with an explained decision | 2 ✔ |
+| Preamble | Layered, rendered instructions; readable per session | 2 ✔ |
 | Questions | Questions escalate up the parent chain; an operator mode decides what reaches you; assumption log | 3 |
 | Death and cleanup | `dead` reasons, cost-aware retry/reassign/halt, harvest of outputs on every exit | 3 |
 | UI | SolidJS + Tailwind + Kobalte, dark/light, colour+icon status encoding, Open in OpenCode on a second port of your domain, notifications incl. Web Push, password login on your domain | 4 |
-| Containers | Live CPU/RAM/pids/disk per instance, soft or hard disk limits | 2 / 5 |
+| Containers | Live CPU/RAM/pids/disk per instance, soft or hard disk limits | 2 ✔ soft · 5 hard |

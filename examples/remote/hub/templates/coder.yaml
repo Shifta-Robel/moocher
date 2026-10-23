@@ -1,0 +1,20 @@
+# Hub template: any node that maps the `openrouter` alias in its node.yaml
+# `secrets:` can run it. The hub never sees the key.
+name: coder
+description: General coder on OpenRouter (BYOK).
+provider:
+  id: openrouter
+  model: qwen/qwen3-coder
+  key: { secret: openrouter }
+role:
+  system_prompt_file: prompts/coder.md       # inlined by the hub before it is sent
+  preamble: "You write small, tested changes and explain them briefly."
+tools:
+  edit: allow
+  bash: { default: ask, allow: ["pytest*", "python3 *", "git *", "ls*", "cat *"] }
+limits: { max_sessions: 2, budget_usd: 1.00 }
+instances: { max: 4 }                         # cluster-wide
+overridable:                                  # what a spawner (you or a coordinator) may change
+  role_append: true
+  budget_usd: 3.00
+  routes: [direct, via-relay-de]

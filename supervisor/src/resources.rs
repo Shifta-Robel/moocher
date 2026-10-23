@@ -23,14 +23,15 @@ pub struct StatsMem {
 impl Sup {
     pub fn on_stats(&self, node: &str, host: HostStats, instances: Vec<InstanceStats>) {
         let now = now_ms();
+        // A node may only report its own sessions.
+        let mine: std::collections::HashSet<String> = self.db.sessions_on(node).into_iter().map(|s| s.report.id).collect();
+        let instances: Vec<InstanceStats> = instances.into_iter().filter(|s| s.node == node && mine.contains(&s.session)).collect();
+        let host = HostStats { node: node.to_string(), ..host };
         let mut to_store = vec![];
         let prune = {
             let mut m = self.stats.lock().unwrap();
             m.hosts.insert(node.to_string(), host);
             for s in instances {
-                if s.node != node {
-                    continue; // a node only reports its own instances
-                }
                 if m.persisted.get(&s.session).is_none_or(|t| now - t >= PERSIST_EVERY_MS) {
                     m.persisted.insert(s.session.clone(), now);
                     to_store.push(s.clone());

@@ -1,0 +1,8 @@
+# A machine that only lends its IP: no agents, no Podman needed. Its source
+# address must be in the hub's allowed sources (`ocl allow add <ip>`).
+name: relay-de
+supervisor: https://hub.example.org:7443
+role: relay
+relay_ports: [443]
+relay_allow_hosts: [api.kilo.ai, "*.openrouter.ai", openrouter.ai, api.groq.com, api.ipify.org]
+# egress_bind: 203.0.113.77          # on a machine with several IPs, which one to leave from

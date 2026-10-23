@@ -1,0 +1,3 @@
+routes:
+  via-relay-de: { type: via_node, node: relay-de }        # out through a relay node's IP
+  via-home: { type: proxy, url: "socks5h://127.0.0.1:1080" }   # e.g. `ssh -D 1080 home`

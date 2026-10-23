@@ -1244,6 +1244,35 @@ success: { todos: ["write module"], checks: [ { exit_code: "pytest -q" } ] }
         assert_eq!(r.routes["b"], Route::ViaNode { node: "vps-de".into() });
     }
 
+    /// The documented examples must stay valid.
+    #[test]
+    fn examples_parse() {
+        let ex = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples");
+        for d in ["remote/hub", "quickstart/hub"] {
+            let s: SupervisorConfig = load_yaml(&ex.join(d).join("supervisor.yaml")).unwrap();
+            assert!(s.tasks.enabled);
+        }
+        for d in ["remote/worker", "remote/relay", "quickstart/hub"] {
+            let n: NodeConfig = load_yaml(&ex.join(d).join("node.yaml")).unwrap();
+            assert!(valid_name(&n.name));
+        }
+        let r: RoutesFile = load_yaml(&ex.join("remote/worker/routes.yaml")).unwrap();
+        assert_eq!(r.routes.len(), 2);
+        let p: ProvidersFile = load_yaml(&ex.join("remote/worker/providers.yaml")).unwrap();
+        let mut all = builtin_providers();
+        all.extend(p.providers);
+        for (path, a) in load_dir::<AgentConfig>(&ex.join("remote/hub/templates")).into_iter().chain(load_dir(&ex.join("quickstart/hub/agents"))) {
+            let a = a.unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            if path.to_string_lossy().contains("quickstart") {
+                continue; // uses the quickstart's own `mock` provider
+            }
+            assert!(a.validate(&all).is_empty(), "{}: {:?}", path.display(), a.validate(&all));
+        }
+        for (path, w) in load_dir::<WorkflowConfig>(&ex.join("quickstart/hub/workflows")) {
+            w.unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        }
+    }
+
     #[test]
     fn overrides_follow_the_template() {
         let a: AgentConfig = serde_yaml::from_str(

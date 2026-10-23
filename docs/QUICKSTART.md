@@ -1,6 +1,6 @@
-# Quickstart (Phase 1: one machine)
+# Quickstart
 
-Phase 1 runs the hub (supervisor + its own node) and optionally a second local node on one Linux machine. Remote workers arrive in Phase 2.
+First the hub (supervisor + its own node), with an optional second local node, all on one Linux machine. Then [remote machines](#adding-remote-machines-workers-and-relays) over mTLS.
 
 ## Prerequisites
 
@@ -88,6 +88,43 @@ $O task cancel 7
 
 Tag a task `-t workflow:build-review` to run a workflow instead of a coordinator.
 
+## Adding remote machines (workers and relays)
+
+On the hub, enable the mTLS link in `supervisor.yaml` and restart the supervisor:
+
+```yaml
+link_listen: 0.0.0.0:7443
+public_names: [hub.example.org]
+```
+
+Then, per machine:
+
+```bash
+# hub
+ocl node invite vps-fi                       # prints: opencode-node join https://hub.example.org:7443 --token ocljoin.…
+# the new machine (binaries + Podman + agent image installed)
+opencode-node join https://hub.example.org:7443 --token ocljoin.…
+opencode-node run                            # or enable the systemd unit
+# hub
+ocl node approve vps-fi
+ocl nodes                                    # vps-fi  worker  approved  connected  14ms  198.51.100.4 …
+ocl spawn builder --node vps-fi -p "…"       # or leave --node out and let placement choose
+```
+
+**A machine that only lends its IP** to other nodes' LLM calls:
+1. Allow its address on the hub: `ocl allow add <ip>`.
+2. Invite it with `ocl node invite relay-home --relay`, join, and approve as above.
+3. Refer to it in workers' `routes.yaml` as `{ type: via_node, node: relay-home }`.
+
+To switch IP when a free allowance runs out, give the agent a plan: `route: { prefer: direct, failover: [via-home] }`. Then watch:
+- `ocl quotas`: allowances and reset countdowns;
+- `ocl ips`: who shares which IP;
+- `ocl stats`: CPU, memory and disk.
+
+Full procedures and failure modes: [RUNBOOK.md](./RUNBOOK.md). Example configs: [`examples/remote/`](../examples/remote/).
+
+The same scenarios run as automated tests on one machine: `tests/e2e/run-all.sh` (see `tests/e2e/README.md`).
+
 ## Troubleshooting
 
 | Symptom | Check |
@@ -97,4 +134,5 @@ Tag a task `-t workflow:build-review` to run a workflow instead of a coordinator
 | Session `blocked` | It's waiting on a permission (`bash: ask`). `ocl show <session>` gives the request id; then `ocl permit <session> <request> once`. |
 | Session `error` with `[opencode-cluster] …` | The message came from keyproxy: budget, token cap, model allowlist, or unresolvable credential. |
 | Node logs `supervisor link down` | The supervisor isn't running, or the socket path differs: compare `node.yaml: supervisor` with `supervisor.yaml: link_socket`. Events are buffered meanwhile. |
-| `permission denied` on `/run/ocl` | Set `runtime.run_dir` in `node.yaml` and `link_socket` in `supervisor.yaml` to a directory you own. |
+| `permission denied` on `/run/ocl` | Set `runtime.run_dir` in `node.yaml` and `link_socket` in `supervisor.yaml` to a directory you own (short: socket paths must fit in 107 bytes). |
+| Remote node problems (join, approval, certificates, relays, quotas) | [RUNBOOK.md §6](./RUNBOOK.md#6-debugging) |

@@ -1,0 +1,10 @@
+# Keyless template: allowances are per IP, so it fails over to relays' IPs.
+name: free-coder
+description: Coder on Kilo's free models (no key); moves to another IP when the allowance runs out.
+provider: { id: kilo-free, model: auto }
+route:
+  prefer: direct
+  failover: [via-relay-de, via-home]
+  on_exhausted: wait                          # park until the soonest reset
+tools: { edit: allow, bash: { default: ask, allow: ["pytest*", "python3 *"] } }
+limits: { max_sessions: 2 }

@@ -1,0 +1,21 @@
+# Hub control plane. The hub also runs agents when node.yaml sits next to this file.
+api_listen: 127.0.0.1:7700            # operator API; put TLS in front (built-in TLS: Phase 4)
+link_listen: 0.0.0.0:7443             # remote nodes connect here (mTLS)
+public_names: [hub.example.org, 203.0.113.10]   # in the link certificate; the first forms the join command
+enrollment:
+  require_approval: true              # new machines wait for `ocl node approve <name>`
+  enforce_for: relay                  # relay | all | none: who must come from an allowed source
+  allowed_sources:                    # seeds the list once; then edit with `ocl allow add|rm`
+    - 198.51.100.0/24
+    - 192.0.2.44
+  token_ttl_secs: 900
+  cert_days: 30                       # nodes renew at two thirds of this
+placement:                            # score weights (each part is 0..1)
+  capacity: 0.30
+  quota: 0.25
+  latency: 0.20
+  locality: 0.15
+  link: 0.10
+tasks:
+  coordinator_agent: coordinator
+  max_concurrent_tasks: 2

@@ -179,6 +179,7 @@ impl Sup {
     }
 
     /// Admission check for an `Attach` arriving over TLS.
+    #[allow(clippy::result_large_err)] // tonic::Status is what the handler returns
     pub fn admit(&self, peer: &LinkPeer, hello: &Hello) -> Result<Admission, tonic::Status> {
         use tonic::Status;
         let fp = peer.cert.as_deref().ok_or_else(|| Status::unauthenticated("a client certificate is required (enroll with `opencode-node join`)"))?;
@@ -225,6 +226,7 @@ impl Sup {
     }
 
     /// Who opened a Tunnel RPC over TLS (same checks as `admit`, minus hello).
+    #[allow(clippy::result_large_err)]
     pub fn tunnel_identity(&self, peer: &LinkPeer) -> Result<String, tonic::Status> {
         use tonic::Status;
         let fp = peer.cert.as_deref().ok_or_else(|| Status::unauthenticated("a client certificate is required"))?;

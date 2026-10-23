@@ -1,6 +1,6 @@
 # opencode-cluster — Usage guide
 
-Practical, copy-pasteable examples for every feature that exists today (Phase 1: one machine, hub + local nodes). Features from later phases are marked **(Phase N)** at the end.
+Practical, copy-pasteable examples for every feature that exists today (Phases 1–2: hub, local and remote nodes, relays, quotas, templates). Features from later phases are listed at the end. Enrolling machines and debugging them: [RUNBOOK.md](./RUNBOOK.md).
 
 Contents:
 1. [Mental model in 60 seconds](#1-mental-model-in-60-seconds)
@@ -20,7 +20,8 @@ Contents:
 15. [Running as systemd services](#15-running-as-systemd-services)
 16. [Testing offline with the mock LLM](#16-testing-offline-with-the-mock-llm)
 17. [Recovery and maintenance](#17-recovery-and-maintenance)
-18. [What's coming](#18-whats-coming)
+18. [Templates from the hub](#18-templates-from-the-hub)
+19. [What's coming](#19-whats-coming)
 
 ---
 
@@ -551,6 +552,42 @@ route: via-vps
 
 Or set `default_route: via-vps` in `node.yaml` for every agent on that node. Only LLM calls take the route; agents still have no network.
 
+### Out through another machine of the cluster (`via_node`)
+
+```yaml
+# routes.yaml on the worker
+routes:
+  via-relay-de: { type: via_node, node: relay-de }   # a node with role: relay (or relay: true)
+```
+
+The relay connects to the provider from its own IP. TLS stays end to end, and the key stays on the worker. Enrolling a relay is described in RUNBOOK §2.2.
+
+### Switch IP when a free allowance runs out
+
+Keyless gateways count per IP. Give the agent a plan, and tell the node how the provider counts:
+
+```yaml
+# agents/free-coder.yaml
+provider: { id: kilo-free, model: auto }
+route: { prefer: direct, failover: [via-relay-de, via-vps], on_exhausted: wait }
+
+# providers.yaml
+providers:
+  kilo-free:
+    quota:
+      scope: ip
+      limits: [ { kind: requests, max: 200, window: 1d, at: "00:00", tz: UTC } ]
+```
+
+```bash
+ocl quotas kilo-free          # per-IP buckets: used/limit, left, RESETS IN 3h 24m, source (header/429/config/override)
+ocl ips                       # which nodes and sessions share each IP
+ocl quota set kilo-free --scope-id 203.0.113.7 --resets-at 03:15 --remaining 0   # you know better than the counters
+ocl route set vps-fi free-coder --prefer via-relay-de --failover direct          # live, kept in that node's overrides.yaml
+```
+
+When every route is used up, the session is `parked`, and `ocl status` shows the countdown. It resumes by itself after the reset. For BYOK accounts use `scope: account` (keys labelled with the same `account`) or `scope: key`. Their limits and resets are learned from the provider's rate-limit headers.
+
 ---
 
 ## 11. Monitoring: status, events, metrics
@@ -847,11 +884,35 @@ Upgrading OpenCode: bump `OPENCODE_VERSION` in `images/agent/Containerfile`, reb
 
 ---
 
-## 18. What's coming
+## 18. Templates from the hub
+
+Put agent templates in the hub's `templates/`; every worker node receives them. A template names a secret *alias*, which each node maps to its own secret:
+
+```yaml
+# hub: templates/coder.yaml
+name: coder
+provider: { id: openrouter, model: qwen/qwen3-coder, key: { secret: openrouter } }
+instances: { max: 4 }
+overridable: { role_append: true, budget_usd: 3.00, routes: [direct, via-relay-de] }
+
+# each worker's node.yaml
+secrets:
+  openrouter: { ref: "systemd-creds:openrouter", account: personal }
+```
+
+```bash
+ocl templates                                   # where each template can run, and why not elsewhere
+ocl spawn coder --append "Focus on the parser" --budget 2 --route via-relay-de
+ocl show <session> --preamble                   # the rendered instructions it started with
+```
+
+Coordinators get the same through `cluster_spawn_agent` (`role_append`, `budget_usd`, `route`), and `cluster_list_nodes` lets them choose a machine.
+
+## 19. What's coming
 
 | Feature | Phase |
 |---|---|
-| Remote nodes over mTLS; **add a machine from the web UI with a one-time join token**; `via_node` egress routes | 2 |
+| ~~Remote nodes over mTLS, join tokens, `via_node` routes, quotas and failover, templates~~ | 2 ✔ (web UI for these: 4) |
 | Artifact store (`cluster_artifact_put/get`), cross-machine shared workspaces, lineage | 3 |
 | Web UI (SolidJS, mobile-first: live sessions, drag-to-sort task board, enrollment), TUI, password login, built-in TLS | 4 |
 | Load test (~10 sessions), pre-warmed containers, Quadlet units, event export, keyproxy usage metering | 5 |

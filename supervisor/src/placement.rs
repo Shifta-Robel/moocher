@@ -3,12 +3,13 @@
 //! Hard filters: the node is attached, has the agent with a resolvable
 //! secret, and has a free slot. The rest is a weighted score, each part 0..1:
 //! * capacity — free session slots;
-//! * quota    — provider allowance left on the node's routes for this agent
-//!              (nodes where every route is used up are dropped while any
-//!              other node still has headroom);
-//! * latency  — provider response time over the node's preferred route;
+//! * quota — provider allowance left on the node's routes for this agent
+//!   (nodes where every route is used up are dropped while any other node
+//!   still has headroom);
+//! * latency — provider response time over the node's preferred route;
 //! * locality — same node as the parent session / the shared workspace;
-//! * link     — hub <-> node round-trip time.
+//! * link — hub <-> node round-trip time.
+//!
 //! Unknown measurements score as neutral, not as bad.
 
 use crate::state::Sup;

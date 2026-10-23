@@ -364,7 +364,7 @@ pub fn parse_size(s: &str) -> Option<u64> {
         _ => (s.as_str(), 1),
     };
     let n: f64 = num.trim().parse().ok()?;
-    (n >= 0.0).then(|| (n * mult as f64) as u64)
+    (n >= 0.0).then_some((n * mult as f64) as u64)
 }
 
 // ------------------------------------------------------------------- tasks

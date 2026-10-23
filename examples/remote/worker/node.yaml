@@ -1,0 +1,14 @@
+# Written by `opencode-node join` (name, supervisor) and extended by hand.
+name: vps-fi
+supervisor: https://hub.example.org:7443
+max_sessions: 4
+runtime: { kind: podman }
+labels: { region: eu-north }
+# Map the hub templates' secret aliases to this machine's own secrets.
+secrets:
+  openrouter: { ref: "systemd-creds:openrouter", account: personal }
+  groq: { ref: "env:GROQ_API_KEY" }
+# Learn each route's public IP (per-IP quotas). The hub-observed address is
+# used for `direct` when it is not a private/loopback address.
+ip_echo: ["https://api.ipify.org"]
+# hub_templates: false                # run only this node's own agents/

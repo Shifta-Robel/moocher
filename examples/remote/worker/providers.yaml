@@ -1,0 +1,21 @@
+providers:
+  # Keyless gateway: counted per IP. Configured limits are a fallback; rate-limit
+  # headers and 429s from the provider take precedence.
+  kilo-free:
+    base_url: https://api.kilo.ai/api/openrouter
+    auth: { type: none }
+    tier: best_effort
+    quota:
+      scope: ip
+      limits:
+        - { kind: requests, max: 200, window: 1d, at: "00:00", tz: UTC }   # resets daily at midnight UTC
+        - { kind: requests, max: 20, window: 1m, rolling: true }
+  # Your OpenRouter account: keys with the same `account` label share one view.
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    quota: { scope: account }
+    prices: { qwen/qwen3-coder: { input_per_mtok: 0.20, output_per_mtok: 0.80 } }
+  # Groq: per key, learned from x-ratelimit-* headers.
+  groq:
+    base_url: https://api.groq.com/openai/v1
+    quota: { scope: key }
