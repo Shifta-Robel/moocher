@@ -209,6 +209,9 @@ impl Manager {
                 Ok(json!({"ok": true}))
             }
             NodeCommand::SyncTemplates { templates, preamble, hash } => {
+                if !self.cfg.get().node.hub_templates {
+                    return Ok(json!({"ok": true, "ignored": "hub_templates: false on this node"}));
+                }
                 if self.cfg.get().hub_hash != hash {
                     let n = templates.len();
                     let s = self.cfg.set_hub(&crate::cfgstore::HubSet { templates, preamble, hash })?;

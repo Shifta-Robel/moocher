@@ -58,6 +58,10 @@ pub struct NodeConfig {
     /// IPs (applies to `direct` routes and to traffic relayed for others).
     #[serde(default)]
     pub egress_bind: Option<String>,
+    /// Accept agent templates pushed by the hub (`templates/`). With `false`
+    /// this node runs only its own agents/, whatever the hub sends.
+    #[serde(default = "default_true")]
+    pub hub_templates: bool,
     /// Secret aliases for hub templates: `openrouter: { ref: "env:OPENROUTER_API_KEY", account: personal }`.
     /// A template names the alias (`key: { secret: openrouter }`); each node maps it to its own secret.
     #[serde(default)]

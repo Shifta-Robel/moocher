@@ -143,7 +143,11 @@ pub fn load(dir: &Path) -> Result<Snapshot> {
     if !valid_name(&node.name) {
         anyhow::bail!("node name {:?} must match [a-z0-9-]{{1,48}}", node.name);
     }
-    let hub: HubSet = std::fs::read(hub_cache(dir, &node)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let hub: HubSet = if node.hub_templates {
+        std::fs::read(hub_cache(dir, &node)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    } else {
+        HubSet::default()
+    };
     let mut file_errors = BTreeMap::new();
     let mut providers = builtin_providers();
     let pf = dir.join("providers.yaml");
