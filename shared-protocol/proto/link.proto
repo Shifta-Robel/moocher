@@ -1,0 +1,24 @@
+// Node <-> supervisor link.
+//
+// One long-lived bidirectional stream per node, dialed by the node. The proto
+// layer is deliberately thin: it carries sequence/ack numbers for the
+// telemetry outbox and a JSON payload whose schema is the Rust enums in
+// `ocl_protocol::link` (NodeMsg / SupMsg). Both ends are built from the same
+// crate, so the domain schema lives in exactly one place while gRPC supplies
+// HTTP/2 multiplexing, flow control and (Phase 2) mTLS.
+syntax = "proto3";
+
+package ocl.link.v1;
+
+service NodeLink {
+  rpc Attach(stream Envelope) returns (stream Envelope);
+}
+
+message Envelope {
+  // Node->supervisor: outbox sequence number for durable events, 0 otherwise.
+  uint64 seq = 1;
+  // Supervisor->node: highest event seq persisted by the supervisor.
+  uint64 ack = 2;
+  // serde_json encoding of NodeMsg (node->sup) or SupMsg (sup->node).
+  bytes json = 3;
+}

@@ -1,0 +1,7 @@
+name: hub
+supervisor: unix:///run/ocl/supervisor.sock
+max_sessions: 6
+runtime:
+  kind: podman
+  image: localhost/ocl-agent:1.19.4
+labels: { role: hub }

@@ -1,0 +1,8 @@
+# Hub supervisor. The hub ALSO runs its own sessions: node.yaml in this same
+# directory makes this machine a node too.
+api_listen: 127.0.0.1:7700
+# link_socket defaults to $XDG_RUNTIME_DIR/ocl/supervisor.sock or /run/ocl/supervisor.sock
+tasks:
+  coordinator_agent: coordinator
+  max_concurrent_tasks: 2
+  idle_grace_secs: 10

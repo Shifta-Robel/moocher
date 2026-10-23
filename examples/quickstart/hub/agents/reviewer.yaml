@@ -1,0 +1,12 @@
+apiVersion: ocl/v1
+kind: Agent
+name: reviewer
+description: Reviews code for correctness and style; ends with VERDICT APPROVED or CHANGES_REQUESTED.
+provider: { id: mock, model: reviewer, key: { ref: "env:MOCK_API_KEY" } }
+role:
+  system_prompt_file: prompts/reviewer.md
+tools:
+  edit: deny
+  bash: { default: deny, allow: ["python3 -m pytest*", "cat *", "ls*"] }
+container: { memory: 1g, cpus: 1.0 }
+limits: { max_sessions: 2, budget_usd: 0.50 }

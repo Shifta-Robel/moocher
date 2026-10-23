@@ -1,0 +1,402 @@
+//! Per-session gateway, served on `<run>/<id>/node.sock` and reachable from the
+//! container as `http://127.0.0.1:7777` through ocl-bridge.
+//!
+//! * `/llm/<provider>/...` — **keyproxy**: checks the session capability token,
+//!   model allowlist and budget, swaps in the real API key (resolved on this
+//!   node, per request) and forwards over the agent's egress route. The agent
+//!   only ever holds the capability token.
+//! * `/mcp` — **cluster MCP server** (streamable HTTP, JSON responses): the
+//!   tools agents use to message, spawn and report to the cluster.
+
+use crate::cfgstore::ConfigStore;
+use crate::link::LinkHandle;
+use axum::body::Body;
+use axum::extract::{Path, Request, State};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{any, get, post};
+use axum::{Json, Router};
+use futures::StreamExt;
+use ocl_protocol::config::{AuthStyle, Route};
+use ocl_protocol::link::AgentCall;
+use ocl_protocol::model::{SessionRole, TokenUsage};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use tokio::net::UnixListener;
+
+#[derive(Clone)]
+pub struct Gateway {
+    pub id: String,
+    pub agent: String,
+    pub role: SessionRole,
+    cap: Arc<String>,
+    cfg: ConfigStore,
+    pub usage: Arc<Mutex<TokenUsage>>,
+    link: LinkHandle,
+    http: Arc<Mutex<HashMap<String, reqwest::Client>>>,
+}
+
+const MAX_BODY: usize = 32 * 1024 * 1024;
+
+impl Gateway {
+    pub fn new(id: &str, agent: &str, role: SessionRole, cap: &str, cfg: ConfigStore, usage: Arc<Mutex<TokenUsage>>, link: LinkHandle) -> Self {
+        Gateway {
+            id: id.into(),
+            agent: agent.into(),
+            role,
+            cap: Arc::new(cap.into()),
+            cfg,
+            usage,
+            link,
+            http: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Bind the socket and serve until the returned task is aborted.
+    pub fn serve(self, sock: PathBuf) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock)?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // The 0700 parent dir is the boundary; the container user must connect.
+            std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o666))?;
+        }
+        let app = Router::new()
+            .route("/healthz", get(|| async { "ok" }))
+            .route("/llm/{provider}/{*rest}", any(keyproxy))
+            .route("/mcp", post(mcp).get(|| async { StatusCode::METHOD_NOT_ALLOWED }))
+            .with_state(self);
+        Ok(tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app).await {
+                tracing::warn!(error = %e, "gateway stopped");
+            }
+        }))
+    }
+
+    fn check_cap(&self, headers: &HeaderMap, query: Option<&str>) -> bool {
+        let mut presented: Vec<String> = vec![];
+        if let Some(v) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+            presented.push(v.trim_start_matches("Bearer ").trim().to_string());
+        }
+        for h in ["x-api-key", "x-goog-api-key"] {
+            if let Some(v) = headers.get(h).and_then(|v| v.to_str().ok()) {
+                presented.push(v.trim().to_string());
+            }
+        }
+        if let Some(q) = query {
+            for kv in q.split('&') {
+                if let Some(v) = kv.strip_prefix("key=") {
+                    presented.push(v.to_string());
+                }
+            }
+        }
+        presented.iter().any(|p| ct_eq(p.as_bytes(), self.cap.as_bytes()))
+    }
+
+    fn client_for(&self, route: &Route) -> Result<reqwest::Client, String> {
+        let key = format!("{route:?}");
+        if let Some(c) = self.http.lock().unwrap().get(&key) {
+            return Ok(c.clone());
+        }
+        let mut b = reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(20));
+        match route {
+            Route::Direct => {}
+            Route::Proxy { url } => b = b.proxy(reqwest::Proxy::all(url).map_err(|e| format!("bad proxy url: {e}"))?),
+            Route::ViaNode { node } => return Err(format!("via_node route ({node}) is not available until Phase 2")),
+        }
+        let c = b.build().map_err(|e| e.to_string())?;
+        self.http.lock().unwrap().insert(key, c.clone());
+        Ok(c)
+    }
+}
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn llm_error(status: StatusCode, msg: &str) -> Response {
+    // Shaped like an OpenAI error so OpenCode surfaces the message.
+    (status, Json(json!({"error": {"message": format!("[opencode-cluster] {msg}"), "type": "ocl_gateway"}}))).into_response()
+}
+
+const HOP: &[&str] = &[
+    "host",
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "transfer-encoding",
+    "te",
+    "upgrade",
+    "content-length",
+    "authorization",
+    "x-api-key",
+    "x-goog-api-key",
+];
+
+async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String, String)>, req: Request) -> Response {
+    let query = req.uri().query().map(String::from);
+    if !g.check_cap(req.headers(), query.as_deref()) {
+        return llm_error(StatusCode::UNAUTHORIZED, "invalid capability token");
+    }
+    let snap = g.cfg.get();
+    let Some(agent) = snap.agents.get(&g.agent) else {
+        return llm_error(StatusCode::FORBIDDEN, "agent profile no longer exists on this node");
+    };
+    if provider != agent.cfg.provider.id {
+        return llm_error(StatusCode::FORBIDDEN, &format!("provider {provider} not allowed for agent {}", g.agent));
+    }
+    let Some(pdef) = snap.providers.get(&provider).cloned() else {
+        return llm_error(StatusCode::BAD_GATEWAY, "provider not configured");
+    };
+    {
+        let u = *g.usage.lock().unwrap();
+        if let Some(b) = agent.cfg.limits.budget_usd {
+            if u.cost_usd >= b {
+                return llm_error(StatusCode::TOO_MANY_REQUESTS, &format!("session budget ${b:.2} exhausted"));
+            }
+        }
+        if let Some(m) = agent.cfg.limits.max_tokens {
+            if u.total() >= m {
+                return llm_error(StatusCode::TOO_MANY_REQUESTS, &format!("session token cap {m} reached"));
+            }
+        }
+    }
+    let method = req.method().clone();
+    let mut headers = req.headers().clone();
+    let body = match axum::body::to_bytes(req.into_body(), MAX_BODY).await {
+        Ok(b) => b,
+        Err(_) => return llm_error(StatusCode::PAYLOAD_TOO_LARGE, "request too large"),
+    };
+    // Model allowlist: JSON bodies name the model (OpenAI/Anthropic); Gemini puts it in the path.
+    if let Ok(v) = serde_json::from_slice::<Value>(&body) {
+        if let Some(m) = v.get("model").and_then(|m| m.as_str()) {
+            if m != agent.cfg.provider.model {
+                return llm_error(StatusCode::FORBIDDEN, &format!("model {m} not allowed (profile model is {})", agent.cfg.provider.model));
+            }
+        }
+    }
+    let secret = match &agent.cfg.provider.key {
+        None => None,
+        Some(r) => match crate::secrets::resolve(r) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(agent = %g.agent, error = %e, "secret unresolvable");
+                return llm_error(StatusCode::BAD_GATEWAY, "provider credential unavailable on this node");
+            }
+        },
+    };
+    let mut url = format!("{}/{}", pdef.base_url.trim_end_matches('/'), rest);
+    let mut q: Vec<String> = query.unwrap_or_default().split('&').filter(|kv| !kv.is_empty() && !kv.starts_with("key=")).map(String::from).collect();
+    for h in HOP {
+        headers.remove(*h);
+    }
+    for (k, v) in &pdef.headers {
+        if let (Ok(k), Ok(v)) = (HeaderName::try_from(k.as_str()), HeaderValue::try_from(v.as_str())) {
+            headers.insert(k, v);
+        }
+    }
+    if let Some(s) = &secret {
+        match &pdef.auth {
+            AuthStyle::Bearer => {
+                headers.insert("authorization", HeaderValue::try_from(format!("Bearer {s}")).unwrap());
+            }
+            AuthStyle::Header { name } => {
+                if let Ok(n) = HeaderName::try_from(name.as_str()) {
+                    headers.insert(n, HeaderValue::try_from(s.as_str()).unwrap());
+                }
+            }
+            AuthStyle::Query { name } => q.push(format!("{name}={s}")),
+            AuthStyle::None => {}
+        }
+    }
+    if !q.is_empty() {
+        url.push('?');
+        url.push_str(&q.join("&"));
+    }
+    let route = snap.route_for(&agent.cfg);
+    let client = match g.client_for(&route) {
+        Ok(c) => c,
+        Err(e) => return llm_error(StatusCode::BAD_GATEWAY, &e),
+    };
+    let upstream = match client.request(method, &url).headers(headers).body(body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(agent = %g.agent, provider, error = %e, "upstream request failed");
+            return llm_error(StatusCode::BAD_GATEWAY, &format!("upstream unreachable: {}", e.without_url()));
+        }
+    };
+    let status = upstream.status();
+    let mut out = Response::builder().status(status.as_u16());
+    for (k, v) in upstream.headers() {
+        if !HOP.contains(&k.as_str()) {
+            out = out.header(k, v);
+        }
+    }
+    let stream = upstream.bytes_stream().map(|r| r.map_err(std::io::Error::other));
+    out.body(Body::from_stream(stream)).unwrap_or_else(|_| llm_error(StatusCode::BAD_GATEWAY, "bad upstream response"))
+}
+
+// ---------------------------------------------------------------------- MCP
+
+struct ToolDef {
+    name: &'static str,
+    desc: &'static str,
+    schema: fn() -> Value,
+    coordinator: bool,
+}
+
+fn obj(props: Value, required: &[&str]) -> Value {
+    json!({"type": "object", "properties": props, "required": required})
+}
+
+const TOOLS: &[ToolDef] = &[
+    ToolDef {
+        name: "send_message",
+        desc: "Send a message to another session in the cluster. delivery: queue (after its current turn, default), steer (inject now), inbox (it reads it with read_inbox).",
+        schema: || obj(json!({"to": {"type": "string", "description": "session id"}, "text": {"type": "string"}, "delivery": {"type": "string", "enum": ["queue", "steer", "inbox"]}}), &["to", "text"]),
+        coordinator: false,
+    },
+    ToolDef { name: "read_inbox", desc: "Read and clear messages left for you by other sessions.", schema: || obj(json!({}), &[]), coordinator: false },
+    ToolDef { name: "list_agents", desc: "List agent profiles available in the cluster (name, description, model, node).", schema: || obj(json!({}), &[]), coordinator: false },
+    ToolDef { name: "list_sessions", desc: "List live sessions with status, todos progress and token usage.", schema: || obj(json!({}), &[]), coordinator: false },
+    ToolDef {
+        name: "session_status",
+        desc: "Status, todos, token usage and last output of one session.",
+        schema: || obj(json!({"session": {"type": "string"}}), &["session"]),
+        coordinator: false,
+    },
+    ToolDef {
+        name: "spawn_agent",
+        desc: "Start a new agent session from a profile (see list_agents) with an initial prompt. Returns its session id. You are notified when it finishes a turn. share_workspace=true gives it your workspace.",
+        schema: || {
+            obj(
+                json!({"agent": {"type": "string"}, "prompt": {"type": "string"}, "title": {"type": "string"}, "node": {"type": "string"}, "share_workspace": {"type": "boolean"}}),
+                &["agent", "prompt"],
+            )
+        },
+        coordinator: true,
+    },
+    ToolDef { name: "stop_session", desc: "Stop a session you spawned.", schema: || obj(json!({"session": {"type": "string"}}), &["session"]), coordinator: true },
+    ToolDef { name: "task_get", desc: "Get the task you are coordinating.", schema: || obj(json!({}), &[]), coordinator: true },
+    ToolDef { name: "task_note", desc: "Append a progress note to your task (visible to the operator).", schema: || obj(json!({"note": {"type": "string"}}), &["note"]), coordinator: true },
+    ToolDef {
+        name: "task_complete",
+        desc: "Mark your task done with a summary of the outcome. Stops the sessions you spawned.",
+        schema: || obj(json!({"summary": {"type": "string"}}), &["summary"]),
+        coordinator: true,
+    },
+    ToolDef { name: "task_fail", desc: "Give up on your task with a reason.", schema: || obj(json!({"reason": {"type": "string"}}), &["reason"]), coordinator: true },
+];
+
+impl Gateway {
+    fn tool_allowed(&self, t: &ToolDef) -> bool {
+        if t.coordinator && self.role != SessionRole::Coordinator {
+            return false;
+        }
+        let snap = self.cfg.get();
+        match snap.agents.get(&self.agent).and_then(|a| a.cfg.tools.cluster.clone()) {
+            Some(list) => list.iter().any(|n| n == t.name),
+            None => true,
+        }
+    }
+}
+
+fn to_call(name: &str, a: &Value) -> Result<AgentCall, String> {
+    let s = |k: &str| a.get(k).and_then(|v| v.as_str()).map(String::from).ok_or_else(|| format!("missing string argument {k:?}"));
+    Ok(match name {
+        "send_message" => AgentCall::Send {
+            to: s("to")?,
+            text: s("text")?,
+            delivery: a.get("delivery").and_then(|d| serde_json::from_value(d.clone()).ok()).unwrap_or_default(),
+        },
+        "read_inbox" => AgentCall::Inbox,
+        "list_agents" => AgentCall::ListAgents,
+        "list_sessions" => AgentCall::ListSessions,
+        "session_status" => AgentCall::SessionStatus { session: s("session")? },
+        "spawn_agent" => AgentCall::Spawn {
+            agent: s("agent")?,
+            prompt: s("prompt")?,
+            node: s("node").ok(),
+            title: s("title").ok(),
+            share_workspace: a.get("share_workspace").and_then(|v| v.as_bool()).unwrap_or(false),
+        },
+        "stop_session" => AgentCall::Stop { session: s("session")? },
+        "task_get" => AgentCall::TaskGet,
+        "task_note" => AgentCall::TaskNote { note: s("note")? },
+        "task_complete" => AgentCall::TaskComplete { summary: s("summary")? },
+        "task_fail" => AgentCall::TaskFail { reason: s("reason")? },
+        _ => return Err(format!("unknown tool {name}")),
+    })
+}
+
+async fn mcp(State(g): State<Gateway>, headers: HeaderMap, Json(msg): Json<Value>) -> Response {
+    if !g.check_cap(&headers, None) {
+        return (StatusCode::UNAUTHORIZED, "invalid capability token").into_response();
+    }
+    // Batches are allowed by older spec revisions; handle both.
+    if let Some(batch) = msg.as_array() {
+        let mut out = vec![];
+        for m in batch {
+            if let Some(r) = handle_rpc(&g, m).await {
+                out.push(r);
+            }
+        }
+        return if out.is_empty() { StatusCode::ACCEPTED.into_response() } else { Json(Value::Array(out)).into_response() };
+    }
+    match handle_rpc(&g, &msg).await {
+        Some(r) => Json(r).into_response(),
+        None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+async fn handle_rpc(g: &Gateway, m: &Value) -> Option<Value> {
+    let id = m.get("id").cloned();
+    let method = m.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    let id = id?; // notifications get no response
+    let ok = |result: Value| json!({"jsonrpc": "2.0", "id": id.clone(), "result": result});
+    let err = |code: i64, message: String| json!({"jsonrpc": "2.0", "id": id.clone(), "error": {"code": code, "message": message}});
+    Some(match method {
+        "initialize" => {
+            let pv = m["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18").to_string();
+            ok(json!({
+                "protocolVersion": pv,
+                "capabilities": {"tools": {"listChanged": false}},
+                "serverInfo": {"name": "opencode-cluster", "version": ocl_protocol::VERSION},
+                "instructions": "Cluster tools for coordinating with other OpenCode agents. Your session id is available via list_sessions."
+            }))
+        }
+        "ping" => ok(json!({})),
+        "tools/list" => {
+            let tools: Vec<Value> = TOOLS
+                .iter()
+                .filter(|t| g.tool_allowed(t))
+                .map(|t| json!({"name": t.name, "description": t.desc, "inputSchema": (t.schema)()}))
+                .collect();
+            ok(json!({"tools": tools}))
+        }
+        "tools/call" => {
+            let name = m["params"]["name"].as_str().unwrap_or("");
+            let args = m["params"].get("arguments").cloned().unwrap_or(json!({}));
+            let Some(def) = TOOLS.iter().find(|t| t.name == name) else {
+                return Some(err(-32602, format!("unknown tool {name}")));
+            };
+            if !g.tool_allowed(def) {
+                return Some(ok(json!({"content": [{"type": "text", "text": format!("tool {name} is not permitted for this session")}], "isError": true})));
+            }
+            let call = match to_call(name, &args) {
+                Ok(c) => c,
+                Err(e) => return Some(ok(json!({"content": [{"type": "text", "text": e}], "isError": true}))),
+            };
+            match g.link.request(&g.id, call).await {
+                Ok(v) => {
+                    let text = if let Some(s) = v.as_str() { s.to_string() } else { serde_json::to_string_pretty(&v).unwrap_or_default() };
+                    ok(json!({"content": [{"type": "text", "text": text}], "isError": false}))
+                }
+                Err(e) => ok(json!({"content": [{"type": "text", "text": format!("cluster error: {e}")}], "isError": true})),
+            }
+        }
+        _ => err(-32601, format!("method not found: {method}")),
+    })
+}

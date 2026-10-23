@@ -1,0 +1,196 @@
+{
+ "phases": [
+  {
+   "match": "docstring",
+   "steps": [
+    {
+     "tool": "todowrite",
+     "args": {
+      "todos": [
+       {
+        "content": "write implementation",
+        "status": "in_progress",
+        "priority": "high"
+       },
+       {
+        "content": "write tests",
+        "status": "pending",
+        "priority": "high"
+       },
+       {
+        "content": "run tests",
+        "status": "pending",
+        "priority": "medium"
+       }
+      ]
+     }
+    },
+    {
+     "tool": "write",
+     "args": {
+      "content": "def greet(name: str) -> str:\n    \"\"\"Return a friendly greeting for `name` (blank -> \"world\").\"\"\"\n    name = name.strip() or \"world\"\n    return f\"Hello, {name}!\"\n",
+      "filePath": "greet.py"
+     }
+    },
+    {
+     "tool": "write",
+     "args": {
+      "content": "from greet import greet\n\n\ndef test_name():\n    assert greet(\"Ada\") == \"Hello, Ada!\"\n\n\ndef test_blank():\n    assert greet(\"  \") == \"Hello, world!\"\n",
+      "filePath": "test_greet.py"
+     }
+    },
+    {
+     "tool": "todowrite",
+     "args": {
+      "todos": [
+       {
+        "content": "write implementation",
+        "status": "completed",
+        "priority": "high"
+       },
+       {
+        "content": "write tests",
+        "status": "completed",
+        "priority": "high"
+       },
+       {
+        "content": "run tests",
+        "status": "in_progress",
+        "priority": "medium"
+       }
+      ]
+     }
+    },
+    {
+     "tool": "bash",
+     "args": {
+      "command": "python3 -m pytest -q",
+      "description": "Run the test suite"
+     }
+    },
+    {
+     "tool": "todowrite",
+     "args": {
+      "todos": [
+       {
+        "content": "write implementation",
+        "status": "completed",
+        "priority": "high"
+       },
+       {
+        "content": "write tests",
+        "status": "completed",
+        "priority": "high"
+       },
+       {
+        "content": "run tests",
+        "status": "completed",
+        "priority": "medium"
+       }
+      ]
+     }
+    },
+    {
+     "text": "Implemented greet(name) in greet.py with a docstring (as the operator asked) and two pytest tests; all tests pass."
+    }
+   ]
+  },
+  {
+   "steps": [
+    {
+     "tool": "todowrite",
+     "args": {
+      "todos": [
+       {
+        "content": "write implementation",
+        "status": "in_progress",
+        "priority": "high"
+       },
+       {
+        "content": "write tests",
+        "status": "pending",
+        "priority": "high"
+       },
+       {
+        "content": "run tests",
+        "status": "pending",
+        "priority": "medium"
+       }
+      ]
+     }
+    },
+    {
+     "delay": 2,
+     "tool": "write",
+     "args": {
+      "content": "def greet(name: str) -> str:\n    name = name.strip() or \"world\"\n    return f\"Hello, {name}!\"\n",
+      "filePath": "greet.py"
+     }
+    },
+    {
+     "delay": 2,
+     "tool": "write",
+     "args": {
+      "content": "from greet import greet\n\n\ndef test_name():\n    assert greet(\"Ada\") == \"Hello, Ada!\"\n\n\ndef test_blank():\n    assert greet(\"  \") == \"Hello, world!\"\n",
+      "filePath": "test_greet.py"
+     }
+    },
+    {
+     "tool": "todowrite",
+     "args": {
+      "todos": [
+       {
+        "content": "write implementation",
+        "status": "completed",
+        "priority": "high"
+       },
+       {
+        "content": "write tests",
+        "status": "completed",
+        "priority": "high"
+       },
+       {
+        "content": "run tests",
+        "status": "in_progress",
+        "priority": "medium"
+       }
+      ]
+     }
+    },
+    {
+     "delay": 1,
+     "tool": "bash",
+     "args": {
+      "command": "python3 -m pytest -q",
+      "description": "Run the test suite"
+     }
+    },
+    {
+     "tool": "todowrite",
+     "args": {
+      "todos": [
+       {
+        "content": "write implementation",
+        "status": "completed",
+        "priority": "high"
+       },
+       {
+        "content": "write tests",
+        "status": "completed",
+        "priority": "high"
+       },
+       {
+        "content": "run tests",
+        "status": "completed",
+        "priority": "medium"
+       }
+      ]
+     }
+    },
+    {
+     "text": "Implemented greet(name) in greet.py with two pytest tests (test_greet.py); all tests pass."
+    }
+   ]
+  }
+ ]
+}

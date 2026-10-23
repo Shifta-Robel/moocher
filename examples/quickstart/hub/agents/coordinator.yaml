@@ -1,0 +1,14 @@
+apiVersion: ocl/v1
+kind: Agent
+name: coordinator
+description: Main agent. Takes tasks from the bucket and delegates to other agents.
+provider: { id: mock, model: coordinator, key: { ref: "env:MOCK_API_KEY" } }
+role:
+  system_prompt: |
+    You coordinate a small team of coding agents. Prefer delegating
+    implementation to `builder` and verification to `reviewer`.
+tools:
+  edit: allow
+  bash: { default: deny, allow: ["ls*", "cat *"] }
+container: { memory: 1g, cpus: 0.5 }
+limits: { max_sessions: 2, budget_usd: 2.00 }

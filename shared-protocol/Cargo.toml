@@ -1,0 +1,20 @@
+[package]
+name = "ocl-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared config schema, domain types and node<->supervisor protocol for opencode-cluster"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+schemars.workspace = true
+anyhow.workspace = true
+tonic.workspace = true
+prost.workspace = true
+rand.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
+protoc-bin-vendored.workspace = true

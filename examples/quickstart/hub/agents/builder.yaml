@@ -1,0 +1,17 @@
+apiVersion: ocl/v1
+kind: Agent
+name: builder
+description: Writes small Python modules with pytest tests.
+provider:
+  id: mock                       # swap for e.g. { id: openrouter, model: qwen/qwen3-coder, key: { ref: "env:OPENROUTER_API_KEY" } }
+  model: builder
+  key: { ref: "env:MOCK_API_KEY" } # resolved on THIS node only, injected by keyproxy
+role:
+  system_prompt_file: prompts/builder.md
+tools:
+  edit: allow
+  bash: { default: ask, allow: ["python3 *", "pytest*", "ls*", "cat *"] }
+  webfetch: deny
+container: { memory: 1g, cpus: 1.0, pids: 512, egress: none }
+workspace: { mode: isolated }
+limits: { max_sessions: 2, budget_usd: 1.00, max_tokens: 500000, wall_clock_secs: 1800 }

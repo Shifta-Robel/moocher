@@ -1,0 +1,12 @@
+# Built-ins (openrouter, groq, gemini, anthropic, openai, kilo-free,
+# pollinations, keylessai) are always available; entries here add or override.
+providers:
+  mock:
+    base_url: http://127.0.0.1:8099/v1
+    api: openai
+    auth: { type: bearer }
+    description: Local deterministic mock LLM (examples/mock-llm) for offline demos
+    prices:
+      builder:     { input_per_mtok: 0.50, output_per_mtok: 1.50 }
+      reviewer:    { input_per_mtok: 0.50, output_per_mtok: 1.50 }
+      coordinator: { input_per_mtok: 1.00, output_per_mtok: 3.00 }

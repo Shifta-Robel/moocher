@@ -1,0 +1,9 @@
+[package]
+name = "ocl-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "In-container UDS<->TCP relay and entrypoint for opencode-cluster agent containers"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "net", "io-util", "process", "signal", "macros", "time"] }

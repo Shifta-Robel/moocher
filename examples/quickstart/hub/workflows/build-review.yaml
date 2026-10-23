@@ -1,0 +1,28 @@
+apiVersion: ocl/v1
+kind: Workflow
+name: build-review
+description: Builder implements, reviewer approves or sends it back.
+# Steps share one workspace (default: shared, named after the run).
+max_step_runs: 6
+steps:
+  - name: build
+    agent: builder
+    prompt: |
+      Implement the following in the current directory:
+      {{input}}
+      {{feedback}}
+    success:
+      todos: ["write implementation", "write tests", "run tests"]
+      checks:
+        - exit_code: "python3 -m pytest -q"
+      max_nudges: 1
+  - name: review
+    agent: reviewer
+    prompt: |
+      Review the implementation of: {{input}}
+      The builder reported:
+      {{prev.output}}
+    success:
+      checks:
+        - text_contains: "VERDICT: APPROVED"
+    on_fail: build

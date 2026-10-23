@@ -1,0 +1,30 @@
+{"phases": [
+  {"match": "(reviewer", "steps": [
+    {"tool": "todowrite", "args": {"todos": [
+      {"content": "delegate implementation", "status": "completed", "priority": "high"},
+      {"content": "delegate review", "status": "completed", "priority": "high"},
+      {"content": "report result", "status": "completed", "priority": "medium"}]}},
+    {"tool": "cluster_task_complete", "args": {"summary": "greet.py implemented by builder and approved by reviewer (tests pass)."}},
+    {"text": "Task complete."}
+  ]},
+  {"match": "(builder", "steps": [
+    {"tool": "todowrite", "args": {"todos": [
+      {"content": "delegate implementation", "status": "completed", "priority": "high"},
+      {"content": "delegate review", "status": "in_progress", "priority": "high"},
+      {"content": "report result", "status": "pending", "priority": "medium"}]}},
+    {"tool": "cluster_spawn_agent", "args": {"agent": "reviewer", "title": "review greet.py", "share_workspace": true,
+      "prompt": "Review greet.py and test_greet.py in the current directory. Run the tests. End with VERDICT: APPROVED or VERDICT: CHANGES_REQUESTED."}},
+    {"text": "Builder finished; reviewer started."}
+  ]},
+  {"match": "still open", "steps": [{"text": "Still waiting for my agents."}]},
+  {"steps": [
+    {"tool": "todowrite", "args": {"todos": [
+      {"content": "delegate implementation", "status": "in_progress", "priority": "high"},
+      {"content": "delegate review", "status": "pending", "priority": "high"},
+      {"content": "report result", "status": "pending", "priority": "medium"}]}},
+    {"tool": "cluster_list_agents", "args": {}},
+    {"tool": "cluster_spawn_agent", "args": {"agent": "builder", "title": "implement greet.py", "share_workspace": true,
+      "prompt": "Implement greet(name) in greet.py (strip whitespace, default to 'world') with pytest tests in test_greet.py. Run the tests."}},
+    {"text": "Builder started; waiting for it to finish."}
+  ]}
+]}
