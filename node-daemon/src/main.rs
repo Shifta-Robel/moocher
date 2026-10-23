@@ -5,6 +5,7 @@ mod gateway;
 mod link;
 mod manager;
 mod oc;
+mod pki;
 mod runtime;
 mod secrets;
 mod store;
@@ -36,6 +37,14 @@ enum Cmd {
         #[arg(long, default_value = "schemas")]
         out: PathBuf,
     },
+    /// Enroll this machine with a hub using a one-time join token
+    /// (from `ocl node invite <name>` or the web UI).
+    Join {
+        /// The hub's link address, e.g. https://hub.example:7443
+        url: String,
+        #[arg(long, env = "OCL_JOIN_TOKEN", hide_env_values = true)]
+        token: String,
+    },
 }
 
 fn default_dir() -> PathBuf {
@@ -61,8 +70,62 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Check => check(&dir),
+        Cmd::Join { url, token } => join(&dir, &url, &token).await,
         Cmd::Run => run(dir).await,
     }
+}
+
+fn pki_dir(dir: &std::path::Path, node: Option<&ocl_protocol::config::NodeConfig>) -> PathBuf {
+    node.and_then(|n| n.pki_dir.clone()).unwrap_or_else(|| dir.join("pki"))
+}
+
+async fn join(dir: &std::path::Path, url: &str, token: &str) -> Result<()> {
+    let node_yaml = dir.join("node.yaml");
+    let existing: Option<ocl_protocol::config::NodeConfig> = if node_yaml.exists() { Some(ocl_protocol::config::load_yaml(&node_yaml)?) } else { None };
+    let pki = pki::Pki::new(pki_dir(dir, existing.as_ref()));
+    let e = pki::join(&pki, url, token).await?;
+    println!("enrolled as node {:?} (role {}), certificate valid until {}", e.node, e.role, fmt_ts(e.expires_at));
+    match existing {
+        None => {
+            std::fs::create_dir_all(dir)?;
+            let body = if e.role == "relay" {
+                format!("name: {}\nsupervisor: {url}\nrole: relay\n", e.node)
+            } else {
+                format!("name: {}\nsupervisor: {url}\nmax_sessions: 4\nruntime: {{ kind: podman }}\n", e.node)
+            };
+            std::fs::write(&node_yaml, body)?;
+            println!("wrote {}", node_yaml.display());
+        }
+        Some(n) => {
+            if n.name != e.node {
+                println!("WARNING: {} names this node {:?} but it enrolled as {:?}; set `name: {}` before starting.", node_yaml.display(), n.name, e.node, e.node);
+            }
+            if n.supervisor != url {
+                println!("WARNING: {} has `supervisor: {}`; set it to `{url}`.", node_yaml.display(), n.supervisor);
+            }
+        }
+    }
+    if e.status == "pending" {
+        println!("The node is pending approval. On the hub: ocl node approve {}", e.node);
+    }
+    println!("Start it with: opencode-node --config-dir {} run   (or enable the systemd unit)", dir.display());
+    Ok(())
+}
+
+fn fmt_ts(ms: i64) -> String {
+    let secs = ms / 1000;
+    let days = secs / 86_400;
+    // Civil date from days since epoch (Howard Hinnant's algorithm), UTC.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}-{m:02}-{d:02} UTC")
 }
 
 fn check(dir: &std::path::Path) -> Result<()> {
@@ -103,6 +166,11 @@ async fn run(dir: PathBuf) -> Result<()> {
     }
     let rt = runtime::Runtime::new(snap.node.runtime.kind, &snap.node.runtime.podman, snap.node.runtime.opencode_bin.clone())?;
     let supervisor = snap.node.supervisor.clone();
+    let relay_only = snap.node.role == ocl_protocol::config::NodeRole::Relay;
+    let pki = Arc::new(pki::Pki::new(pki_dir(&dir, Some(&snap.node))));
+    if supervisor.starts_with("https://") {
+        pki.client_config().context("loading the node certificate")?;
+    }
     let node_name = snap.node.name.clone();
     let data_dir = snap.node.runtime.data_dir.clone().unwrap_or_else(|| dir.join("data"));
     std::fs::create_dir_all(&data_dir)?;
@@ -112,7 +180,11 @@ async fn run(dir: PathBuf) -> Result<()> {
     let mgr = manager::Manager::new(cfg.clone(), store, rt, link.clone())?;
     tracing::info!(node = %node_name, supervisor = %supervisor, data = %mgr.data_root().display(), "starting");
 
-    mgr.reconcile().await?;
+    if relay_only {
+        tracing::info!("role=relay: this node runs no agents and only relays egress traffic");
+    } else {
+        mgr.reconcile().await?;
+    }
 
     // Hot reload -> tell the supervisor which agents exist now.
     let mut reloads = cfg.watch()?;
@@ -120,7 +192,8 @@ async fn run(dir: PathBuf) -> Result<()> {
         let link = link.clone();
         tokio::spawn(async move {
             while let Some(s) = reloads.recv().await {
-                link.emit(NodeEvent::Agents { agents: s.agent_infos() });
+                let agents = if s.node.role == ocl_protocol::config::NodeRole::Relay { vec![] } else { s.agent_infos() };
+                link.emit(NodeEvent::Agents { agents });
             }
         });
     }
@@ -149,7 +222,7 @@ async fn run(dir: PathBuf) -> Result<()> {
             Box::pin(async move { mgr.handle(cmd).await })
         })
     };
-    let link_task = tokio::spawn(link.run(supervisor, hello, handler));
+    let link_task = tokio::spawn(link.run(supervisor, pki, hello, handler));
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}

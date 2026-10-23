@@ -75,7 +75,20 @@ impl Manager {
         let run_root = snap.node.runtime.run_dir.clone().unwrap_or_else(|| {
             std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("ocl")).unwrap_or_else(|| PathBuf::from("/run/ocl"))
         });
-        std::fs::create_dir_all(&run_root).with_context(|| format!("creating {}", run_root.display()))?;
+        // Relay-only nodes run no sessions and need no socket dir.
+        if snap.node.role != NodeRole::Relay {
+            // Session sockets live at <run_dir>/<s-xxxxxxxxxx>/node.sock; unix socket
+            // paths are limited to 107 bytes, so catch a too-long run_dir now.
+            let longest = run_root.join("s-0123456789").join("node.sock");
+            if longest.as_os_str().len() > 107 {
+                bail!(
+                    "runtime.run_dir {} is too long for unix sockets ({} bytes with the session socket, max 107); use a shorter path such as /run/ocl",
+                    run_root.display(),
+                    longest.as_os_str().len()
+                );
+            }
+            std::fs::create_dir_all(&run_root).with_context(|| format!("creating {}", run_root.display()))?;
+        }
         std::fs::create_dir_all(data_root.join("workspaces"))?;
         std::fs::create_dir_all(data_root.join("instances"))?;
         Ok(Arc::new(Manager {
@@ -104,15 +117,17 @@ impl Manager {
 
     pub async fn hello(&self) -> Hello {
         let snap = self.cfg.get();
+        let relay_only = snap.node.role == NodeRole::Relay;
         Hello {
             protocol: PROTOCOL_VERSION,
             node: self.node.clone(),
             version: ocl_protocol::VERSION.into(),
-            max_sessions: snap.node.max_sessions,
-            relay: snap.node.relay,
-            agents: snap.agent_infos(),
+            max_sessions: if relay_only { 0 } else { snap.node.max_sessions },
+            relay: snap.node.relay || relay_only,
+            agents: if relay_only { vec![] } else { snap.agent_infos() },
             sessions: self.reports(),
             labels: snap.node.labels.clone(),
+            role: snap.node.role,
         }
     }
 
@@ -189,6 +204,9 @@ impl Manager {
 
     async fn spawn(self: &Arc<Self>, spec: SpawnSpec) -> Result<Value> {
         let snap = self.cfg.get();
+        if snap.node.role == NodeRole::Relay {
+            bail!("node {} is a relay-only node and runs no agents", self.node);
+        }
         let agent = snap.agents.get(&spec.agent).cloned().ok_or_else(|| anyhow!("agent {:?} is not configured on node {}", spec.agent, self.node))?;
         if !agent.errors.is_empty() {
             bail!("agent {} has config errors: {}", spec.agent, agent.errors.join("; "));

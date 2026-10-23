@@ -70,7 +70,14 @@ impl Db {
              CREATE INDEX IF NOT EXISTS events_session ON events(session);
              CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
                 target TEXT NOT NULL, detail TEXT NOT NULL, ok INTEGER NOT NULL, prev TEXT NOT NULL, hash TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS api_tokens(hash TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, scope TEXT NOT NULL, created_at INTEGER NOT NULL);",
+             CREATE TABLE IF NOT EXISTS api_tokens(hash TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, scope TEXT NOT NULL, created_at INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS join_tokens(hash TEXT PRIMARY KEY, node TEXT NOT NULL, role TEXT NOT NULL, labels TEXT NOT NULL,
+                created_by TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER);
+             CREATE TABLE IF NOT EXISTS node_certs(fingerprint TEXT PRIMARY KEY, node TEXT NOT NULL, serial TEXT NOT NULL,
+                issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
+             CREATE INDEX IF NOT EXISTS node_certs_node ON node_certs(node);
+             CREATE TABLE IF NOT EXISTS node_auth(node TEXT PRIMARY KEY, status TEXT NOT NULL, role TEXT NOT NULL, labels TEXT NOT NULL, updated_at INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS allowed_sources(cidr TEXT PRIMARY KEY, note TEXT NOT NULL, added_by TEXT NOT NULL, added_at INTEGER NOT NULL);",
         )?;
         {
             use std::os::unix::fs::PermissionsExt;
@@ -116,6 +123,123 @@ impl Db {
         Ok(self.c.lock().unwrap().execute("DELETE FROM api_tokens WHERE name=?1", params![name])? > 0)
     }
 
+    // -------------------------------------------------------- enrollment
+
+    pub fn create_join_token(&self, node: &str, role: &str, labels: &serde_json::Value, by: &str, ttl_ms: i64) -> Result<(String, Ts)> {
+        use rand::Rng;
+        let raw: [u8; 16] = rand::thread_rng().gen();
+        let secret = hex::encode(raw);
+        let now = now_ms();
+        let c = self.c.lock().unwrap();
+        // One outstanding token per node name: a new invite replaces the old one.
+        c.execute("DELETE FROM join_tokens WHERE node=?1 AND used_at IS NULL", params![node])?;
+        c.execute(
+            "INSERT INTO join_tokens(hash,node,role,labels,created_by,created_at,expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![hash_token(&secret), node, role, labels.to_string(), by, now, now + ttl_ms],
+        )?;
+        Ok((secret, now + ttl_ms))
+    }
+
+    /// Atomically consume a join token. Returns (node, role, labels).
+    pub fn use_join_token(&self, secret: &str) -> Result<(String, String, serde_json::Value)> {
+        let c = self.c.lock().unwrap();
+        let row: Option<(String, String, String, Ts, Option<Ts>)> = c
+            .query_row("SELECT node, role, labels, expires_at, used_at FROM join_tokens WHERE hash=?1", params![hash_token(secret)], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .optional()?;
+        let Some((node, role, labels, expires, used)) = row else { return Err(anyhow!("unknown join token")) };
+        if used.is_some() {
+            return Err(anyhow!("join token already used"));
+        }
+        if expires < now_ms() {
+            return Err(anyhow!("join token expired"));
+        }
+        let n = c.execute("UPDATE join_tokens SET used_at=?2 WHERE hash=?1 AND used_at IS NULL", params![hash_token(secret), now_ms()])?;
+        if n != 1 {
+            return Err(anyhow!("join token already used"));
+        }
+        Ok((node, role, serde_json::from_str(&labels).unwrap_or_default()))
+    }
+
+    pub fn add_node_cert(&self, node: &str, fingerprint: &str, serial: &str, expires_at: Ts) -> Result<()> {
+        self.c.lock().unwrap().execute(
+            "INSERT INTO node_certs(fingerprint,node,serial,issued_at,expires_at) VALUES(?1,?2,?3,?4,?5)",
+            params![fingerprint, node, serial, now_ms(), expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// (node, revoked, expires_at) for a presented client certificate.
+    pub fn node_cert(&self, fingerprint: &str) -> Option<(String, bool, Ts)> {
+        self.c
+            .lock()
+            .unwrap()
+            .query_row("SELECT node, revoked, expires_at FROM node_certs WHERE fingerprint=?1", params![fingerprint], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0, r.get::<_, i64>(2)?))
+            })
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Revoke a node's certificates, optionally keeping one (rotation keeps the newest).
+    pub fn revoke_node_certs(&self, node: &str, except: Option<&str>) -> Result<usize> {
+        Ok(self.c.lock().unwrap().execute(
+            "UPDATE node_certs SET revoked=1 WHERE node=?1 AND revoked=0 AND fingerprint IS NOT ?2",
+            params![node, except],
+        )?)
+    }
+
+    pub fn set_node_auth(&self, node: &str, status: &str, role: &str, labels: &serde_json::Value) -> Result<()> {
+        self.c.lock().unwrap().execute(
+            "INSERT INTO node_auth(node,status,role,labels,updated_at) VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(node) DO UPDATE SET status=excluded.status, role=excluded.role, labels=excluded.labels, updated_at=excluded.updated_at",
+            params![node, status, role, labels.to_string(), now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// (status, role, labels) of an enrolled node.
+    pub fn node_auth(&self, node: &str) -> Option<(String, String, serde_json::Value)> {
+        self.c
+            .lock()
+            .unwrap()
+            .query_row("SELECT status, role, labels FROM node_auth WHERE node=?1", params![node], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            })
+            .optional()
+            .ok()
+            .flatten()
+            .map(|(s, r, l)| (s, r, serde_json::from_str(&l).unwrap_or_default()))
+    }
+
+    pub fn allowed_sources(&self) -> Vec<(String, String, String, Ts)> {
+        let c = self.c.lock().unwrap();
+        let Ok(mut st) = c.prepare("SELECT cidr, note, added_by, added_at FROM allowed_sources ORDER BY added_at") else { return vec![] };
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map(|it| it.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    }
+
+    pub fn add_allowed_source(&self, cidr: &str, note: &str, by: &str) -> Result<bool> {
+        Ok(self.c.lock().unwrap().execute(
+            "INSERT OR IGNORE INTO allowed_sources(cidr,note,added_by,added_at) VALUES(?1,?2,?3,?4)",
+            params![cidr, note, by, now_ms()],
+        )? > 0)
+    }
+
+    pub fn remove_allowed_source(&self, cidr: &str) -> Result<bool> {
+        Ok(self.c.lock().unwrap().execute("DELETE FROM allowed_sources WHERE cidr=?1", params![cidr])? > 0)
+    }
+
+    pub fn meta(&self, k: &str) -> Option<String> {
+        self.c.lock().unwrap().query_row("SELECT v FROM meta WHERE k=?1", params![k], |r| r.get(0)).optional().ok().flatten()
+    }
+
+    pub fn set_meta(&self, k: &str, v: &str) -> Result<()> {
+        self.c.lock().unwrap().execute("INSERT INTO meta(k,v) VALUES(?1,?2) ON CONFLICT(k) DO UPDATE SET v=excluded.v", params![k, v])?;
+        Ok(())
+    }
+
     // ------------------------------------------------------------- nodes
 
     pub fn put_node(&self, n: &NodeInfo) -> Result<()> {
@@ -133,6 +257,10 @@ impl Db {
 
     pub fn nodes(&self) -> Vec<NodeInfo> {
         self.json_rows("SELECT info FROM nodes ORDER BY name", [])
+    }
+
+    pub fn delete_node(&self, name: &str) -> Result<bool> {
+        Ok(self.c.lock().unwrap().execute("DELETE FROM nodes WHERE name=?1", params![name])? > 0)
     }
 
     pub fn node_seq(&self, name: &str) -> u64 {

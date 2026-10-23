@@ -85,3 +85,20 @@ pub enum StreamEvent {
     Run(WorkflowRun),
     Log(LogEvent),
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InviteRequest {
+    pub name: String,
+    #[serde(default)]
+    pub role: crate::config::NodeRole,
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AllowSourceRequest {
+    /// IP address or CIDR.
+    pub source: String,
+    #[serde(default)]
+    pub note: String,
+}

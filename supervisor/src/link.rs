@@ -1,11 +1,13 @@
 //! Supervisor side of the node link (gRPC `NodeLink.Attach`).
 
+use crate::nodes::Admission;
 use crate::state::Sup;
+use crate::tlslink::LinkPeer;
 use anyhow::{anyhow, bail, Result};
 use ocl_protocol::link::*;
 use ocl_protocol::model::*;
 use ocl_protocol::proto::node_link_server::NodeLink;
-use ocl_protocol::proto::Envelope;
+use ocl_protocol::proto::{EnrollReply, EnrollRequest, Envelope, TunnelFrame};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -22,6 +24,11 @@ pub struct NodeConn {
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
     /// Distinguishes this connection from a newer one for the same node.
     pub epoch: u64,
+    /// Remote (TLS) connections: the peer address.
+    pub peer: Option<std::net::IpAddr>,
+    /// Set by `Registry::disconnect` to end the stream with a reason.
+    close: tokio::sync::Notify,
+    close_reason: Mutex<Option<String>>,
 }
 
 #[derive(Default)]
@@ -33,6 +40,19 @@ pub struct Registry {
 impl Registry {
     pub fn connected(&self, node: &str) -> bool {
         self.conns.lock().unwrap().contains_key(node)
+    }
+
+    /// Close a node's live connection (revocation, allowlist change).
+    pub fn disconnect(&self, node: &str, reason: &str) {
+        if let Some(c) = self.conns.lock().unwrap().get(node) {
+            *c.close_reason.lock().unwrap() = Some(reason.to_string());
+            c.close.notify_one();
+        }
+    }
+
+    /// Connected remote nodes and their peer addresses.
+    pub fn remote_peers(&self) -> Vec<(String, std::net::IpAddr)> {
+        self.conns.lock().unwrap().iter().filter_map(|(n, c)| c.peer.map(|ip| (n.clone(), ip))).collect()
     }
 
     /// Send a command to a node and wait for its reply.
@@ -65,7 +85,23 @@ type OutStream = Pin<Box<dyn Stream<Item = Result<Envelope, Status>> + Send>>;
 impl NodeLink for LinkService {
     type AttachStream = OutStream;
 
+    async fn enroll(&self, req: Request<EnrollRequest>) -> Result<Response<EnrollReply>, Status> {
+        let peer = req.extensions().get::<LinkPeer>().cloned();
+        let r = req.into_inner();
+        match self.sup.enroll(peer.as_ref(), &r.token, &r.csr_pem).await {
+            Ok(reply) => Ok(Response::new(reply)),
+            Err(e) => Err(Status::permission_denied(format!("{e:#}"))),
+        }
+    }
+
+    type TunnelStream = Pin<Box<dyn Stream<Item = Result<TunnelFrame, Status>> + Send>>;
+
+    async fn tunnel(&self, _req: Request<Streaming<TunnelFrame>>) -> Result<Response<Self::TunnelStream>, Status> {
+        Err(Status::unimplemented("tunnels are not available yet"))
+    }
+
     async fn attach(&self, req: Request<Streaming<Envelope>>) -> Result<Response<OutStream>, Status> {
+        let peer = req.extensions().get::<LinkPeer>().cloned();
         let mut inbound = req.into_inner();
         let first = inbound.message().await?.ok_or_else(|| Status::invalid_argument("empty stream"))?;
         let hello = match serde_json::from_slice::<NodeMsg>(&first.json) {
@@ -78,23 +114,33 @@ impl NodeLink for LinkService {
         if !ocl_protocol::config::valid_name(&hello.node) {
             return Err(Status::invalid_argument("bad node name"));
         }
-        // Phase 1: only same-machine nodes over a 0600 unix socket, so the
-        // socket's file permissions are the authentication. Phase 2 binds the
-        // node name to the mTLS client certificate here.
+        // Same-machine nodes use the 0600 unix socket (file permissions are the
+        // authentication); remote nodes must present an enrolled certificate.
+        let admission = match &peer {
+            Some(p) => self.sup.admit(p, &hello)?,
+            None => Admission::local(&hello),
+        };
         let sup = self.sup.clone();
         let node = hello.node.clone();
         let (tx, rx) = mpsc::channel::<Result<Envelope, Status>>(256);
         let epoch = sup.nodes.next.fetch_add(1, Ordering::Relaxed) + 1;
-        let conn = Arc::new(NodeConn { tx: tx.clone(), pending: Mutex::new(HashMap::new()), epoch });
+        let conn = Arc::new(NodeConn {
+            tx: tx.clone(),
+            pending: Mutex::new(HashMap::new()),
+            epoch,
+            peer: peer.as_ref().map(|p| p.ip()),
+            close: tokio::sync::Notify::new(),
+            close_reason: Mutex::new(None),
+        });
         if let Some(old) = sup.nodes.conns.lock().unwrap().insert(node.clone(), conn.clone()) {
             tracing::warn!(node = %node, "replacing existing connection");
             drop(old);
         }
         let last_seq = sup.db.node_seq(&node);
-        sup.on_hello(&hello);
+        sup.on_hello(&hello, &admission);
         let welcome = serde_json::to_vec(&SupMsg::Welcome { last_seq }).unwrap();
         let _ = tx.send(Ok(Envelope { seq: 0, ack: 0, json: welcome })).await;
-        tracing::info!(node = %node, last_seq, sessions = hello.sessions.len(), "node attached");
+        tracing::info!(node = %node, last_seq, sessions = hello.sessions.len(), peer = ?admission.observed_ip, "node attached");
 
         tokio::spawn(async move {
             let mut acked = last_seq;
@@ -136,8 +182,21 @@ impl NodeLink for LinkService {
                                     let _ = tx.send(Ok(Envelope { seq: 0, ack: 0, json: serde_json::to_vec(&reply).unwrap() })).await;
                                 });
                             }
+                            NodeMsg::RenewCert { req, csr_pem } => {
+                                let reply = match sup.renew_cert(&node, &csr_pem) {
+                                    Ok(value) => SupMsg::Reply { req, ok: true, value, error: None },
+                                    Err(e) => SupMsg::Reply { req, ok: false, value: Value::Null, error: Some(format!("{e:#}")) },
+                                };
+                                let _ = tx.send(Ok(Envelope { seq: 0, ack: 0, json: serde_json::to_vec(&reply).unwrap() })).await;
+                            }
                             NodeMsg::Hello(_) => {}
                         }
+                    }
+                    _ = conn.close.notified() => {
+                        let why = conn.close_reason.lock().unwrap().clone().unwrap_or_else(|| "closed by supervisor".into());
+                        tracing::warn!(node = %node, reason = %why, "closing node connection");
+                        let _ = tx.send(Err(Status::permission_denied(why))).await;
+                        break;
                     }
                     _ = ack_tick.tick() => {
                         if processed > acked {
@@ -172,7 +231,7 @@ impl NodeLink for LinkService {
 
 impl Sup {
     /// Reconcile the supervisor's view with a node's full inventory.
-    pub fn on_hello(&self, h: &Hello) {
+    pub fn on_hello(&self, h: &Hello, adm: &Admission) {
         let info = NodeInfo {
             name: h.node.clone(),
             connected: true,
@@ -183,6 +242,10 @@ impl Sup {
             agents: h.agents.clone(),
             last_seen: now_ms(),
             labels: h.labels.clone(),
+            role: adm.role.as_str().into(),
+            enrollment: adm.enrollment.clone(),
+            observed_ip: adm.observed_ip.clone(),
+            cert_expires_at: adm.cert_expires_at,
         };
         let _ = self.db.put_node(&info);
         self.publish_node(info);
@@ -200,7 +263,12 @@ impl Sup {
                 self.save_session(&s);
             }
         }
-        let _ = self.db.log("node.attached", Some(&h.node), None, &serde_json::json!({"sessions": h.sessions.len(), "agents": h.agents.len()}));
+        let _ = self.db.log(
+            "node.attached",
+            Some(&h.node),
+            None,
+            &serde_json::json!({"sessions": h.sessions.len(), "agents": h.agents.len(), "role": adm.role.as_str(), "peer": adm.observed_ip}),
+        );
     }
 
     pub fn on_node_gone(&self, node: &str) {

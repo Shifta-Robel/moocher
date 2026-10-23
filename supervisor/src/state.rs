@@ -25,6 +25,11 @@ pub struct Sup {
     pub stream: broadcast::Sender<StreamEvent>,
     /// Serialises orchestration decisions (workflow steps, task scheduling).
     pub orch_lock: tokio::sync::Mutex<()>,
+    /// Cluster CA (set at start when remote nodes are enabled).
+    pub ca: std::sync::OnceLock<crate::pki::Ca>,
+    /// Last audit time per (node, rejection reason): a rejected node retries
+    /// for as long as it runs, which should not flood the audit log.
+    pub rejections: std::sync::Mutex<std::collections::HashMap<String, Ts>>,
 }
 
 /// Who performed an action, for the audit log.
@@ -64,7 +69,7 @@ pub struct SpawnOpts {
 impl Sup {
     pub fn new(db: Db, cfg: SupervisorConfig, config_dir: PathBuf) -> Arc<Sup> {
         let (stream, _) = broadcast::channel(1024);
-        Arc::new(Sup { db, cfg, config_dir, nodes: Registry::default(), stream, orch_lock: tokio::sync::Mutex::new(()) })
+        Arc::new(Sup { db, cfg, config_dir, nodes: Registry::default(), stream, orch_lock: tokio::sync::Mutex::new(()), ca: std::sync::OnceLock::new(), rejections: Default::default() })
     }
 
     pub fn audit(&self, actor: &Actor, action: &str, target: &str, detail: Value, ok: bool) {

@@ -3,8 +3,11 @@
 mod api;
 mod db;
 mod link;
+mod nodes;
 mod orch;
+mod pki;
 mod state;
+mod tlslink;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -151,7 +154,9 @@ async fn run(dir: PathBuf, cfg: SupervisorConfig) -> Result<()> {
     }
     let sock = cfg.link_socket.clone().unwrap_or_else(default_link_socket);
     let api_listen = cfg.api_listen.clone();
+    let data = cfg.data_dir.clone().unwrap_or_else(|| dir.join("supervisor"));
     let sup = state::Sup::new(db, cfg, dir.clone());
+    sup.seed_allowlist();
     for s in sup.db.sessions(false) {
         if s.report.state.is_live() {
             // Until its node re-attaches we cannot know; the hello reconciles it.
@@ -175,6 +180,34 @@ async fn run(dir: PathBuf, cfg: SupervisorConfig) -> Result<()> {
         .add_service(NodeLinkServer::new(link::LinkService { sup: sup.clone() }))
         .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(uds));
 
+    // Remote nodes: mTLS on TCP.
+    let remote = match sup.cfg.link_listen.clone() {
+        None => None,
+        Some(listen) => {
+            let ca = pki::Ca::open(&data.join("pki"))?;
+            let names = if sup.cfg.public_names.is_empty() { pki::default_names() } else { sup.cfg.public_names.clone() };
+            let (chain, key) = ca.link_cert(&names)?;
+            let ca_der = ocl_protocol::tls::certs_from_pem(&ca.cert_pem)?;
+            let tls = ocl_protocol::tls::link_server(ocl_protocol::tls::certs_from_pem(&chain)?, ocl_protocol::tls::key_from_pem(&key)?, &ca_der)?;
+            tracing::info!(listen = %listen, names = ?names, ca_fingerprint = %ca.fingerprint(), "remote node link (mTLS) enabled");
+            let _ = sup.ca.set(ca);
+            let incoming = tlslink::incoming(&listen, tls).await?;
+            Some(
+                tonic::transport::Server::builder()
+                    .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+                    .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
+                    .add_service(NodeLinkServer::new(link::LinkService { sup: sup.clone() }))
+                    .serve_with_incoming(incoming),
+            )
+        }
+    };
+    let remote = async move {
+        match remote {
+            Some(f) => f.await,
+            None => std::future::pending().await,
+        }
+    };
+
     let listener = tokio::net::TcpListener::bind(&api_listen).await.with_context(|| format!("binding {api_listen}"))?;
     if !api_listen.starts_with("127.") && !api_listen.starts_with("localhost") && !api_listen.starts_with("[::1]") {
         tracing::warn!(api_listen, "API is listening beyond loopback without TLS; put a TLS reverse proxy in front (built-in TLS: Phase 4)");
@@ -197,6 +230,7 @@ async fn run(dir: PathBuf, cfg: SupervisorConfig) -> Result<()> {
     let sup2: Arc<state::Sup> = sup.clone();
     tokio::select! {
         r = link => r.context("node link server")?,
+        r = remote => r.context("remote node link server")?,
         r = api => r.context("api server")?,
         _ = tokio::signal::ctrl_c() => {}
         _ = sigterm() => {}

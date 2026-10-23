@@ -28,8 +28,15 @@ pub struct NodeConfig {
     /// Unique node name within the cluster (`[a-z0-9-]+`).
     pub name: String,
     /// Where the supervisor is: `unix:///run/ocl/supervisor.sock` (same machine)
-    /// or `https://hub.example:7443` (remote, mTLS; Phase 2).
+    /// or `https://hub.example:7443` (remote, mTLS; set up by `opencode-node join`).
     pub supervisor: String,
+    /// `worker` (default) runs agents. `relay` runs no agents and only carries
+    /// other nodes' LLM traffic out through this machine's IP (`via_node` routes).
+    #[serde(default)]
+    pub role: NodeRole,
+    /// Node key, certificate and the hub CA (default: `<config dir>/pki`).
+    #[serde(default)]
+    pub pki_dir: Option<PathBuf>,
     #[serde(default)]
     pub runtime: RuntimeConfig,
     /// Maximum concurrently running sessions on this node.
@@ -47,6 +54,30 @@ pub struct NodeConfig {
 
 fn default_node_max_sessions() -> u32 {
     6
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRole {
+    #[default]
+    Worker,
+    Relay,
+}
+
+impl NodeRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NodeRole::Worker => "worker",
+            NodeRole::Relay => "relay",
+        }
+    }
+    pub fn parse(s: &str) -> Option<NodeRole> {
+        match s {
+            "worker" => Some(NodeRole::Worker),
+            "relay" => Some(NodeRole::Relay),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -114,6 +145,15 @@ pub struct SupervisorConfig {
     /// Unix socket that same-machine nodes (the hub's own node) connect to.
     #[serde(default)]
     pub link_socket: Option<PathBuf>,
+    /// TCP listener for remote nodes (mTLS), e.g. `0.0.0.0:7443`. Off when unset.
+    #[serde(default)]
+    pub link_listen: Option<String>,
+    /// Host names / IPs remote nodes use to reach the hub. They go into the
+    /// link certificate; the first one also forms the join command.
+    #[serde(default)]
+    pub public_names: Vec<String>,
+    #[serde(default)]
+    pub enrollment: EnrollmentConfig,
     /// Database and artifact directory. Default: `<config dir>/supervisor`.
     #[serde(default)]
     pub data_dir: Option<PathBuf>,
@@ -129,11 +169,67 @@ impl Default for SupervisorConfig {
         SupervisorConfig {
             api_listen: default_api_listen(),
             link_socket: None,
+            link_listen: None,
+            public_names: vec![],
+            enrollment: EnrollmentConfig::default(),
             data_dir: None,
             tasks: TaskSchedulerConfig::default(),
             disconnect_grace_secs: default_grace(),
         }
     }
+}
+
+/// How remote machines join (ARCHITECTURE D5, PHASE1_5 §4).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollmentConfig {
+    /// A newly enrolled node stays `pending` until the operator approves it.
+    #[serde(default = "default_true")]
+    pub require_approval: bool,
+    /// Source addresses (IP or CIDR) allowed to enroll and connect. Seeds the
+    /// list on first start; afterwards it is edited through the API / UI.
+    #[serde(default)]
+    pub allowed_sources: Vec<String>,
+    /// Which nodes the allowlist applies to.
+    #[serde(default)]
+    pub enforce_for: AllowlistScope,
+    /// Join token lifetime.
+    #[serde(default = "default_token_ttl")]
+    pub token_ttl_secs: u64,
+    /// Node certificate lifetime; nodes renew at two thirds of it.
+    #[serde(default = "default_cert_days")]
+    pub cert_days: u32,
+}
+
+impl Default for EnrollmentConfig {
+    fn default() -> Self {
+        EnrollmentConfig {
+            require_approval: true,
+            allowed_sources: vec![],
+            enforce_for: AllowlistScope::default(),
+            token_ttl_secs: default_token_ttl(),
+            cert_days: default_cert_days(),
+        }
+    }
+}
+
+fn default_token_ttl() -> u64 {
+    900
+}
+fn default_cert_days() -> u32 {
+    30
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AllowlistScope {
+    /// Only relay (proxy-only) nodes must connect from an allowed source.
+    #[default]
+    Relay,
+    /// Every remote node must.
+    All,
+    /// The allowlist is not enforced.
+    None,
 }
 
 fn default_api_listen() -> String {

@@ -5,13 +5,18 @@
 // telemetry outbox and a JSON payload whose schema is the Rust enums in
 // `ocl_protocol::link` (NodeMsg / SupMsg). Both ends are built from the same
 // crate, so the domain schema lives in exactly one place while gRPC supplies
-// HTTP/2 multiplexing, flow control and (Phase 2) mTLS.
+// HTTP/2 multiplexing and flow control. Remote nodes connect over mTLS.
 syntax = "proto3";
 
 package ocl.link.v1;
 
 service NodeLink {
   rpc Attach(stream Envelope) returns (stream Envelope);
+  // One-time enrollment with a join token (no client certificate yet).
+  rpc Enroll(EnrollRequest) returns (EnrollReply);
+  // Byte tunnel for `via_node` egress routes. The first frame names the
+  // tunnel; afterwards frames carry raw bytes in both directions.
+  rpc Tunnel(stream TunnelFrame) returns (stream TunnelFrame);
 }
 
 message Envelope {
@@ -21,4 +26,30 @@ message Envelope {
   uint64 ack = 2;
   // serde_json encoding of NodeMsg (node->sup) or SupMsg (sup->node).
   bytes json = 3;
+}
+
+message EnrollRequest {
+  // The secret part of the join token (`ocljoin.<secret>.<ca fingerprint>`).
+  string token = 1;
+  // PEM certificate signing request for a key generated on the node.
+  string csr_pem = 2;
+}
+
+message EnrollReply {
+  string node = 1;
+  string role = 2;
+  string cert_pem = 3;
+  string ca_pem = 4;
+  // unix millis
+  int64 expires_at = 5;
+  // "approved" or "pending" (the operator must approve the node first).
+  string status = 6;
+}
+
+message TunnelFrame {
+  // First frame only, JSON: `{"open": ...}` (see `ocl_protocol::link::TunnelOpen`).
+  bytes header = 1;
+  bytes data = 2;
+  // Half-close: no more data from this side.
+  bool eof = 3;
 }

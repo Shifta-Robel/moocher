@@ -96,6 +96,12 @@ pub fn router(sup: Arc<Sup>) -> Router {
     let api = Router::new()
         .route("/overview", get(overview))
         .route("/nodes", get(nodes))
+        .route("/nodes/invite", post(invite_node))
+        .route("/nodes/{name}", axum::routing::delete(forget_node))
+        .route("/nodes/{name}/approve", post(approve_node))
+        .route("/nodes/{name}/revoke", post(revoke_node))
+        .route("/allowed-sources", get(allowed_sources).post(add_allowed_source))
+        .route("/allowed-sources/remove", post(remove_allowed_source))
         .route("/agents", get(agents))
         .route("/sessions", get(sessions).post(spawn))
         .route("/sessions/{id}", get(session).delete(stop))
@@ -133,6 +139,46 @@ async fn overview(State(sup): S) -> Json<Overview> {
 
 async fn nodes(State(sup): S) -> Json<Vec<NodeInfo>> {
     Json(sup.node_views())
+}
+
+async fn invite_node(State(sup): S, Extension(c): Extension<Caller>, Json(r): Json<InviteRequest>) -> R<Value> {
+    c.need(Scope::Admin)?;
+    Ok(Json(sup.invite(&c.actor(), &r.name, r.role, serde_json::to_value(&r.labels).unwrap_or_default())?))
+}
+
+async fn approve_node(State(sup): S, Extension(c): Extension<Caller>, Path(name): Path<String>) -> R<Value> {
+    c.need(Scope::Admin)?;
+    sup.approve_node(&c.actor(), &name)?;
+    Ok(Json(json!({"ok": true, "node": name, "enrollment": "approved"})))
+}
+
+async fn revoke_node(State(sup): S, Extension(c): Extension<Caller>, Path(name): Path<String>) -> R<Value> {
+    c.need(Scope::Admin)?;
+    let n = sup.revoke_node(&c.actor(), &name)?;
+    Ok(Json(json!({"ok": true, "node": name, "certificates_revoked": n})))
+}
+
+async fn forget_node(State(sup): S, Extension(c): Extension<Caller>, Path(name): Path<String>) -> R<Value> {
+    c.need(Scope::Admin)?;
+    sup.forget_node(&c.actor(), &name)?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn allowed_sources(State(sup): S, Extension(c): Extension<Caller>) -> R<Value> {
+    c.need(Scope::Admin)?;
+    Ok(Json(sup.allowlist()))
+}
+
+async fn add_allowed_source(State(sup): S, Extension(c): Extension<Caller>, Json(r): Json<AllowSourceRequest>) -> R<Value> {
+    c.need(Scope::Admin)?;
+    let cidr = sup.allowlist_add(&c.actor(), &r.source, &r.note)?;
+    Ok(Json(json!({"ok": true, "cidr": cidr})))
+}
+
+async fn remove_allowed_source(State(sup): S, Extension(c): Extension<Caller>, Json(r): Json<AllowSourceRequest>) -> R<Value> {
+    c.need(Scope::Admin)?;
+    let dropped = sup.allowlist_remove(&c.actor(), &r.source)?;
+    Ok(Json(json!({"ok": true, "disconnected": dropped})))
 }
 
 async fn agents(State(sup): S) -> Json<Value> {

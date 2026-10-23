@@ -4,12 +4,14 @@
 //! * [`model`]  — domain types (sessions, tokens, todos, tasks, runs)
 //! * [`link`]   — node<->supervisor stream payloads
 //! * [`api`]    — operator REST bodies
+//! * [`tls`]    — mTLS helpers for the node link
 //! * [`proto`]  — generated gRPC transport
 
 pub mod api;
 pub mod config;
 pub mod link;
 pub mod model;
+pub mod tls;
 
 pub mod proto {
     tonic::include_proto!("ocl.link.v1");

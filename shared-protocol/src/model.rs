@@ -193,6 +193,25 @@ pub struct NodeInfo {
     pub last_seen: Ts,
     #[serde(default)]
     pub labels: std::collections::BTreeMap<String, String>,
+    /// `worker` or `relay` (proxy-only).
+    #[serde(default = "default_role")]
+    pub role: String,
+    /// `local` (same machine, unix socket), `pending`, `approved` or `revoked`.
+    #[serde(default = "default_enrollment")]
+    pub enrollment: String,
+    /// Source address of the node's link connection, as seen by the hub.
+    #[serde(default)]
+    pub observed_ip: Option<String>,
+    /// Expiry of the node's link certificate (remote nodes).
+    #[serde(default)]
+    pub cert_expires_at: Option<Ts>,
+}
+
+fn default_role() -> String {
+    "worker".into()
+}
+fn default_enrollment() -> String {
+    "local".into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

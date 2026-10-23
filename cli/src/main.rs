@@ -28,7 +28,18 @@ struct Cli {
 enum Cmd {
     /// Nodes, live sessions, tasks and token totals.
     Status,
+    /// List nodes (same as `ocl node ls`).
     Nodes,
+    /// Nodes: list, invite (join token), approve, revoke, forget.
+    Node {
+        #[command(subcommand)]
+        cmd: NodeCmd,
+    },
+    /// Source addresses allowed to enroll/connect (relay nodes, or all nodes).
+    Allow {
+        #[command(subcommand)]
+        cmd: AllowCmd,
+    },
     /// Agent profiles available per node.
     Agents,
     Sessions {
@@ -141,6 +152,40 @@ enum WorkflowCmd {
 }
 
 #[derive(Subcommand)]
+enum NodeCmd {
+    Ls,
+    /// Create a one-time join token and print the command to run on the new machine.
+    Invite {
+        name: String,
+        /// Proxy-only machine: runs no agents, relays other nodes' LLM traffic.
+        #[arg(long)]
+        relay: bool,
+        /// Repeatable `key=value`.
+        #[arg(long)]
+        label: Vec<String>,
+    },
+    /// Let a pending node take part in the cluster.
+    Approve { name: String },
+    /// Revoke the node's certificates and disconnect it.
+    Revoke { name: String },
+    /// Remove a disconnected node from the list (history is kept).
+    Forget { name: String },
+}
+
+#[derive(Subcommand)]
+enum AllowCmd {
+    Ls,
+    /// Allow an IP or CIDR, e.g. `203.0.113.7` or `10.0.0.0/8`.
+    Add {
+        source: String,
+        #[arg(long, default_value = "")]
+        note: String,
+    },
+    /// Remove an entry; connected nodes it no longer covers are disconnected.
+    Rm { source: String },
+}
+
+#[derive(Subcommand)]
 enum TokenCmd {
     Create {
         name: String,
@@ -226,6 +271,22 @@ fn print_sessions(ss: &[SessionInfo]) {
     }
 }
 
+fn print_nodes(nodes: &[NodeInfo]) {
+    println!("{:<12} {:<8} {:<9} {:<13} {:<16} {:>8}  {}", "NODE", "ROLE", "ENROLL", "LINK", "IP", "SESSIONS", "AGENTS");
+    for n in nodes {
+        println!(
+            "{:<12} {:<8} {:<9} {:<13} {:<16} {:>8}  {}",
+            n.name,
+            n.role,
+            n.enrollment,
+            if n.connected { "connected".to_string() } else { format!("down {}", ago(n.last_seen)) },
+            n.observed_ip.as_deref().unwrap_or("-"),
+            format!("{}/{}", n.running, n.max_sessions),
+            n.agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+        );
+    }
+}
+
 fn print_tasks(ts: &[Task]) {
     println!("{:>4} {:<10} {:<10} {:>5}  {}", "ID", "STATUS", "LABEL", "RANK", "TITLE");
     for t in ts {
@@ -256,23 +317,72 @@ async fn run(cli: Cli) -> Result<()> {
             }
             let o: Overview = serde_json::from_value(v)?;
             println!("NODES");
-            for n in &o.nodes {
-                println!(
-                    "  {:<12} {:<12} sessions {}/{}  agents: {}",
-                    n.name,
-                    if n.connected { "connected" } else { "disconnected" },
-                    o.sessions.iter().filter(|s| s.report.node == n.name && s.report.state.is_live()).count(),
-                    n.max_sessions,
-                    n.agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
-                );
-            }
+            print_nodes(&o.nodes);
             println!("\nSESSIONS");
             print_sessions(&o.sessions);
             println!("\nTASKS");
             print_tasks(&o.tasks);
             println!("\nTOTAL  tokens {}  (in {} / out {})  cost ${:.4}", o.totals.total(), o.totals.input, o.totals.output, o.totals.cost_usd);
         }
-        Cmd::Nodes => out(&api.get("/nodes").await?),
+        Cmd::Nodes | Cmd::Node { cmd: NodeCmd::Ls } => {
+            let v = api.get("/nodes").await?;
+            if raw {
+                return Ok(out(&v));
+            }
+            print_nodes(&serde_json::from_value::<Vec<NodeInfo>>(v)?);
+        }
+        Cmd::Node { cmd } => match cmd {
+            NodeCmd::Ls => unreachable!(),
+            NodeCmd::Invite { name, relay, label } => {
+                let mut labels = serde_json::Map::new();
+                for l in label {
+                    let (k, v) = l.split_once('=').context("labels are key=value")?;
+                    labels.insert(k.into(), json!(v));
+                }
+                let v = api.post("/nodes/invite", json!({"name": name, "role": if relay { "relay" } else { "worker" }, "labels": labels})).await?;
+                if raw {
+                    return Ok(out(&v));
+                }
+                println!("Join token for {} ({}), single use, valid until {}:", name, v["role"].as_str().unwrap_or(""), fmt_ts(v["expires_at"].as_i64().unwrap_or(0)));
+                println!("\n  {}\n", v["command"].as_str().unwrap_or(""));
+                if v["approval_required"].as_bool() == Some(true) {
+                    println!("After it enrolls, approve it with: ocl node approve {name}");
+                }
+            }
+            NodeCmd::Approve { name } => {
+                api.post(&format!("/nodes/{name}/approve"), json!({})).await?;
+                println!("{name} approved");
+            }
+            NodeCmd::Revoke { name } => {
+                let v = api.post(&format!("/nodes/{name}/revoke"), json!({})).await?;
+                println!("{name} revoked ({} certificate(s)); it has been disconnected", v["certificates_revoked"]);
+            }
+            NodeCmd::Forget { name } => {
+                api.req(reqwest::Method::DELETE, &format!("/nodes/{name}"), None).await?;
+                println!("{name} removed");
+            }
+        },
+        Cmd::Allow { cmd } => match cmd {
+            AllowCmd::Ls => {
+                let v = api.get("/allowed-sources").await?;
+                if raw {
+                    return Ok(out(&v));
+                }
+                println!("enforced for: {}", v["enforce_for"].as_str().unwrap_or("?"));
+                for e in v["entries"].as_array().into_iter().flatten() {
+                    println!("  {:<20} {:<24} {}", e["cidr"].as_str().unwrap_or(""), e["added_by"].as_str().unwrap_or(""), e["note"].as_str().unwrap_or(""));
+                }
+            }
+            AllowCmd::Add { source, note } => {
+                let v = api.post("/allowed-sources", json!({"source": source, "note": note})).await?;
+                println!("allowed {}", v["cidr"].as_str().unwrap_or(""));
+            }
+            AllowCmd::Rm { source } => {
+                let v = api.post("/allowed-sources/remove", json!({"source": source})).await?;
+                let d: Vec<&str> = v["disconnected"].as_array().into_iter().flatten().filter_map(|x| x.as_str()).collect();
+                println!("removed {source}{}", if d.is_empty() { String::new() } else { format!("; disconnected {}", d.join(", ")) });
+            }
+        },
         Cmd::Agents => {
             let v = api.get("/agents").await?;
             if raw {

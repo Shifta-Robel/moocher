@@ -17,6 +17,8 @@ pub enum NodeMsg {
     Reply { req: u64, ok: bool, #[serde(default)] value: serde_json::Value, #[serde(default)] error: Option<String> },
     /// An agent called a cluster tool (MCP); the supervisor answers with `SupMsg::Reply`.
     Request { req: u64, from_session: String, call: AgentCall },
+    /// Certificate renewal; answered with `SupMsg::Reply { value: {cert_pem, expires_at} }`.
+    RenewCert { req: u64, csr_pem: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +32,8 @@ pub struct Hello {
     pub sessions: Vec<SessionReport>,
     #[serde(default)]
     pub labels: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub role: crate::config::NodeRole,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,4 +122,14 @@ impl AgentCall {
                 | AgentCall::TaskFail { .. }
         )
     }
+}
+
+/// First frame of a `Tunnel` RPC (JSON in `TunnelFrame.header`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum TunnelOpen {
+    /// From the node that wants out: connect `host:port` from `relay`'s IP.
+    Dial { relay: String, host: String, port: u16 },
+    /// From the relay node, answering `NodeCommand::OpenTunnel { id }`.
+    Accept { id: String },
 }
