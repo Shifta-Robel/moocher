@@ -90,6 +90,8 @@ pub enum NodeCommand {
     PermissionReply { session: String, request: String, reply: String },
     /// Run a command in the session's container (success checks).
     Exec { session: String, command: String, timeout_secs: u64 },
+    /// Relay nodes: connect to `host:port`, then open a Tunnel RPC with `Accept { id }`.
+    OpenTunnel { id: String, host: String, port: u16, from: String },
 }
 
 /// Cluster tools available to agents over MCP. `from_session` is added by the node.

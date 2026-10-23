@@ -102,10 +102,8 @@ pub fn load(dir: &Path) -> Result<Snapshot> {
         };
         let mut errors = cfg.validate(&providers);
         if let Some(r) = &cfg.route {
-            match routes.get(r) {
-                None => errors.push(format!("unknown route {r:?}")),
-                Some(Route::ViaNode { .. }) => errors.push("route type via_node arrives in Phase 2".into()),
-                _ => {}
+            if !routes.contains_key(r) {
+                errors.push(format!("unknown route {r:?}"));
             }
         }
         let mut role_text = cfg.role.system_prompt.clone().unwrap_or_default();

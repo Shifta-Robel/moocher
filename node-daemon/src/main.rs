@@ -6,6 +6,7 @@ mod link;
 mod manager;
 mod oc;
 mod pki;
+mod relay;
 mod runtime;
 mod secrets;
 mod store;
@@ -177,7 +178,8 @@ async fn run(dir: PathBuf) -> Result<()> {
     let store = Arc::new(store::Store::open(&data_dir.join("node.db"))?);
     let cfg = cfgstore::ConfigStore::new(snap);
     let link = link::LinkHandle::new(store.clone());
-    let mgr = manager::Manager::new(cfg.clone(), store, rt, link.clone())?;
+    let dialer = relay::Dialer::start(node_name.clone(), link.clone()).await?;
+    let mgr = manager::Manager::new(cfg.clone(), store, rt, link.clone(), Some(dialer))?;
     tracing::info!(node = %node_name, supervisor = %supervisor, data = %mgr.data_root().display(), "starting");
 
     if relay_only {

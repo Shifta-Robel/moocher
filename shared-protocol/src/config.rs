@@ -45,6 +45,16 @@ pub struct NodeConfig {
     /// Allow other nodes to send LLM traffic out through this machine (`via_node` routes).
     #[serde(default)]
     pub relay: bool,
+    /// Relaying: destination ports allowed (default 443).
+    #[serde(default = "default_relay_ports")]
+    pub relay_ports: Vec<u16>,
+    /// Relaying: destination hosts allowed (`api.groq.com`, `*.example.com`). Empty = any.
+    #[serde(default)]
+    pub relay_allow_hosts: Vec<String>,
+    /// Local address outbound LLM traffic leaves from, on machines with several
+    /// IPs (applies to `direct` routes and to traffic relayed for others).
+    #[serde(default)]
+    pub egress_bind: Option<String>,
     /// Default egress route for agents that do not set one.
     #[serde(default)]
     pub default_route: Option<String>,
@@ -54,6 +64,10 @@ pub struct NodeConfig {
 
 fn default_node_max_sessions() -> u32 {
     6
+}
+
+fn default_relay_ports() -> Vec<u16> {
+    vec![443]
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -435,7 +449,7 @@ pub struct RoutesFile {
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum Route {
     Direct,
-    /// Tunnel out through another cluster node (which must have `relay: true`). Phase 2.
+    /// Tunnel out through another cluster node (`relay: true` or `role: relay`).
     ViaNode { node: String },
     /// Any HTTP(S)/SOCKS5 proxy, e.g. `socks5h://127.0.0.1:1080` from `ssh -D`.
     Proxy { url: String },

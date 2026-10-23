@@ -35,6 +35,34 @@ pub struct NodeConn {
 pub struct Registry {
     conns: Mutex<HashMap<String, Arc<NodeConn>>>,
     next: AtomicU64,
+    /// `via_node` tunnels waiting for the relay to accept, by tunnel id.
+    tunnels: Mutex<HashMap<String, PendingTunnel>>,
+    /// Per relay: (tunnels, bytes out to the provider, bytes back).
+    pub relay_stats: Mutex<HashMap<String, (u64, u64, u64)>>,
+}
+
+pub struct PendingTunnel {
+    relay: String,
+    inbound: Streaming<TunnelFrame>,
+    tx: mpsc::Sender<Result<TunnelFrame, Status>>,
+}
+
+type FrameTx = mpsc::Sender<Result<TunnelFrame, Status>>;
+
+/// Forward frames until the source ends; returns the payload bytes moved.
+async fn splice(mut from: Streaming<TunnelFrame>, to: FrameTx) -> u64 {
+    let mut n = 0u64;
+    while let Ok(Some(f)) = from.message().await {
+        n += f.data.len() as u64;
+        if to.send(Ok(f)).await.is_err() {
+            break;
+        }
+    }
+    n
+}
+
+fn ready() -> TunnelFrame {
+    TunnelFrame { header: b"ready".to_vec(), data: vec![], eof: false }
 }
 
 impl Registry {
@@ -96,8 +124,80 @@ impl NodeLink for LinkService {
 
     type TunnelStream = Pin<Box<dyn Stream<Item = Result<TunnelFrame, Status>> + Send>>;
 
-    async fn tunnel(&self, _req: Request<Streaming<TunnelFrame>>) -> Result<Response<Self::TunnelStream>, Status> {
-        Err(Status::unimplemented("tunnels are not available yet"))
+    async fn tunnel(&self, req: Request<Streaming<TunnelFrame>>) -> Result<Response<Self::TunnelStream>, Status> {
+        let peer = req.extensions().get::<LinkPeer>().cloned();
+        let mut inbound = req.into_inner();
+        let first = inbound.message().await?.ok_or_else(|| Status::invalid_argument("empty tunnel"))?;
+        let hdr: Value = serde_json::from_slice(&first.header).map_err(|_| Status::invalid_argument("bad tunnel header"))?;
+        let claimed = hdr["from"].as_str().unwrap_or_default().to_string();
+        let open: TunnelOpen = serde_json::from_value(hdr).map_err(|e| Status::invalid_argument(format!("bad tunnel header: {e}")))?;
+        // Remote callers are who their certificate says; unix-socket callers are local.
+        let caller = match &peer {
+            Some(p) => {
+                let who = self.sup.tunnel_identity(p)?;
+                if who != claimed {
+                    return Err(Status::permission_denied("tunnel header does not match the client certificate"));
+                }
+                who
+            }
+            None => claimed,
+        };
+        if !self.sup.nodes.connected(&caller) {
+            return Err(Status::permission_denied(format!("node {caller} is not attached")));
+        }
+        let sup = self.sup.clone();
+        match open {
+            TunnelOpen::Dial { relay, host, port } => {
+                let relay_ok = sup.db.node(&relay).is_some_and(|n| n.relay && n.connected);
+                if !relay_ok || !sup.nodes.connected(&relay) {
+                    return Err(Status::unavailable(format!("relay node {relay} is not connected or does not relay")));
+                }
+                let id = ocl_protocol::new_id("t");
+                let (tx, rx) = mpsc::channel::<Result<TunnelFrame, Status>>(64);
+                sup.nodes.tunnels.lock().unwrap().insert(id.clone(), PendingTunnel { relay: relay.clone(), inbound, tx: tx.clone() });
+                tokio::spawn(async move {
+                    let cmd = NodeCommand::OpenTunnel { id: id.clone(), host: host.clone(), port, from: caller.clone() };
+                    let res = sup.nodes.call(&relay, cmd, Duration::from_secs(20)).await;
+                    if let Err(e) = res {
+                        if sup.nodes.tunnels.lock().unwrap().remove(&id).is_some() {
+                            tracing::info!(relay, host, port, from = %caller, error = %e, "tunnel refused");
+                            let _ = tx.send(Err(Status::unavailable(format!("{e:#}")))).await;
+                        }
+                        return;
+                    }
+                    // The relay accepts right after connecting; give up if it never does.
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                    if sup.nodes.tunnels.lock().unwrap().remove(&id).is_some() {
+                        let _ = tx.send(Err(Status::deadline_exceeded("relay did not accept the tunnel"))).await;
+                    }
+                });
+                Ok(Response::new(Box::pin(ReceiverStream::new(rx)) as Self::TunnelStream))
+            }
+            TunnelOpen::Accept { id } => {
+                let p = {
+                    let mut t = sup.nodes.tunnels.lock().unwrap();
+                    match t.get(&id) {
+                        Some(p) if p.relay == caller => t.remove(&id),
+                        Some(_) => return Err(Status::permission_denied("tunnel belongs to another relay")),
+                        None => None,
+                    }
+                };
+                let p = p.ok_or_else(|| Status::not_found("no such tunnel (timed out?)"))?;
+                let (tx, rx) = mpsc::channel::<Result<TunnelFrame, Status>>(64);
+                let _ = p.tx.send(Ok(ready())).await;
+                let _ = tx.send(Ok(ready())).await;
+                let relay = caller.clone();
+                tokio::spawn(async move {
+                    let (up, down) = tokio::join!(splice(p.inbound, tx), splice(inbound, p.tx));
+                    let mut st = sup.nodes.relay_stats.lock().unwrap();
+                    let e = st.entry(relay).or_default();
+                    e.0 += 1;
+                    e.1 += up;
+                    e.2 += down;
+                });
+                Ok(Response::new(Box::pin(ReceiverStream::new(rx)) as Self::TunnelStream))
+            }
+        }
     }
 
     async fn attach(&self, req: Request<Streaming<Envelope>>) -> Result<Response<OutStream>, Status> {

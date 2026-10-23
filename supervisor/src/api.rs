@@ -410,6 +410,16 @@ async fn metrics(State(sup): S) -> impl IntoResponse {
     for (a, v) in cost {
         let _ = writeln!(out, "ocl_cost_usd_total{{agent=\"{a}\"}} {v}");
     }
+    let relays = sup.nodes.relay_stats.lock().unwrap().clone();
+    let _ = writeln!(out, "# TYPE ocl_relay_tunnels_total counter");
+    for (r, (n, _, _)) in &relays {
+        let _ = writeln!(out, "ocl_relay_tunnels_total{{relay=\"{r}\"}} {n}");
+    }
+    let _ = writeln!(out, "# TYPE ocl_relay_bytes_total counter");
+    for (r, (_, up, down)) in &relays {
+        let _ = writeln!(out, "ocl_relay_bytes_total{{relay=\"{r}\",direction=\"out\"}} {up}");
+        let _ = writeln!(out, "ocl_relay_bytes_total{{relay=\"{r}\",direction=\"in\"}} {down}");
+    }
     let mut ts: BTreeMap<&str, u64> = BTreeMap::new();
     for t in sup.db.tasks() {
         *ts.entry(t.status.as_str()).or_default() += 1;

@@ -33,6 +33,10 @@ pub struct LinkHandle {
 struct Inner {
     store: Arc<Store>,
     tx: Mutex<Option<mpsc::Sender<Envelope>>>,
+    /// The current gRPC channel (Tunnel RPCs share it).
+    channel: Mutex<Option<tonic::transport::Channel>>,
+    /// Latest tunnel setup time per relay node (link metrics).
+    tunnel_setup: Mutex<HashMap<String, Duration>>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
     next_req: AtomicU64,
     wake: Notify,
@@ -45,12 +49,30 @@ impl LinkHandle {
             inner: Arc::new(Inner {
                 store,
                 tx: Mutex::new(None),
+                channel: Mutex::new(None),
+                tunnel_setup: Mutex::new(HashMap::new()),
                 pending: Mutex::new(HashMap::new()),
                 next_req: AtomicU64::new(1),
                 wake: Notify::new(),
                 connected: AtomicBool::new(false),
             }),
         }
+    }
+
+    pub fn channel(&self) -> Option<tonic::transport::Channel> {
+        if !self.inner.connected.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.inner.channel.lock().unwrap().clone()
+    }
+
+    pub fn note_tunnel(&self, relay: &str, setup: Duration) {
+        self.inner.tunnel_setup.lock().unwrap().insert(relay.to_string(), setup);
+    }
+
+    #[allow(dead_code)]
+    pub fn tunnel_setup(&self) -> HashMap<String, Duration> {
+        self.inner.tunnel_setup.lock().unwrap().clone()
     }
 
     /// Queue a durable telemetry event.
@@ -145,6 +167,7 @@ impl LinkHandle {
 
     async fn session(&self, supervisor: &str, pki: &Arc<Pki>, hello: &HelloFn, handler: &CommandHandler) -> Result<()> {
         let channel = connect(supervisor, pki).await?;
+        *self.inner.channel.lock().unwrap() = Some(channel.clone());
         let mut client = NodeLinkClient::new(channel);
         let (tx, rx) = mpsc::channel::<Envelope>(256);
         let h = hello().await;

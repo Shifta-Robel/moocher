@@ -29,6 +29,8 @@ use tokio::task::JoinHandle;
 
 pub struct Manager {
     pub cfg: ConfigStore,
+    /// `via_node` routes go through this local SOCKS5 entry point.
+    pub dialer: Option<crate::relay::Dialer>,
     store: Arc<Store>,
     rt: Runtime,
     pub link: LinkHandle,
@@ -63,13 +65,18 @@ pub struct Instance {
     turn_open: AtomicBool,
 }
 
+pub fn random_hex(bytes: usize) -> String {
+    let b: Vec<u8> = (0..bytes).map(|_| rand::thread_rng().gen()).collect();
+    hex::encode(b)
+}
+
 fn random_token(prefix: &str) -> String {
     let b: [u8; 24] = rand::thread_rng().gen();
     format!("{prefix}{}", hex::encode(b))
 }
 
 impl Manager {
-    pub fn new(cfg: ConfigStore, store: Arc<Store>, rt: Runtime, link: LinkHandle) -> Result<Arc<Manager>> {
+    pub fn new(cfg: ConfigStore, store: Arc<Store>, rt: Runtime, link: LinkHandle, dialer: Option<crate::relay::Dialer>) -> Result<Arc<Manager>> {
         let snap = cfg.get();
         let data_root = snap.node.runtime.data_dir.clone().unwrap_or_else(|| snap.dir.join("data"));
         let run_root = snap.node.runtime.run_dir.clone().unwrap_or_else(|| {
@@ -94,6 +101,7 @@ impl Manager {
         Ok(Arc::new(Manager {
             node: snap.node.name.clone(),
             cfg,
+            dialer,
             store,
             rt,
             link,
@@ -152,6 +160,11 @@ impl Manager {
             NodeCommand::PermissionReply { session, request, reply } => {
                 let inst = self.get(&session)?;
                 inst.oc.reply_permission(&request, &reply).await?;
+                Ok(json!({"ok": true}))
+            }
+            NodeCommand::OpenTunnel { id, host, port, from } => {
+                let snap = self.cfg.get();
+                crate::relay::accept(&snap.node, &self.link, &id, &host, port, &from).await?;
                 Ok(json!({"ok": true}))
             }
             NodeCommand::Exec { session, command, timeout_secs } => {
@@ -297,7 +310,7 @@ impl Manager {
     }
 
     fn start_gateway(&self, inst: &Arc<Instance>, cap: &str) -> Result<()> {
-        let gw = Gateway::new(&inst.id, &inst.agent, inst.role, cap, self.cfg.clone(), inst.usage.clone(), self.link.clone());
+        let gw = Gateway::new(&inst.id, &inst.agent, inst.role, cap, self.cfg.clone(), inst.usage.clone(), self.link.clone(), self.dialer.clone());
         let h = gw.serve(inst.paths.node_sock())?;
         inst.tasks.lock().unwrap().push(h);
         Ok(())
@@ -491,6 +504,21 @@ impl Manager {
         match ty {
             "session.status" => match p["status"]["type"].as_str() {
                 Some("idle") => self.check_turn_end(inst),
+                Some("retry") => {
+                    // OpenCode backs off and retries failed provider calls by itself.
+                    inst.turn_open.store(true, Ordering::Relaxed);
+                    let st = &p["status"];
+                    let wait = st["next"].as_i64().map(|n| ((n - now_ms()) / 1000).max(0)).unwrap_or(0);
+                    let msg = format!(
+                        "retrying (attempt {}, next in {wait}s): {}",
+                        st["attempt"].as_u64().unwrap_or(0),
+                        st["message"].as_str().unwrap_or("provider error").chars().take(200).collect::<String>()
+                    );
+                    self.update(inst, |r| {
+                        r.state = SessionState::Running;
+                        r.current_task = Some(msg);
+                    });
+                }
                 Some(_) => {
                     inst.turn_open.store(true, Ordering::Relaxed);
                     let changed = inst.report.lock().unwrap().state == SessionState::Idle;

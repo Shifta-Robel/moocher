@@ -18,7 +18,12 @@ cluster's follow-up messages (e.g. "Session X (builder) finished a turn").
 String values may contain ``{{last_user}}`` (the last user message text).
 Usage is reported with simple len/4 token estimates so metering can be tested.
 
-Usage: mock_llm.py --port 8099 [--scripts DIR] [--require-key KEY]
+Rate limits like a keyless gateway: ``--ip-quota N --ip-window SECS`` allows N
+chat requests per client IP per fixed window and answers with OpenAI-style
+``x-ratelimit-*`` headers, then 429 + ``retry-after``. ``GET /ip`` echoes the
+caller's address (like api.ipify.org); ``GET /_log`` shows recent requests.
+
+Usage: mock_llm.py --port 8099 [--scripts DIR] [--require-key KEY] [--ip-quota N --ip-window SECS]
 """
 import argparse
 import json
@@ -30,6 +35,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 SCRIPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
 LOG = []
 REQUIRE_KEY = None
+IP_QUOTA = 0
+IP_WINDOW = 60
+WINDOWS = {}  # client ip -> [window start, count]
 
 
 def est_tokens(obj):
@@ -89,12 +97,41 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code, body):
         data = json.dumps(body).encode()
         self.send_response(code)
+        for k, v in getattr(self, "_rl", {}).items():
+            self.send_header(k, v)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
+    def _quota(self):
+        """(allowed, headers) for this client's fixed-window request budget."""
+        if not IP_QUOTA:
+            return True, {}
+        ip, now = self.client_address[0], time.time()
+        start, count = WINDOWS.get(ip, (now, 0))
+        if now - start >= IP_WINDOW:
+            start, count = now, 0
+        reset = max(1, int(start + IP_WINDOW - now))
+        allowed = count < IP_QUOTA
+        if allowed:
+            count += 1
+        WINDOWS[ip] = (start, count)
+        return allowed, {
+            "x-ratelimit-limit-requests": str(IP_QUOTA),
+            "x-ratelimit-remaining-requests": str(IP_QUOTA - count),
+            "x-ratelimit-reset-requests": f"{reset}s",
+            **({} if allowed else {"retry-after": str(reset)}),
+        }
+
     def do_GET(self):
+        if self.path.rstrip("/").endswith("/ip"):
+            data = self.client_address[0].encode()
+            self.send_response(200)
+            self.send_header("content-type", "text/plain")
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            return self.wfile.write(data)
         if self.path.endswith("/models"):
             names = sorted(f[:-5] for f in os.listdir(SCRIPTS) if f.endswith(".json"))
             return self._json(200, {"object": "list", "data": [{"id": n, "object": "model"} for n in names]})
@@ -103,12 +140,24 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_POST(self):
+        self._rl = {}
         body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))) or b"{}")
-        LOG.append({"path": self.path, "auth": self.headers.get("authorization"), "model": body.get("model")})
+        LOG.append({"path": self.path, "auth": self.headers.get("authorization"), "model": body.get("model"), "client": self.client_address[0]})
         if not self.path.endswith("/chat/completions"):
             return self._json(404, {"error": "not found"})
         if REQUIRE_KEY and self.headers.get("authorization") != f"Bearer {REQUIRE_KEY}":
             return self._json(401, {"error": {"message": "mock: wrong or missing API key"}})
+        allowed, rl = self._quota()
+        if not allowed:
+            data = json.dumps({"error": {"message": "mock: rate limit exceeded for this IP", "type": "rate_limit"}}).encode()
+            self.send_response(429)
+            for k, v in rl.items():
+                self.send_header(k, v)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            return self.wfile.write(data)
+        self._rl = rl
         model = body.get("model", "default")
         messages = body.get("messages", [])
         step = next_step(model, messages)
@@ -132,6 +181,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"id": cid, "object": "chat.completion", "created": int(time.time()), "model": model,
                                     "choices": [{"index": 0, "message": msg, "finish_reason": finish}], "usage": usage})
         self.send_response(200)
+        for k, v in self._rl.items():
+            self.send_header(k, v)
         self.send_header("content-type", "text/event-stream")
         self.send_header("cache-control", "no-cache")
         self.send_header("connection", "close")
@@ -150,16 +201,19 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global SCRIPTS, REQUIRE_KEY
+    global SCRIPTS, REQUIRE_KEY, IP_QUOTA, IP_WINDOW
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8099)
     ap.add_argument("--scripts", default=SCRIPTS)
     ap.add_argument("--require-key", default=os.environ.get("MOCK_REQUIRE_KEY"),
                     help="reject requests whose bearer token is not this key (proves keyproxy injection)")
+    ap.add_argument("--ip-quota", type=int, default=0, help="chat requests allowed per client IP per window (0 = unlimited)")
+    ap.add_argument("--ip-window", type=int, default=60, help="quota window in seconds")
     a = ap.parse_args()
     SCRIPTS = a.scripts
     REQUIRE_KEY = a.require_key
+    IP_QUOTA, IP_WINDOW = a.ip_quota, a.ip_window
     print(f"mock-llm listening on http://{a.host}:{a.port}/v1 scripts={SCRIPTS}", flush=True)
     ThreadingHTTPServer((a.host, a.port), Handler).serve_forever()
 

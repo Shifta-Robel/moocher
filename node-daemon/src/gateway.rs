@@ -35,13 +35,15 @@ pub struct Gateway {
     cfg: ConfigStore,
     pub usage: Arc<Mutex<TokenUsage>>,
     link: LinkHandle,
+    dialer: Option<crate::relay::Dialer>,
     http: Arc<Mutex<HashMap<String, reqwest::Client>>>,
 }
 
 const MAX_BODY: usize = 32 * 1024 * 1024;
 
 impl Gateway {
-    pub fn new(id: &str, agent: &str, role: SessionRole, cap: &str, cfg: ConfigStore, usage: Arc<Mutex<TokenUsage>>, link: LinkHandle) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(id: &str, agent: &str, role: SessionRole, cap: &str, cfg: ConfigStore, usage: Arc<Mutex<TokenUsage>>, link: LinkHandle, dialer: Option<crate::relay::Dialer>) -> Self {
         Gateway {
             id: id.into(),
             agent: agent.into(),
@@ -50,6 +52,7 @@ impl Gateway {
             cfg,
             usage,
             link,
+            dialer,
             http: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -102,14 +105,32 @@ impl Gateway {
         }
         let mut b = reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(20));
         match route {
-            Route::Direct => {}
+            Route::Direct => {
+                if let Some(ip) = self.cfg.get().node.egress_bind.as_deref() {
+                    b = b.local_address(Some(ip.parse::<std::net::IpAddr>().map_err(|_| format!("egress_bind {ip:?} is not an IP"))?));
+                }
+            }
             Route::Proxy { url } => b = b.proxy(reqwest::Proxy::all(url).map_err(|e| format!("bad proxy url: {e}"))?),
-            Route::ViaNode { node } => return Err(format!("via_node route ({node}) is not available until Phase 2")),
+            Route::ViaNode { node } => {
+                let d = self.dialer.as_ref().ok_or("via_node routes are not available on this node")?;
+                b = b.proxy(reqwest::Proxy::all(d.proxy_url(node)).map_err(|e| format!("relay proxy: {e}"))?);
+            }
         }
         let c = b.build().map_err(|e| e.to_string())?;
         self.http.lock().unwrap().insert(key, c.clone());
         Ok(c)
     }
+}
+
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut s = e.to_string();
+    let mut cur = e.source();
+    while let Some(c) = cur {
+        s.push_str(": ");
+        s.push_str(&c.to_string());
+        cur = c.source();
+    }
+    s
 }
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -223,8 +244,14 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
     let upstream = match client.request(method, &url).headers(headers).body(body).send().await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(agent = %g.agent, provider, error = %e, "upstream request failed");
-            return llm_error(StatusCode::BAD_GATEWAY, &format!("upstream unreachable: {}", e.without_url()));
+            let mut why = error_chain(&e.without_url());
+            if let (Route::ViaNode { node }, Some(d)) = (&route, &g.dialer) {
+                if let Some(r) = d.last_error(node) {
+                    why = format!("relay {node}: {r}");
+                }
+            }
+            tracing::warn!(agent = %g.agent, provider, error = %why, "upstream request failed");
+            return llm_error(StatusCode::BAD_GATEWAY, &format!("upstream unreachable: {why}"));
         }
     };
     let status = upstream.status();

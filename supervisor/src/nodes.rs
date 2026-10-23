@@ -223,6 +223,20 @@ impl Sup {
         Ok(Admission { enrollment: status, role: hello.role, observed_ip: Some(peer.ip().to_string()), cert_expires_at: Some(expires) })
     }
 
+    /// Who opened a Tunnel RPC over TLS (same checks as `admit`, minus hello).
+    pub fn tunnel_identity(&self, peer: &LinkPeer) -> Result<String, tonic::Status> {
+        use tonic::Status;
+        let fp = peer.cert.as_deref().ok_or_else(|| Status::unauthenticated("a client certificate is required"))?;
+        let (node, revoked, expires) = self.db.node_cert(fp).ok_or_else(|| Status::unauthenticated("unknown client certificate"))?;
+        if revoked || expires < now_ms() {
+            return Err(Status::permission_denied("certificate revoked or expired"));
+        }
+        match self.db.node_auth(&node) {
+            Some((s, ..)) if s == "approved" => Ok(node),
+            _ => Err(Status::permission_denied(format!("node {node} is not approved"))),
+        }
+    }
+
     pub fn renew_cert(&self, node: &str, csr_pem: &str) -> Result<Value> {
         let ca = self.ca()?;
         let issued = ca.issue_node(node, csr_pem, self.cfg.enrollment.cert_days)?;
