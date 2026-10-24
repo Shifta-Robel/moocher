@@ -13,6 +13,10 @@ not needed; container isolation itself is covered by the Phase 1 demo.
 | `templates.sh` | Hub template library, secret aliases, `overridable` caps, `instances.max`, the rendered preamble, account-scoped usage, library updates, `hub_templates: false`. |
 | `stats.sh` | Host and instance stats, per-session history, the soft disk limit. |
 | `resilience.sh` | The supervisor restarts while a remote node is working: the node buffers, reconnects and replays, and nothing is lost. |
+| `artifacts.sh` | Operator and agent artifacts (files and trees, content addressing, links never packed), lineage, a shared workspace on two machines (sync before start and after turns, three-way merge, a conflict kept as `.theirs`), a workflow whose review step runs on another machine. |
+| `questions.sh` | `cluster_ask` and OpenCode's `question` tool reaching the operator, a parent answering, escalation with a note, the four modes, rules raising importance, operator-only questions, timeouts, the assumption log, permissions and budget stops as questions. |
+| `death.sh` | A killed instance detected (`exit:137`) and restarted in place with its history; a tree halted when recovery is not cheap enough, then resumed with one command; resume on another machine from the dead volume; a lost node resumed from its checkpoint; the wall-clock limit. |
+| `harvest.sh` | Outputs collected on stop (files, a glob as one tree, a missing one reported), delivered into the parent's workspace and the task workspace, the transcript as an artifact, `retain:` never vs. the default. |
 
 ## Running
 
@@ -26,4 +30,4 @@ Needs `python3`, and free ports 7700, 7443 and 8099. Scratch files go to
 `OCL_E2E_DIR` (default `/tmp/ocl-e2e`); keep that path short, because session
 sockets must fit in 107 bytes. The relay tests use the loopback address
 127.0.0.2 as the relay's egress IP (`egress_bind`), which Linux provides.
-Each suite takes 1–3 minutes.
+Each suite takes 1–3 minutes (the Phase 3 suites 3–8). Scripted models for a suite are written to `$OCL_E2E_DIR/work/scripts` with `mock_script` (see `lib.sh`).

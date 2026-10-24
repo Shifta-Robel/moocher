@@ -66,7 +66,9 @@ start_hub() {
   done
   # A previous run's stragglers may still be writing; move it aside first.
   if [ -e "$W" ]; then mv "$W" "$W.old.$$"; (rm -rf "$W.old.$$" 2>/dev/null &); fi
-  mkdir -p "$W/run"
+  mkdir -p "$W/run" "$W/scripts"
+  # Mock scripts are read per request: suites add their own with mock_script.
+  cp "$REPO"/examples/mock-llm/scripts/*.json "$W/scripts/"
   cp -r "$REPO/examples/quickstart/hub" "$W/hub"
   cat > "$W/hub/node.yaml" <<EOF
 name: hub
@@ -84,7 +86,7 @@ ${ENROLL_YAML:-}
 EOF
   export MOCK_API_KEY="mock-key-$RANDOM$RANDOM"
   # shellcheck disable=SC2086
-  python3 -I "$REPO/examples/mock-llm/mock_llm.py" --port 8099 --require-key "$MOCK_API_KEY" ${MOCK_ARGS:-} > "$W/mock.log" 2>&1 &
+  python3 -I "$REPO/examples/mock-llm/mock_llm.py" --port 8099 --scripts "$W/scripts" --require-key "$MOCK_API_KEY" ${MOCK_ARGS:-} > "$W/mock.log" 2>&1 &
   PIDS+=($!)
   "$BIN/ocl-supervisor" --config-dir "$W/hub" init > "$W/init.txt"
   export OCL_TOKEN="$(cat "$W/hub/cli-token")"
@@ -131,3 +133,46 @@ node_field() { # node_field NAME FIELD
 }
 is_connected() { [ "$(node_field "$1" connected)" = "True" ]; }
 is_disconnected() { [ "$(node_field "$1" connected)" = "False" ]; }
+
+# mock_script NAME < json: a scripted model for this suite (model name = NAME).
+mock_script() { cat > "$W/scripts/$1.json"; }
+
+# mock_prices MODEL...: give scripted models a price on every config dir
+# (recovery costs are estimated from it). Run before make_worker copies providers.yaml.
+mock_prices() {
+  python3 -I - "$W/hub/providers.yaml" "$@" <<'PY'
+import sys
+p, models = sys.argv[1], sys.argv[2:]
+s = open(p).read()
+add = "".join(f"      {m}: {{ input_per_mtok: 0.50, output_per_mtok: 1.50 }}\n" for m in models if f"      {m}:" not in s)
+s = s.replace("    prices:\n", "    prices:\n" + add, 1)
+open(p, "w").write(s)
+PY
+}
+
+# agent_yaml DIR NAME MODEL [extra yaml]: an agent profile using the mock.
+agent_yaml() {
+  mkdir -p "$1/agents"
+  cat > "$1/agents/$2.yaml" <<EOF
+name: $2
+description: e2e agent $2
+provider: { id: mock, model: $3, key: { ref: "env:MOCK_API_KEY" } }
+tools: { edit: allow, bash: { default: ask, allow: ["python3 *", "ls*", "cat *", "sleep *"] } }
+limits: { max_sessions: 4 }
+${4:-}
+EOF
+}
+
+# sess EXPR ID: a field of a session (python expression on the dict `s`).
+sess() { $O show "$2" --json | python3 -c "import sys,json;s=json.load(sys.stdin);print($1)"; }
+sess_state() { sess 's["state"]' "$1"; }
+spawn_id() { $O spawn "$@" --json | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])'; }
+# Usable inside `wait_for ... bash -c "..."` too.
+export O W
+export -f sess sess_state
+# Stop every live session (between scenarios, so node capacity is free again).
+stop_all() {
+  for s in $($O sessions --json | python3 -c 'import sys,json;[print(s["id"]) for s in json.load(sys.stdin) if s["state"] not in ("stopped","lost","dead")]'); do
+    $O stop "$s" >/dev/null 2>&1 || true
+  done
+}
