@@ -1,0 +1,20 @@
+# opencode-cluster supervisor image (for the Quadlet in deploy/quadlet).
+#
+#   cargo build --release -p ocl-supervisor -p ocl
+#   podman build -t localhost/ocl-supervisor -f images/supervisor/Containerfile .
+#
+# The binary embeds the dashboard and needs only glibc (it links libc, libm
+# and libgcc_s), so the base is the same Debian release as the agent image.
+ARG BASE_IMAGE=docker.io/library/debian:bookworm-slim
+FROM ${BASE_IMAGE}
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates tzdata \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --system --no-create-home --uid 10001 --shell /usr/sbin/nologin ocl
+COPY target/release/ocl-supervisor /usr/local/bin/ocl-supervisor
+COPY target/release/ocl /usr/local/bin/ocl
+USER 10001:10001
+VOLUME /config
+EXPOSE 7700 7443 7444
+ENTRYPOINT ["/usr/local/bin/ocl-supervisor"]
+CMD ["--config-dir", "/config", "run"]

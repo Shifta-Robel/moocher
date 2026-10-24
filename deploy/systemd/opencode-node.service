@@ -1,0 +1,56 @@
+# opencode-cluster node, rootful Podman (the hub's own node or a worker).
+# Root is needed for rootful Podman and for `disk_enforce: hard` quotas;
+# the agents themselves run as uid 1000 inside --network=none containers.
+#
+#   install -m 0644 deploy/systemd/opencode-node.service /etc/systemd/system/
+#   opencode-node --config-dir /etc/ocl/node join …   # once, for a remote worker
+#   systemctl enable --now opencode-node
+#
+# Provider keys: keep them out of node.yaml and environment files; use
+# systemd credentials, referenced as `key: { ref: "systemd-creds:openrouter" }`:
+#   systemd-creds encrypt --name=openrouter key.txt /etc/ocl/creds/openrouter.cred
+# and uncomment LoadCredentialEncrypted below (one line per key). keyproxy
+# reads the key per request, so `systemctl restart` is needed only to add one.
+[Unit]
+Description=opencode-cluster node
+Documentation=file:///usr/share/doc/opencode-cluster/RUNBOOK.md
+After=network-online.target ocl-supervisor.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/opencode-node --config-dir /etc/ocl/node run
+Restart=on-failure
+RestartSec=5s
+# Stopping the node leaves agent containers running (by design: they are
+# re-adopted on start); only the daemon itself stops.
+KillMode=process
+TimeoutStopSec=20s
+Environment=RUST_LOG=info
+#LoadCredentialEncrypted=openrouter:/etc/ocl/creds/openrouter.cred
+
+ConfigurationDirectory=ocl/node
+ConfigurationDirectoryMode=0750
+StateDirectory=ocl/node
+RuntimeDirectory=ocl
+RuntimeDirectoryMode=0711
+RuntimeDirectoryPreserve=yes
+UMask=0027
+
+# Podman needs mounts, namespaces and cgroups, so the sandbox here is lighter
+# than the supervisor's; the agents' own sandbox is the container.
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=full
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+PrivateTmp=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
