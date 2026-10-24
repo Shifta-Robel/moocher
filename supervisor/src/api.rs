@@ -155,6 +155,7 @@ pub fn router(sup: Arc<Sup>) -> Router {
         .route("/audit", get(audit))
         .route("/audit/verify", get(audit_verify))
         .route("/tokens", get(list_tokens).post(create_token))
+        .route("/housekeeping", post(housekeeping))
         .route("/tokens/{name}", axum::routing::delete(revoke_token))
         .route("/questions", get(questions))
         .route("/questions/mode", get(question_mode).post(set_question_mode))
@@ -456,6 +457,26 @@ async fn list_tokens(State(sup): S, Extension(c): Extension<Caller>) -> R<Value>
     c.need(Scope::Admin)?;
     let v: Vec<Value> = sup.db.tokens()?.into_iter().map(|(n, s, t)| json!({"name": n, "scope": s, "created_at": t})).collect();
     Ok(Json(Value::Array(v)))
+}
+
+#[derive(Deserialize, Default)]
+struct HousekeepingReq {
+    /// Run as if this much later (`1d`): what tomorrow's run would do.
+    #[serde(default)]
+    ahead: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+async fn housekeeping(State(sup): S, Extension(c): Extension<Caller>, Json(r): Json<HousekeepingReq>) -> R<Value> {
+    c.need(Scope::Admin)?;
+    let ahead = match r.ahead.as_deref() {
+        Some(a) => ocl_protocol::config::parse_duration_ms(a).ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, format!("ahead {a:?} is not a duration")))?,
+        None => 0,
+    };
+    let actor = c.actor();
+    let rep = tokio::task::spawn_blocking(move || sup.housekeeping(now_ms() + ahead, r.dry_run, &actor)).await.map_err(|e| anyhow::anyhow!("{e}"))??;
+    Ok(Json(serde_json::to_value(rep).unwrap_or_default()))
 }
 
 #[derive(Deserialize)]

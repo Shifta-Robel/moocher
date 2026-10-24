@@ -522,6 +522,57 @@ impl Db {
         rows.unwrap_or_default()
     }
 
+    /// Events after `after_id` with `ts < before`, oldest first (for export).
+    pub fn events_for_export(&self, after_id: i64, before: Ts, limit: i64) -> Vec<LogEvent> {
+        let c = self.c.lock().unwrap();
+        let Ok(mut st) = c.prepare("SELECT id,ts,kind,node,session,data FROM events WHERE id>?1 AND ts<?2 ORDER BY id LIMIT ?3") else { return vec![] };
+        st.query_map(params![after_id, before, limit], |r| {
+            Ok(LogEvent { id: r.get(0)?, ts: r.get(1)?, kind: r.get(2)?, node: r.get(3)?, session: r.get(4)?, data: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or_default() })
+        })
+        .map(|it| it.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    /// Drop events older than `before` (and, when given, only up to `max_id`).
+    pub fn prune_events(&self, before: Ts, max_id: Option<i64>) -> Result<usize> {
+        Ok(self.c.lock().unwrap().execute("DELETE FROM events WHERE ts<?1 AND id<=?2", params![before, max_id.unwrap_or(i64::MAX)])?)
+    }
+
+    pub fn all_artifacts(&self) -> Vec<ArtifactMeta> {
+        self.json_rows("SELECT info FROM artifacts", [])
+    }
+
+    pub fn delete_artifact(&self, hash: &str) -> Result<()> {
+        self.c.lock().unwrap().execute("DELETE FROM artifacts WHERE hash=?1", params![hash])?;
+        Ok(())
+    }
+
+    /// Text of everything that may still point at an artifact (`art://b3/…`):
+    /// shared workspaces, checkpoints, open halts, unfinished tasks and runs,
+    /// sessions that are not over.
+    pub fn live_reference_text(&self) -> String {
+        let c = self.c.lock().unwrap();
+        let mut out = String::new();
+        for sql in [
+            "SELECT info FROM workspaces",
+            "SELECT info FROM checkpoints",
+            "SELECT info FROM halts WHERE status='open'",
+            "SELECT info FROM tasks WHERE status NOT IN ('done','failed','cancelled')",
+            "SELECT info FROM runs WHERE status IN ('running','halted')",
+            "SELECT info FROM sessions WHERE state NOT IN ('stopped','lost')",
+        ] {
+            if let Ok(mut st) = c.prepare(sql) {
+                if let Ok(rows) = st.query_map([], |r| r.get::<_, String>(0)) {
+                    for r in rows.flatten() {
+                        out.push_str(&r);
+                        out.push('\n');
+                    }
+                }
+            }
+        }
+        out
+    }
+
     // ------------------------------------------------------------- audit
 
     /// Append to the hash chain: hash = sha256(prev || canonical entry).

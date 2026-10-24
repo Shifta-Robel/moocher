@@ -3,6 +3,7 @@
 mod attach;
 mod cas;
 mod cfgstore;
+mod disk_quota;
 mod egress;
 mod egress_proxy;
 mod gateway;

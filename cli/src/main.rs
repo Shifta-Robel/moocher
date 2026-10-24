@@ -222,6 +222,15 @@ enum Cmd {
         #[arg(long, default_value_t = 30)]
         limit: i64,
     },
+    /// Run housekeeping now: export events, prune, expire artifacts (admin).
+    Housekeeping {
+        /// Only report what would happen.
+        #[arg(long)]
+        dry_run: bool,
+        /// Act as if this much later (e.g. `1d`: what tomorrow's run would do).
+        #[arg(long)]
+        ahead: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1208,6 +1217,23 @@ async fn run(cli: Cli) -> Result<()> {
                     println!("       {}", n.body);
                 }
             }
+        }
+        Cmd::Housekeeping { dry_run, ahead } => {
+            let v = api.post("/housekeeping", json!({"dry_run": dry_run, "ahead": ahead})).await?;
+            if raw {
+                return Ok(out(&v));
+            }
+            let n = |k: &str| v[k].as_u64().unwrap_or(0);
+            let list = |k: &str| v[k].as_array().map(|a| a.len()).unwrap_or(0);
+            println!("{}events exported {} (files: {}), pruned {}", if dry_run { "(dry run) " } else { "" }, n("events_exported"), v["export_files"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default(), n("events_pruned"));
+            println!(
+                "artifacts removed {} ({} bytes), kept: {} referenced, {} tagged; old export files removed {}",
+                list("artifacts_removed"),
+                n("artifact_bytes_freed"),
+                n("artifacts_kept_referenced"),
+                n("artifacts_kept_tagged"),
+                list("export_files_removed")
+            );
         }
         Cmd::Token { cmd } => match cmd {
             TokenCmd::Create { name, scope } => out(&api.post("/tokens", json!({"name": name, "scope": scope})).await?),

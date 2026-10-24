@@ -6,6 +6,7 @@ license.workspace = true
 description = "opencode-cluster control plane: registry, orchestration, task bucket, operator API"
 
 [dependencies]
+zstd.workspace = true
 ocl-protocol.workspace = true
 anyhow.workspace = true
 tokio.workspace = true

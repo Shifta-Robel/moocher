@@ -23,6 +23,8 @@ pub struct Sup {
     pub db: Db,
     pub cfg: SupervisorConfig,
     pub config_dir: PathBuf,
+    /// Database, artifacts, exports.
+    pub data_dir: PathBuf,
     pub nodes: Registry,
     pub stream: broadcast::Sender<StreamEvent>,
     /// Serialises orchestration decisions (workflow steps, task scheduling).
@@ -91,6 +93,7 @@ impl Sup {
             db,
             cfg,
             config_dir,
+            data_dir: data.clone(),
             nodes: Registry::default(),
             stream,
             orch_lock: tokio::sync::Mutex::new(()),

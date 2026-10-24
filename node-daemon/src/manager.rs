@@ -46,6 +46,8 @@ pub struct Manager {
     run_root: PathBuf,
     data_root: PathBuf,
     instances: Mutex<HashMap<String, Arc<Instance>>>,
+    /// `disk_enforce: hard`: the filesystem that carries the quotas.
+    disk_fs: Option<crate::disk_quota::Fs>,
 }
 
 pub struct Instance {
@@ -124,6 +126,15 @@ impl Manager {
         }
         std::fs::create_dir_all(data_root.join("workspaces"))?;
         std::fs::create_dir_all(data_root.join("instances"))?;
+        let disk_fs = if snap.node.disk_enforce == ocl_protocol::config::DiskEnforce::Hard {
+            let fs = crate::disk_quota::detect(&data_root)?;
+            let euid = std::fs::metadata("/proc/self").map(|m| std::os::unix::fs::MetadataExt::uid(&m)).unwrap_or(u32::MAX);
+            crate::disk_quota::check(&fs, euid)?;
+            tracing::info!(?fs, "disk limits are enforced by filesystem quotas");
+            Some(fs)
+        } else {
+            None
+        };
         Ok(Arc::new(Manager {
             node: snap.node.name.clone(),
             cfg,
@@ -135,6 +146,7 @@ impl Manager {
             run_root,
             data_root,
             instances: Mutex::new(HashMap::new()),
+            disk_fs,
         }))
     }
 
@@ -477,6 +489,14 @@ impl Manager {
         let cap = random_token("ocl_cap_");
         let password = random_token("");
         let fresh = std::fs::read_dir(&paths.workspace).map(|mut d| d.next().is_none()).unwrap_or(true);
+        if let (Some(fs), Some(bytes)) = (&self.disk_fs, agent.cfg.container.disk.as_deref().and_then(parse_size)) {
+            // Home and an isolated workspace share one limit; a shared workspace stays soft.
+            let mut dirs = vec![paths.home.clone()];
+            if ws_spec.mode == WorkspaceMode::Isolated {
+                dirs.push(paths.workspace.clone());
+            }
+            crate::disk_quota::apply(fs, &dirs, crate::disk_quota::quota_id(&spec.id), bytes).await.context("setting the disk quota")?;
+        }
         self.rt.prepare_dirs(&paths)?;
         // A new workspace may start from an artifact (a tree or a single file).
         if let Some(seed) = ws_spec.seed.as_deref().filter(|_| fresh) {
@@ -1101,6 +1121,12 @@ impl Manager {
     async fn reap(&self, id: &str, paths: &[String]) {
         let _ = self.rt.remove(id).await;
         self.rt.forget(id);
+        if let Some(fs) = &self.disk_fs {
+            let dirs = [self.data_root.join("instances").join(id).join("home"), self.data_root.join("workspaces").join(id)];
+            if let Err(e) = crate::disk_quota::execute(&crate::disk_quota::plan_clear(fs, &dirs, crate::disk_quota::quota_id(id))).await {
+                tracing::warn!(session = id, error = %e, "clearing the disk quota");
+            }
+        }
         for p in paths {
             let _ = std::fs::remove_dir_all(p);
         }

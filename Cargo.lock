@@ -1874,6 +1874,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "x509-parser",
+ "zstd",
 ]
 
 [[package]]

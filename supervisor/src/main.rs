@@ -17,6 +17,7 @@ mod recovery;
 mod resources;
 mod state;
 mod templates;
+mod retention;
 mod tlslink;
 mod web;
 mod workspaces;
@@ -52,6 +53,8 @@ enum Cmd {
     },
     /// Verify the audit log hash chain.
     AuditVerify,
+    /// Print an event export (`events-YYYYMMDD.jsonl.zst`) as JSON lines, like `zstdcat`.
+    EventsCat { file: PathBuf },
     /// Web UI logins (work while the supervisor is stopped).
     User {
         #[command(subcommand)]
@@ -215,6 +218,12 @@ async fn main() -> Result<()> {
             println!("audit chain OK ({n} entries)");
             Ok(())
         }
+        Cmd::EventsCat { file } => {
+            let f = std::fs::File::open(&file).with_context(|| format!("opening {}", file.display()))?;
+            // A file is several zstd frames; the decoder reads them as one stream.
+            std::io::copy(&mut zstd::stream::read::Decoder::new(f)?, &mut std::io::stdout().lock())?;
+            Ok(())
+        }
         Cmd::Run => run(dir, cfg).await,
     }
 }
@@ -351,6 +360,7 @@ async fn run(dir: PathBuf, cfg: SupervisorConfig) -> Result<()> {
         });
     }
     tokio::spawn(sup.clone().watch_library());
+    tokio::spawn(sup.clone().housekeeping_loop());
     sup.audit(&state::Actor::System, "supervisor.start", "-", serde_json::json!({"version": ocl_protocol::VERSION}), true);
     tracing::info!(api = %api_listen, link = %sock.display(), "supervisor running");
     let sup2: Arc<state::Sup> = sup.clone();

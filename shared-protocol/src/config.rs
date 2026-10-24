@@ -45,6 +45,11 @@ pub struct NodeConfig {
     /// Maximum concurrently running sessions on this node.
     #[serde(default = "default_node_max_sessions")]
     pub max_sessions: u32,
+    /// How `container.disk` is enforced: `soft` (default: measured, the agent
+    /// is warned at 90% and interrupted at 100%) or `hard` (also a filesystem
+    /// quota: XFS with prjquota or btrfs, node running as root).
+    #[serde(default)]
+    pub disk_enforce: DiskEnforce,
     /// Allow other nodes to send LLM traffic out through this machine (`via_node` routes).
     #[serde(default)]
     pub relay: bool,
@@ -221,6 +226,8 @@ pub struct SupervisorConfig {
     pub on_death: DeathPolicy,
     #[serde(default)]
     pub artifacts: ArtifactsConfig,
+    #[serde(default)]
+    pub events: EventsConfig,
     /// HTTPS for the web UI and API: certificate files, or ACME (Let's
     /// Encrypt or any RFC 8555 CA). Without it the API is plain HTTP (keep it
     /// on loopback or behind a TLS proxy).
@@ -498,6 +505,42 @@ pub struct ArtifactsConfig {
     /// Largest single artifact accepted (e.g. `2g`).
     #[serde(default = "default_max_artifact")]
     pub max_size: String,
+    /// Delete artifacts older than this (`90d`), unless tagged with one of
+    /// `keep_tags` or still referenced (live sessions, open tasks and runs,
+    /// halts, checkpoints, shared workspaces, config files). Default: keep all.
+    #[serde(default)]
+    pub retain: Option<String>,
+    #[serde(default = "default_keep_tags")]
+    pub keep_tags: Vec<String>,
+}
+
+fn default_keep_tags() -> Vec<String> {
+    vec!["keep".into()]
+}
+
+/// The event log: exported daily, pruned from the database after `retain`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EventsConfig {
+    /// Write `exports/events-YYYYMMDD.jsonl.zst` (one JSON event per line).
+    #[serde(default = "default_true")]
+    pub export: bool,
+    /// How long events stay in the database. Only exported events are pruned.
+    #[serde(default = "default_events_retain")]
+    pub retain: String,
+    /// Delete export files older than this. Default: keep them.
+    #[serde(default)]
+    pub export_keep: Option<String>,
+}
+
+fn default_events_retain() -> String {
+    "30d".into()
+}
+
+impl Default for EventsConfig {
+    fn default() -> Self {
+        EventsConfig { export: true, retain: default_events_retain(), export_keep: None }
+    }
 }
 
 fn default_max_artifact() -> String {
@@ -506,7 +549,7 @@ fn default_max_artifact() -> String {
 
 impl Default for ArtifactsConfig {
     fn default() -> Self {
-        ArtifactsConfig { max_size: default_max_artifact() }
+        ArtifactsConfig { max_size: default_max_artifact(), retain: None, keep_tags: default_keep_tags() }
     }
 }
 
@@ -525,6 +568,7 @@ impl Default for SupervisorConfig {
             questions: QuestionsConfig::default(),
             on_death: DeathPolicy::default(),
             artifacts: ArtifactsConfig::default(),
+            events: EventsConfig::default(),
             tls: None,
             trusted_proxies: vec![],
             attach_listen: None,
@@ -1390,6 +1434,14 @@ fn default_cpus() -> f32 {
 }
 fn default_pids() -> u32 {
     512
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskEnforce {
+    #[default]
+    Soft,
+    Hard,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
