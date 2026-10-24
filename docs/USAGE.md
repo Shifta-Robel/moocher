@@ -1,6 +1,6 @@
 # opencode-cluster — Usage guide
 
-Practical, copy-pasteable examples for every feature that exists today (Phases 1–2: hub, local and remote nodes, relays, quotas, templates). Features from later phases are listed at the end. Enrolling machines and debugging them: [RUNBOOK.md](./RUNBOOK.md).
+Practical, copy-pasteable examples for every feature that exists today (Phases 1–3: hub, local and remote nodes, relays, quotas, templates, artifacts, questions, recovery from dead agents, harvesting). Features from later phases are listed at the end. Enrolling machines and debugging them: [RUNBOOK.md](./RUNBOOK.md).
 
 Contents:
 1. [Mental model in 60 seconds](#1-mental-model-in-60-seconds)
@@ -21,7 +21,11 @@ Contents:
 16. [Testing offline with the mock LLM](#16-testing-offline-with-the-mock-llm)
 17. [Recovery and maintenance](#17-recovery-and-maintenance)
 18. [Templates from the hub](#18-templates-from-the-hub)
-19. [What's coming](#19-whats-coming)
+19. [Questions and escalation](#19-questions-and-escalation)
+20. [Artifacts](#20-artifacts)
+21. [When an agent dies](#21-when-an-agent-dies)
+22. [Outputs, harvesting and clean-up](#22-outputs-harvesting-and-clean-up)
+23. [What's coming](#23-whats-coming)
 
 ---
 
@@ -42,7 +46,7 @@ you ──ocl / curl──▶ ocl-supervisor (hub) ◀──gRPC── opencode-
 | **Todos** | Every agent keeps an OpenCode todo list. Its progress is how success is judged. |
 | **Capability token** | What an agent holds instead of an API key. It only works through its own node, for its own model, within its budget. |
 
-Session states: `starting → idle ⇄ running`, plus `blocked` (waiting on a permission), `error`, `stopped`, `unreachable` (node disconnected) and `lost`.
+Session states: `starting → idle ⇄ running`, plus `blocked` (waiting on a permission or a question), `parked` (waiting for a provider allowance), `error`, `stopped`, `unreachable` (node disconnected), `lost` (node gone), `dead` (its container died; volumes kept) and `halted` (paused with its container kept, after another agent died).
 
 ---
 
@@ -325,6 +329,8 @@ ocl permit s-81c2d0a3f4 per_7f2c… reject   # the agent is told it was refused
 
 Tip: use `ask` as the default for `bash`, with an explicit `allow` list of safe commands. Most sessions then never block.
 
+Each permission request is also a **question** (§19): it goes to the agent that started the session first, then up the chain, and to you depending on the question mode. `ocl questions` shows it; `ocl answer <q-id> once|always|reject` answers it. Requests matching the vital rules (`rm -rf`, `deploy`, …) are `vital`.
+
 ---
 
 ## 7. Workflows (turn-based handoffs)
@@ -500,6 +506,15 @@ ls ~/.opencode-cluster/data/workspaces/shared-task-2/
 ```
 
 Shared workspaces have no locking. Tell agents (or the coordinator) who owns which files.
+
+**Across machines.** A shared workspace can be used by sessions on different nodes; each node has its own copy and the hub moves changes between them through the artifact store:
+- before a session starts on a node whose copy may be behind (it shows in `ocl show`: `placed: … workspace demo: synced from hub`);
+- after every turn, towards the other machines that have live sessions in it;
+- when an agent calls `cluster_sync_workspace`.
+
+Each sync is a file-by-file three-way merge against the last state both sides saw. A file changed on only one side takes that side's version (added, updated or deleted). A file changed on **both** sides keeps the local version, and the incoming one is written next to it as `<file>.theirs`; the agents in that copy are told which files to reconcile. Workflow runs use this too: a step can run on another machine than the previous one (`node:` per step, or placement), and the run's workspace follows it.
+
+**Handing over files without sharing a workspace:** artifacts (§20).
 
 ---
 
@@ -857,8 +872,9 @@ The whole demo is `examples/quickstart/run-local.sh --with-worker [--keep]`.
 | Supervisor restarts | Nothing. | Nodes reconnect with backoff and replay buffered events; running sessions are reconciled. |
 | Node daemon restarts | Nothing. | It re-attaches to its running containers, restarts stopped ones, and resyncs each session from OpenCode's history. |
 | Machine reboot | Start both services. | Stopped containers are restarted and sessions continue from their saved OpenCode state. |
-| Session shows `unreachable` | Check the node. | After `disconnect_grace_secs` (default 600) it becomes `lost`. |
-| Session shows `lost` | Spawn a new one; the workspace is still on disk. | — |
+| Session shows `unreachable` | Check the node. | After `disconnect_grace_secs` (default 600) it becomes `lost`, which counts as a death: see §21. |
+| Session shows `lost` or `dead` | `ocl halts`, then `ocl recover <halt> restart|resume_elsewhere|handoff|abandon`. | The cheapest recovery may already have run by itself (§21). |
+| Task shows `halted` | `ocl halts` shows the options with their costs; `ocl recover <h-id> <option>` resumes everything. | Halted sessions keep their containers until then. |
 | Stuck in `starting` > 2 min | `podman logs ocl-<session>`; OpenCode log under `data/instances/<session>/home/.local/share/opencode/log/` | — |
 | `[opencode-cluster] …` error in a session | It came from keyproxy: budget, token cap, model allowlist or missing secret. Check `opencode-node check`. | — |
 
@@ -867,8 +883,10 @@ Where data lives (default `~/.opencode-cluster`):
 ```
 supervisor/supervisor.db      sessions, tasks, runs, events, audit, API token hashes (back this up)
 data/node.db                  node outbox + instance index
+supervisor/artifacts/b3/       artifact blobs (content-addressed; back this up too)
 data/workspaces/              all workspaces
-data/instances/<session>/     generated opencode config (capability only) + OpenCode home
+data/instances/<session>/     generated opencode config (capability only) + OpenCode home (kept for `retain:`)
+data/cas/                     this node's artifact cache
 cli-token                     admin token from `init` (0600) — move it somewhere safe
 ```
 
@@ -908,11 +926,150 @@ ocl show <session> --preamble                   # the rendered instructions it s
 
 Coordinators get the same through `cluster_spawn_agent` (`role_append`, `budget_usd`, `route`), and `cluster_list_nodes` lets them choose a machine.
 
-## 19. What's coming
+## 19. Questions and escalation
+
+Agents ask in two ways:
+- **`cluster_ask(question, options?, importance, context)`**. It returns at once; the answer arrives as a message.
+- **OpenCode's own `question` tool.** The session waits for the reply; the node hands the question to the cluster.
+
+`ask` permissions (§6) and budget stops are questions too.
+
+**Where a question goes:**
+1. To the asker's **parent** (the agent that started it). The parent answers with `cluster_answer(id, answer)` or passes it up with `cluster_escalate(id, note)`; the note travels with the question.
+2. Up the chain, one level at a time. A holder that does nothing for `answer_timeout_secs` (default 300) passes it up automatically.
+3. At the top, the **question mode** decides whether it reaches you. If not, the top agent decides and its decision goes to the **assumption log**.
+
+| Mode | What reaches you |
+|---|---|
+| `ask_me_everything` | Every question, at once. The parent sees an FYI in its inbox but does not answer. |
+| `important_and_vital` *(default)* | `normal` and `vital` questions the chain could not answer. `low` stays in the chain. |
+| `vital_only` | Only `vital` questions, after the chain fails. |
+| `autonomous` | Only what no agent may decide (credentials, budgets). |
+
+Importance is set by the asker; **rules only raise it**. Mentions of money, credentials, deleting data, irreversible or external actions make it `vital` (`questions.vital_keywords`). Questions about passwords, secrets or keys are **operator-only**: no agent may answer them, whatever the mode.
+
+```bash
+ocl questions                          # open ones: importance, then how many wait on it, then age
+# q-3f2a…  vital  open  ask  blocked 2  1m  on worker-a task #3
+#     May I delete the old data directory?
+#     chain: builder s-81c2… → s-77ab… → operator   held by operator
+#     note (s-77ab…): the coordinator does not know whether it is still used
+#     raised to vital: mentions "delete"
+ocl answer q-3f2a… "Yes, it was migrated last week"
+ocl answer q-3f2a… --choice 2          # pick an option
+ocl answer q-3f2a… --decide            # "let the agent decide" (logged as an assumption)
+ocl answer q-3f2a… --reject
+
+ocl questions mode                     # cluster mode and per-task modes
+ocl questions mode vital_only          # switch live
+ocl questions mode autonomous --task 7 # or for one task (also: ocl task add … --question-mode …)
+ocl assumptions [--task 7]             # decisions made without you, for review
+```
+
+**Budgets:** when keyproxy refuses a call because a session's `budget_usd` is used up, you get a `vital` operator-only question: `ocl answer q-… "raise 2.50"` raises it live, `stop` stops the session (its outputs are harvested).
+
+**Upward reports:** `cluster_report_up(message)` sends a status report to the parent, or for a top-level agent, to the task notes and the notification centre (`ocl notifications`).
+
+Questions are also in `GET /api/v1/questions` (and on the SSE stream), answered with `POST /api/v1/questions/{id}/answer`.
+
+---
+
+## 20. Artifacts
+
+Content-addressed files and directory trees, stored on the hub (`art://b3/<hash>`). Identical content has the same reference. Metadata records who made it, on which node, for which task, and **lineage**: the artifacts it was made from.
+
+```bash
+ocl artifact put report.pdf --tag release
+ocl artifact put ./build-output --name build-42      # a directory becomes a tree (tar.zst)
+ocl artifact ls [text] [--task 3]
+ocl artifact show art://b3/9f2c…                      # metadata, parents ("from") and children ("used by")
+ocl artifact get art://b3/9f2c… -o out/               # a tree is unpacked into the directory
+```
+
+**Agents** use:
+- `cluster_artifact_put(path)` returns a reference, which they can attach to `cluster_send_message(…, artifacts=[ref])`;
+- `cluster_artifact_get(ref, path?)` puts it into their workspace;
+- `cluster_artifact_list` and `cluster_artifact_info`.
+
+Whatever an agent publishes lists the artifacts it fetched before as parents, so `ocl artifact show` traces where a result came from.
+
+Bytes move on their own gRPC stream to and from the hub (never node to node). Each node caches blobs (`artifact_cache`, default 2 GB), so a second fetch on the same node does not download again. Links in a workspace are never followed or packed.
+
+---
+
+## 21. When an agent dies
+
+An instance is **dead** when its container or process ends without being stopped. The reason is one of:
+- `oom`;
+- `exit:<code>` (137 is a kill);
+- `wall_clock` (`limits.wall_clock_secs`);
+- `node_lost` (its machine was unreachable for `disconnect_grace_secs`);
+- `container_gone`.
+
+Its volumes are kept. The hub prices each way back:
+
+| Option | Estimated cost |
+|---|---|
+| `restart` | Same node, same OpenCode home, history intact. Re-reading the last context × the input price. Only if the node is up. |
+| `resume_elsewhere` | A fresh instance of the same template (`--node` to choose). The workspace comes from a snapshot of the dead volume, or the latest checkpoint if the node is gone. It is briefed with the original prompt, todos and last output. Same estimate. |
+| `handoff` | The parent is asked to start a replacement with its own summary. `handoff_factor` × spend so far. |
+| `abandon` | The step or task fails with the death reason. |
+
+The cheapest option runs **automatically** once (`on_death.auto_retry`), if it costs at most `$0.50` and at most 25% of what the task has spent (for $0 providers: at most 25% of the allowance left). The wall-clock limit and crash loops (3 deaths in 10 minutes) are never retried automatically. Otherwise the task (or workflow run, or the session tree) is **halted**:
+1. every live instance in it is interrupted;
+2. its outputs are harvested;
+3. its container is stopped and kept.
+
+You get a `vital` notification with the reason, what it was doing, the spend and the priced options:
+
+```bash
+ocl halts
+# h-2e1c…  open  task:3  s-81c2… died (exit:137)  spent $0.4120  2m
+#     was doing: write tests
+#     halted: s-77ab…, s-90fe…
+#     * restart           ~$0.0310   same node worker-a, history intact; re-reads ~62000 tokens of context
+#     * resume_elsewhere  ~$0.0310   on hub (best placement); workspace: snapshot taken now from the dead instance's volume
+#     * handoff           ~$0.2060   parent s-77ab… spawns a replacement with its own summary
+#     * abandon           ~$0.0000   give up: the step/task fails with the death reason
+ocl recover h-2e1c… restart                     # one call resumes the whole tree
+ocl recover h-2e1c… resume_elsewhere --node hub
+ocl recover s-81c2… restart                     # a dead session without a halt
+```
+
+**Checkpoints:** every `checkpoint_every_turns` (default 3) finished turns, a node sends a snapshot of the workspace and the transcript to the hub. If a machine is lost, the replacement starts from there. The harvest record says that anything written after the checkpoint is unrecoverable. If the lost machine comes back later, its old instance of a replaced session is stopped.
+
+---
+
+## 22. Outputs, harvesting and clean-up
+
+Templates name the files worth keeping (`outputs:` in CONFIG.md). They are collected when an instance is stopped, dies, is halted, reaches its wall clock, or its task ends:
+
+```yaml
+outputs:
+  - { path: report.md, to: parent_workspace, dest: from-builder/report.md }
+  - { path: "dist/*.whl", to: artifact, name: wheels }
+transcript: true
+retain: on_failure
+```
+
+```bash
+ocl harvests --session s-81c2…
+# 14:02:11 s-81c2… on worker-a (stop)
+#     report.md      art://b3/77e1…   812B → parent_workspace isolated:s-77ab… on hub: from-builder/report.md
+#     dist/*.whl     art://b3/1c4d…  2048B → artifact
+#     missing.txt    (matched nothing)
+#     transcript art://b3/a09b…
+```
+
+The lifecycle is `running → stopping → harvesting → stopped → reaped`. After the harvest, the capability token stops working (the instance's gateway is gone). `retain:` decides when the OpenCode home and isolated workspace are removed (default 24 h); `ocl stop --rm-workspace` removes them at once.
+
+---
+
+## 23. What's coming
 
 | Feature | Phase |
 |---|---|
 | ~~Remote nodes over mTLS, join tokens, `via_node` routes, quotas and failover, templates~~ | 2 ✔ (web UI for these: 4) |
-| Artifact store (`cluster_artifact_put/get`), cross-machine shared workspaces, lineage | 3 |
+| ~~Artifact store, cross-machine shared workspaces, lineage, questions and escalation, dead-agent recovery and halts, harvesting~~ | 3 ✔ (UI views and push notifications for these: 4) |
 | Web UI (SolidJS, mobile-first: live sessions, drag-to-sort task board, enrollment), TUI, password login, built-in TLS | 4 |
 | Load test (~10 sessions), pre-warmed containers, Quadlet units, event export, keyproxy usage metering | 5 |

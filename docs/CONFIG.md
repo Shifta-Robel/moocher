@@ -43,6 +43,8 @@ Complete examples for a hub, a remote worker and a relay are in [`examples/remot
 | `hub_templates` | `true` | `false`: ignore the hub's template library, run only `agents/`. |
 | `default_route` | direct | Route for agents that don't set `route`. |
 | `labels` | `{}` | Free-form, shown in the UI. |
+| `checkpoint_every_turns` | `3` | Send a checkpoint (workspace snapshot + transcript) to the hub every N finished turns, so a session can resume on another machine if this one is lost. `0` turns it off. |
+| `artifact_cache` | `2g` | Local artifact cache (`<data>/cas`); least recently used blobs are dropped beyond it. |
 | `runtime.kind` | `podman` | `podman`, or `process` (dev/CI only: no isolation). |
 | `runtime.podman` | `podman` | Podman binary. |
 | `runtime.image` | `localhost/ocl-agent:1.19.4` | Default agent image. |
@@ -72,6 +74,17 @@ Complete examples for a hub, a remote worker and a relay are in [`examples/remot
 | `tasks.idle_grace_secs` | `30` | How long the cluster must be idle before a `when_free` task starts. |
 | `tasks.max_nudges` | `2` | Re-prompts for a coordinator that stops without finishing. |
 | `tasks.enabled` | `true` | Turn the scheduler off (tasks then only start via `ocl task run`). |
+| `questions.mode` | `important_and_vital` | Starting question mode: `ask_me_everything`, `important_and_vital`, `vital_only`, `autonomous` (see USAGE §19). Switch it live with `ocl questions mode <mode> [--task N]`; the live setting wins over this one. |
+| `questions.answer_timeout_secs` | `300` | An agent that holds a question this long without answering or escalating passes it up automatically. |
+| `questions.vital_keywords` | money, credentials, deleting, irreversible and external actions (see the schema) | Words that raise a question to `vital`. The rules only ever raise importance. |
+| `questions.operator_only_keywords` | `credential`, `password`, `secret`, `api key`, `private key` | Words that make a question operator-only: no agent may answer it, whatever the mode. |
+| `on_death.auto_retry` | `1` | Automatic recoveries per session before the operator decides. |
+| `on_death.max_auto_cost_usd` | `0.50` | Recover automatically only if the cheapest option costs at most this… |
+| `on_death.max_auto_fraction` | `0.25` | …and at most this fraction of what the task (or the session tree) has spent so far. |
+| `on_death.keyless_quota_fraction` | `0.25` | $0 providers: recover automatically only if it uses at most this fraction of the allowance left. |
+| `on_death.handoff_factor` | `0.5` | A hand-off to a fresh agent is estimated at this fraction of what was spent. |
+| `on_death.crashloop_deaths` | `3` | This many deaths within 10 minutes is a crash loop: no more automatic recoveries. |
+| `artifacts.max_size` | `2g` | Largest single artifact the hub accepts. Blobs live in `<data_dir>/artifacts/`. |
 
 ## providers.yaml
 
@@ -176,7 +189,8 @@ container:
   tmp: 512m                         # size of the in-memory /tmp
 workspace:
   mode: isolated                    # isolated | shared
-  name: my-project                  # shared: same name ⇒ same directory (per node)
+  name: my-project                  # shared: same name ⇒ one workspace; on several machines it is synced
+  seed: art://b3/…                  # optional: a new workspace starts from this artifact (tree or file)
 limits:
   max_sessions: 2                   # per node
   budget_usd: 1.00                  # per session; keyproxy refuses calls beyond it
@@ -190,7 +204,23 @@ overridable:                        # what a spawner may change per instance
   role_append: true                 #   extra instructions
   budget_usd: 3.00                  #   highest budget a spawner may set
   routes: [direct, via-relay-de]    #   preferred routes a spawner may pick
+outputs:                            # collected when the instance stops, dies, is halted or its task ends
+  - { path: report.md, to: parent_workspace, dest: from-builder/report.md }
+  - { path: "dist/*.whl", to: artifact, name: wheels }   # a glob matching several files -> one tree
+  - { path: build/, to: task_workspace }                  # a directory -> a tree
+  - { path: notes.md, to: "workspace:shared-notes" }      # any shared workspace
+transcript: true                    # also keep the conversation as an artifact
+retain: 24h                         # volumes kept after the end: a duration, on_failure, always or never
+on_death: { auto_retry: 1, max_auto_cost_usd: 0.50 }   # overrides the supervisor's on_death
 ```
+
+**Outputs:**
+- `to:` is `artifact` (default), `parent_workspace`, `task_workspace` (`task-<id>`) or `workspace:<name>`.
+- `dest:` is a path in the destination workspace. For a file it is the new path (a trailing `/` means "into this directory"); for a tree, the directory it is unpacked under. Default: the same relative path.
+- A pattern that matches nothing is reported as missing in the harvest, not as an error.
+- Every output is stored as an artifact (with lineage to what the instance fetched), whatever its destination.
+
+**Retention:** `retain: 24h` keeps the stopped instance's OpenCode home and isolated workspace for 24 h, then removes them. `on_failure` keeps them 24 h only if the instance failed or died, `never` removes them at once, `always` never does. Shared workspaces are never removed by an instance.
 
 Spawning with overrides: `ocl spawn coder --append "…" --budget 2 --route via-relay-de`, the API's `overrides` field, or the `spawn_agent` tool's `role_append` / `budget_usd` / `route`. Anything outside `overridable` is refused.
 
@@ -205,9 +235,9 @@ Spawning with overrides: `ocl spawn coder --append "…" --budget 2 --route via-
 4. the orchestration briefing (e.g. for coordinators);
 5. the spawner's `role_append`.
 
-Variables are `{{instance.id}}`, `{{template}}`, `{{node}}`, `{{parent}}`, `{{task}}`, `{{budget}}`, `{{model}}`, `{{tools}}` and `{{question_mode}}`. Read a session's rendered instructions with `ocl show <session> --preamble`.
+Variables are `{{instance.id}}`, `{{template}}`, `{{node}}`, `{{parent}}`, `{{task}}`, `{{budget}}`, `{{model}}`, `{{tools}}`, `{{question_mode}}` and `{{outputs}}`. Read a session's rendered instructions with `ocl show <session> --preamble`.
 
-`ask` permissions make a session **blocked** until the operator answers with `ocl permit <session> <request> once|always|reject`.
+`ask` permissions make a session **blocked**. They become questions (kind `permission`) that go up the chain like any other: answer with `ocl answer <question> once|always|reject`, or directly with `ocl permit <session> <request> once|always|reject`.
 
 ## workflows/<name>.yaml
 
@@ -216,7 +246,7 @@ apiVersion: ocl/v1
 kind: Workflow
 name: build-review
 description: Builder implements, reviewer approves or sends it back.
-workspace: { mode: shared, name: … }   # default: shared, one per run (run-<id>)
+workspace: { mode: shared, name: … }   # default: shared, one per run (run-<id>); follows steps across machines
 max_step_runs: 6                        # bounds review↔build loops
 steps:
   - name: build

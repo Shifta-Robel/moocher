@@ -80,8 +80,9 @@ The supervisor, the UI and other nodes only ever see *secret references* by name
 | Tool | Who |
 |---|---|
 | `send_message`, `read_inbox`, `list_agents`, `list_sessions`, `session_status` | every session |
-| `spawn_agent`, `stop_session`, `task_get`, `task_note`, `task_complete`, `task_fail` | coordinator sessions only (enforced on the node *and* the supervisor) |
-| `artifact_put/get/list`, `sync_workspace` | **(Phase 3)** |
+| `ask`, `answer`, `escalate`, `questions`, `report_up`, `log_assumption` | every session (questions, §6c) |
+| `artifact_put`, `artifact_get`, `artifact_list`, `artifact_info`, `sync_workspace` | every session (artifact bytes move on the node, next to the workspace) |
+| `spawn_agent`, `stop_session`, `task_get`, `task_note`, `task_complete`, `task_fail` | coordinator sessions only (enforced on the node *and* the supervisor). The operator can start a coordinator without a task (`ocl spawn --coordinator`). |
 
 This is the "programmatic way" for an agent to start sessions without secrets: it names a **profile**, and the node that owns the key does the rest. OpenCode's native MCP support means nothing has to be compiled into OpenCode. An `agent.tools.cluster` allowlist can narrow the set per profile.
 
@@ -136,7 +137,7 @@ We chose this over OAuth because there is one trusted operator, everything is se
 `container.egress: full` gives an agent normal networking (package installs, webfetch). An allowlisted egress proxy is Phase 5. The image is built from `images/agent/Containerfile`: OpenCode from npm (pinned) plus `ocl-bridge`, git, python3 and pytest. The base image is configurable.
 
 **D8 — Durability works the same way at every level: desired state, observed state, reconcile.**
-- **Supervisor restart:** containers keep running, and nodes keep buffering events in their outbox. Each node reconnects with a full **inventory snapshot**, and the supervisor reconciles it against SQLite. Unknown sessions are adopted; missing ones are marked `lost` and may be respawned by policy. **Nothing is orphaned.**
+- **Supervisor restart:** containers keep running, and nodes keep buffering events in their outbox. Each node reconnects with a full **inventory snapshot**, and the supervisor reconciles it against SQLite. Unknown sessions are adopted; missing ones are marked `lost`, which the recovery policy treats as a death (§7a). An instance that was replaced while its node was away is stopped when the node returns. **Nothing is orphaned.**
 - **Node restart:** the node runs `podman ps --filter label=ocl.node=<me>`, restarts stopped containers, re-attaches gateway and event stream, and resyncs each session from OpenCode's message history. Verified in Phase 1, including a node restart in the middle of a workflow.
 - **Outbox:** sequence-numbered and acknowledged by the supervisor. Reconnect uses exponential backoff with full jitter (0.5 s → 60 s).
 
@@ -171,7 +172,7 @@ routes:
 
 ## 4. Data flow — two-agent handoff (target design)
 
-Phase 1 implements everything here except artifacts (the steps share a workspace instead). Artifacts come in Phase 3, cross-machine placement in Phase 2. The verified Phase 1 run is in [`PHASE1.md`](./PHASE1.md).
+Everything here is implemented: Phase 1 ran it on one node with a shared workspace, Phase 2 added cross-machine placement, Phase 3 artifacts and workspaces that follow steps across machines. Runs: [`PHASE1.md`](./PHASE1.md), [`PHASE3.md`](./PHASE3.md).
 
 ```mermaid
 sequenceDiagram
@@ -204,7 +205,7 @@ sequenceDiagram
   - `steer`: abort the current step and deliver now.
   - `inbox`: the agent pulls it with `cluster_read_inbox`.
 
-  Messages will carry `art://` references, never file bytes (Phase 3).
+  Messages carry `art://` references (`send_message(…, artifacts=[…])`), never file bytes.
 - **Workflows.** Workflows are YAML state machines (`steps: build → review`). Each step has an agent profile, a prompt template (`{{input}}`, `{{prev.output}}`, `{{feedback}}`, …), seeded todos, checks, and `next` / `on_fail` transitions. `max_step_runs` bounds review↔build loops. Step state is persisted. All steps of a run share one workspace, so in Phase 1 a run is placed on a node that has every step's agent. Free-form messaging between any two sessions sits alongside workflows.
 - **Placement.** A node is eligible when it is attached, has the agent (local or hub template) with a resolvable secret, and has a free slot. Eligible nodes are then **scored** (weights in `supervisor.yaml placement:`):
   - capacity;
@@ -280,20 +281,33 @@ workspace:
 |---|---|
 | `isolated` | Each agent gets its own Podman volume. Files move only as artifacts. Lineage is clean. |
 | `shared`, both agents on the **same node** | The same named Podman volume is mounted into both containers. Changes are visible immediately and nothing is copied. Agents should coordinate through messages or todos to avoid editing the same file at once. Optionally, `lock: advisory` adds `cluster_lock(path)` MCP tools. |
-| `shared`, agents on **different nodes** | A volume can't be shared across machines. The workspace is instead **synced through the artifact store**: at each handoff (or `cluster_sync`), the source node snapshots the workspace as a git bundle (or `tar.zst` for non-git trees) and publishes it as an artifact. The target node applies it into its copy of the volume. Lineage is recorded. Conflicts surface as git merge conflicts for the agent to resolve. |
+| `shared`, agents on **different nodes** | A volume can't be shared across machines, so each node keeps a copy and the hub syncs them through the artifact store (snapshot + three-way merge by file, below). Changes made on both sides keep the local file and add `<file>.theirs`; the agents there are told. Syncs are logged as `workspace.synced`. |
 
 **No `podman cp` or SCP.** The node daemon owns the volumes on the host side, so it reads and writes workspace files directly, and every cross-container transfer goes through the node's CAS cache:
-- **Same node:** a hard link or reflink from the cache, which is instant. Metadata is still recorded at the hub.
+- **Same node:** a copy from the node's cache, with no download. A hard link would let an agent edit the cached blob in place, so the node always copies. Metadata is still recorded at the hub.
 - **Different node:** chunked upload to the hub, then download to the target.
 
-Agents use `artifact_put/get` or `cluster_sync`, and the operator uses `ocl artifact put/get/ls`.
+Agents use `cluster_artifact_put/get` or `cluster_sync_workspace`, and the operator uses `ocl artifact put/get/ls/show`.
+
+**How the cross-machine sync works (Phase 3).** Shared workspaces are synced by **snapshot + three-way merge**, not git bundles:
+1. The holder node packs its copy as a tree artifact (tar.zst; regular files and directories only, links never followed).
+2. The other node merges it file by file against the last manifest both sides agreed on (kept per node and workspace). A file changed on one side takes that side; changed on both, the local version stays and the incoming one lands as `<file>.theirs`.
+
+This needs no git in the workspace and behaves the same for any tree. Syncs happen before a session starts on a node whose copy may be behind, after each turn towards other machines with live sessions, and on `cluster_sync_workspace`. The hub records the latest snapshot per workspace, so a node that never had it (or replaces a lost one) starts from there.
 
 ## 7. Artifacts
 
-- **Storage:** content-addressed with BLAKE3, held as blobs on the hub filesystem by default. A swappable backend is available through the `object_store` crate (S3/Garage/MinIO).
-- **Metadata:** in SQLite, covering name, media type, size, producer session, parent refs (**lineage**) and tags.
-- **Transfer:** chunked streaming over the gRPC connection, so there are no direct node-to-node copies. Nodes cache blobs by hash.
-- **Code trees:** a git bundle is the artifact type to use. `ocl artifact get` can unbundle it into a workspace.
+- **Storage:** content-addressed with BLAKE3, blobs on the hub filesystem (`<data>/artifacts/b3/<aa>/<hash>`). An `object_store` backend (S3/Garage/MinIO) remains possible later.
+- **Metadata:** in SQLite: name, media type, kind (`file` or `tree`), size, producer session and node, task, tags and parent refs (**lineage**). What an agent publishes lists the artifacts it fetched as parents; `ocl artifact show` lists parents and children.
+- **Transfer:** a separate `Blobs` gRPC service on the same connection as the link (mTLS or the hub socket), so a large upload never delays commands. Uploads declare their hash, and the hub skips the bytes when it already has the blob. Downloads are verified against the hash. There are no node-to-node copies. Nodes cache blobs by hash (`artifact_cache`, LRU).
+- **Trees:** a directory is a deterministic tar.zst of its regular files (paths sorted, exec bit kept). `ocl artifact get` unpacks it. Extraction accepts only plain relative paths and caps the expanded size.
+- **Safety on the node:** the node reads and writes workspaces host-side. It opens files with `O_NOFOLLOW` and checks through `/proc/self/fd` that each one really is inside the workspace, so an agent's symlink cannot make it read or overwrite host files.
+
+## 7a. Questions, deaths, harvests (Phase 3)
+
+- **Questions:** `cluster_ask`, OpenCode's `question` tool (intercepted from the event bus and `GET /question`), `ask` permissions and budget stops all become one `Question`. It moves up the parent chain (answer, escalate with a note, or time out) until the question mode lets it reach the operator. Otherwise the top agent decides and the decision is logged as an assumption (PHASE1_5 §6; USAGE §19).
+- **Deaths:** nodes detect ended containers/processes (exit code, OOM), the wall clock, and lost nodes. The hub prices `restart` / `resume_elsewhere` / `handoff` / `abandon` and applies the cheapest automatically within `on_death`. Otherwise it halts the task tree: every instance is interrupted, harvested, and stopped with its container kept; one call resumes. Nodes checkpoint workspace + transcript every N turns for machines that disappear (USAGE §21).
+- **Harvest:** on stop, death, halt and task end, the node collects the template's `outputs:` and the transcript as artifacts; the hub delivers them to the parent's or task's workspace on whichever machine holds it. `retain:` decides when volumes are reaped (USAGE §22).
 
 ## 8. Pluggability
 
@@ -351,22 +365,27 @@ Agents use `artifact_put/get` or `cluster_sync`, and the operator uses `ocl arti
   - requesting another model gets 403;
   - the config is read-only;
   - all capabilities are dropped.
+- **Workspace files:** the node never follows links in a workspace (`O_NOFOLLOW` plus a `/proc/self/fd` check on every open, links skipped when packing, only plain files and directories extracted), so an agent cannot use `artifact_put` / harvests to read host files or artifact downloads to write outside its workspace. Unit-tested.
+- **Questions about secrets** are operator-only, whatever the mode. Raising a budget is the operator's decision, never an agent's.
 - Every mutating API call goes through RBAC (operator/admin), then the audit chain.
 
 ## 11. Repository layout
 
 ```
 opencode-cluster/
-  shared-protocol/   proto/link.proto; src/{config,model,link,api,tls}.rs
-  supervisor/        src/{main,api,link,tlslink,nodes,pki,state,orch,placement,quotas,templates,resources,db}.rs
-  node-daemon/       src/{main,cfgstore,manager,oc,gateway,egress,quota,relay,pki,stats,link,runtime,secrets,store}.rs
+  shared-protocol/   proto/link.proto; src/{config,model,link,api,tls,archive}.rs
+  supervisor/        src/{main,api,link,tlslink,nodes,pki,state,orch,placement,quotas,templates,resources,
+                          artifacts,workspaces,questions,recovery,db}.rs
+  node-daemon/       src/{main,cfgstore,manager,oc,gateway,egress,quota,relay,pki,stats,link,runtime,secrets,store,
+                          cas,wsops}.rs
   bridge/            ocl-bridge (static musl)
   cli/               ocl (clap)
   ui/                web (SolidJS) + tui (ratatui) — Phase 4
   images/agent/      Containerfile
   examples/          quickstart/ (hub config + run-local.sh), remote/ (hub, worker, relay configs), mock-llm/
-  tests/e2e/         enroll, relay, quota, templates, stats, resilience suites (process runtime + mock LLM)
-  docs/              ARCHITECTURE, PHASE0, PHASE1, PHASE1_5, PHASE2, QUICKSTART, CONFIG, USAGE, RUNBOOK
+  tests/e2e/         enroll, relay, quota, templates, stats, resilience, artifacts, questions, death, harvest
+                     suites (process runtime + mock LLM)
+  docs/              ARCHITECTURE, PHASE0, PHASE1, PHASE1_5, PHASE2, PHASE3, QUICKSTART, CONFIG, USAGE, RUNBOOK
 ```
 
 ## 12. Additions designed after Phase 1 (see [`PHASE1_5.md`](./PHASE1_5.md))
@@ -378,7 +397,7 @@ opencode-cluster/
 | Relay-only nodes | Proxy machines with no agents, admitted by an allowlist editable in the UI | 2 ✔ (UI: 4) |
 | Placement | Scored using capacity, quota headroom, measured latency and locality, with an explained decision | 2 ✔ |
 | Preamble | Layered, rendered instructions; readable per session | 2 ✔ |
-| Questions | Questions escalate up the parent chain; an operator mode decides what reaches you; assumption log | 3 |
-| Death and cleanup | `dead` reasons, cost-aware retry/reassign/halt, harvest of outputs on every exit | 3 |
+| Questions | Questions escalate up the parent chain; an operator mode decides what reaches you; assumption log | 3 ✔ (UI inbox: 4) |
+| Death and cleanup | `dead` reasons, cost-aware retry/reassign/halt, harvest of outputs on every exit | 3 ✔ |
 | UI | SolidJS + Tailwind + Kobalte, dark/light, colour+icon status encoding, Open in OpenCode on a second port of your domain, notifications incl. Web Push, password login on your domain | 4 |
 | Containers | Live CPU/RAM/pids/disk per instance, soft or hard disk limits | 2 ✔ soft · 5 hard |

@@ -19,3 +19,12 @@ placement:                            # score weights (each part is 0..1)
 tasks:
   coordinator_agent: coordinator
   max_concurrent_tasks: 2
+questions:
+  mode: important_and_vital           # ask_me_everything | important_and_vital | vital_only | autonomous
+  answer_timeout_secs: 300            # an agent sitting on a question passes it up after this
+on_death:                             # recovery policy for dead agents (templates may override)
+  auto_retry: 1                       # cheapest recovery, at most once…
+  max_auto_cost_usd: 0.50             # …if it costs at most this…
+  max_auto_fraction: 0.25             # …and at most 25% of what the task spent; else halt
+artifacts:
+  max_size: 2g

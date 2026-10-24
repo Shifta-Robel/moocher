@@ -138,7 +138,46 @@ The unix-socket hub node is unaffected.
 
 Live changes go into the node's `overrides.yaml`, never into your versioned files.
 
-## 6. Debugging
+## 6. Questions, halts and harvests
+
+### 6.1 The question inbox
+
+```bash
+ocl questions                     # waiting on you first: importance, then how many wait, then age
+ocl answer <q-id> "text"          # or --choice N, --decide (let the agent decide), --reject
+ocl questions mode                # cluster mode + per-task modes
+ocl questions mode vital_only     # live; persists across restarts (overrides questions.mode)
+ocl notifications --unread --read # what you missed, then mark it read
+ocl assumptions --task 7          # what agents decided without you
+```
+
+- **A question sits with an agent:** it moves up by itself after `questions.answer_timeout_secs` (default 300). To take it over, answer it yourself: the operator may answer any open question.
+- **Too many questions reach you:** switch to `vital_only` or `autonomous` (per task with `--task`).
+- **Too few reach you:** use `ask_me_everything` while you watch a task.
+
+### 6.2 A halted task
+
+```bash
+ocl halts                         # reason, what it was doing, spend, priced options
+ocl recover <h-id> restart        # or resume_elsewhere [--node X], handoff, abandon
+```
+
+- **Choosing an option:**
+  - `restart` keeps the agent's history and is usually cheapest.
+  - Use `resume_elsewhere` when the node is unhealthy or gone.
+  - Use `handoff` when the agent kept failing the same way.
+  - `abandon` fails the task (or step) with the death reason.
+- **Halted sessions keep their containers.** `ocl task cancel <id>` ends them, and their outputs are harvested.
+- **Before restarting an `oom` death,** raise the template's `container.memory`. A restart with the same limit dies again.
+- **Lost nodes:** the replacement starts from the latest checkpoint (`checkpoint_every_turns`). `ocl harvests --session <id>` says what was unrecoverable.
+
+### 6.3 Harvests and disk
+
+- **See what was collected:** `ocl harvests [--session X]`, then `ocl artifact get <ref> -o <dir>`.
+- **Volumes of stopped instances** stay for `retain:` (default 24 h) under `data/instances/<id>/` and `data/workspaces/<id>/`; the node removes them when due. To free disk now, set `retain: never` on the template (it applies at the next stop), or delete those directories by hand for sessions that are `stopped`.
+- **Artifact blobs** live in the hub's `<data>/artifacts/` (back it up with the database). Nodes cache them in `data/cas/` up to `artifact_cache`.
+
+## 7. Debugging
 
 Logs are JSON: `journalctl -u opencode-node -o cat | jq -r '.fields.message'`. Raise verbosity with `OCL_LOG=debug` (or `OCL_LOG=info,opencode_node::gateway=debug`).
 
@@ -161,5 +200,11 @@ Logs are JSON: `journalctl -u opencode-node -o cat | jq -r '.fields.message'`. R
 | Session error `disk limit exceeded: …` | `container.disk` reached. Clean the workspace, raise the limit, or stop the session. OpenCode's home alone takes ~120 MB, so limits below ~500 MB are tight. |
 | Hub restarted and a remote node shows `disconnected` | Nodes back off up to 60 s; it reconnects and replays its buffered events (`ocl events`). |
 | `ocl` prints `contacting supervisor … Connection refused` | The supervisor is down or `OCL_URL` is wrong. |
+| Session `dead`, `exit:137` | Killed: often memory (`oom` when Podman says so) or a manual kill. See §6.2. |
+| Session `dead`, `wall_clock` | `limits.wall_clock_secs` reached. It is not retried automatically; `ocl recover <id> restart` gives it a fresh wall clock. |
+| `artifact_put` says `… resolves outside the workspace` / `is a symlink` | The agent tried to share a link; links are never followed. Share the file itself. |
+| Workspace files `*.theirs` appear | A cross-machine sync found the same file changed on both machines (§ USAGE 9). Reconcile and delete the `.theirs` file. |
+| `upload refused: … artifacts.max_size` | Raise `artifacts.max_size` on the hub, or share a smaller tree. |
+| A new instance takes ~30 s to start on a dev host | Fixed by the node pre-seeding OpenCode's model catalog; if it comes back, check the OpenCode log for a network fetch at boot (`process` runtime only; containers have no network). |
 
-Health at a glance: `ocl status`, `ocl nodes` (link RTT, enrollment, IP), `ocl stats` (CPU/memory/disk per host and instance), `ocl quotas`, and `/metrics` (`ocl_relay_*`, `ocl_sessions{state}`, …).
+Health at a glance: `ocl status`, `ocl nodes` (link RTT, enrollment, IP), `ocl stats` (CPU/memory/disk per host and instance), `ocl quotas`, `ocl questions`, `ocl halts`, `ocl notifications --unread`, and `/metrics` (`ocl_relay_*`, `ocl_sessions{state}`, …).

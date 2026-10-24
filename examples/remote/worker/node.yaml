@@ -12,3 +12,5 @@ secrets:
 # used for `direct` when it is not a private/loopback address.
 ip_echo: ["https://api.ipify.org"]
 # hub_templates: false                # run only this node's own agents/
+checkpoint_every_turns: 3     # workspace + transcript to the hub every 3 turns (resume elsewhere if this machine is lost)
+artifact_cache: 2g            # local cache of artifact blobs

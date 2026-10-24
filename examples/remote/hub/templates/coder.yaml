@@ -18,3 +18,9 @@ overridable:                                  # what a spawner (you or a coordin
   role_append: true
   budget_usd: 3.00
   routes: [direct, via-relay-de]
+outputs:                                      # collected when it stops, dies, is halted or its task ends
+  - { path: CHANGES.md, to: parent_workspace, dest: reports/ }
+  - { path: "dist/*", to: artifact, name: build-output }
+transcript: true                              # keep the conversation as an artifact
+retain: on_failure                            # keep volumes 24 h only after a failure or death
+on_death: { auto_retry: 1, max_auto_cost_usd: 0.25 }

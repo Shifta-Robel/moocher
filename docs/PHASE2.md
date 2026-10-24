@@ -18,7 +18,7 @@ Design: [PHASE1_5.md](./PHASE1_5.md). Operations: [RUNBOOK.md](./RUNBOOK.md). Co
 | Templates and preamble | `supervisor/src/templates.rs`, `node-daemon/src/{cfgstore,manager}.rs` | Hub `templates/` + `preambles/cluster.md` pushed to nodes and cached. Secret aliases via node `secrets:`. `instances.max`, `overridable`. Layered rendered preamble, readable per session. `hub_templates: false` opt-out. |
 | Resource stats | `node-daemon/src/stats.rs`, `supervisor/src/resources.rs` | Host + instance CPU/memory/pids/disk every 10 s (cgroup v2 or `/proc`). An hour in memory, minute samples for 7 days. Soft `container.disk` limit, sized `/tmp`. |
 | CLI | `cli/` | `ocl node invite/approve/revoke/forget/probe`, `ocl allow`, `ocl quotas`, `ocl ips`, `ocl quota set/clear`, `ocl route set/clear`, `ocl templates`, `ocl stats`, `ocl show --preamble`, spawn `--append/--budget/--route`. |
-| E2E suites | `tests/e2e/` | Six suites, 109 checks, rerunnable on one machine. |
+| E2E suites | `tests/e2e/` | Six suites, 103 checks, rerunnable on one machine. (The Phase 2 report first said 109: the counter also counted each suite's "ALL PASSED" line; fixed in Phase 3.) |
 
 ## Verified (each was run, not just compiled)
 
