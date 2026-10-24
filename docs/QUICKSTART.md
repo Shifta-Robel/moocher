@@ -56,7 +56,15 @@ $O task add "Greeting module" -b "Create greet(name) with tests, reviewed" --lab
 $O send <session> "Please also add a docstring"        # mid-run command
 $O events -f                    # live event log
 $O audit --verify
+
+# 4. The dashboard: create a login, then open http://127.0.0.1:7700
+target/release/ocl-supervisor user set admin   # asks for a password
+$O tui                          # or the same in the terminal
 ```
+
+For a dashboard on your own domain with HTTPS, phone notifications and **Open in OpenCode**, see USAGE §23–26.
+
+Building the UI yourself is optional: the built dashboard is checked in (`supervisor/ui-dist/`). To change it, run `cd ui/web && npm ci && npm run build`, then rebuild the supervisor.
 
 ## Using a real provider instead of the mock
 

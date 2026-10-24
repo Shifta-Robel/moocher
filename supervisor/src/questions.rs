@@ -92,7 +92,22 @@ impl Sup {
 
     fn save_question(&self, q: &Question) {
         let _ = self.db.put_question(q);
-        let _ = self.stream.send(StreamEvent::Question(q.clone()));
+        let mut live = q.clone();
+        live.blocked = self.blocked_on(&q.asker, &self.db.sessions(false));
+        let _ = self.stream.send(StreamEvent::Question(live));
+    }
+
+    /// The asker and every live session below it (they all wait for the answer).
+    fn blocked_on(&self, asker: &str, sessions: &[SessionInfo]) -> u32 {
+        let mut n = 1u32;
+        let mut frontier = vec![asker.to_string()];
+        while let Some(p) = frontier.pop() {
+            for c in sessions.iter().filter(|c| c.parent.as_deref() == Some(p.as_str()) && c.report.state.is_live()) {
+                n += 1;
+                frontier.push(c.report.id.clone());
+            }
+        }
+        n
     }
 
     pub fn notify(&self, kind: &str, severity: &str, title: String, body: String, target: Option<String>) {
@@ -475,16 +490,7 @@ impl Sup {
         let sessions = self.db.sessions(false);
         let mut qs: Vec<Question> = self.db.questions(open_only).into_iter().filter(|q| !operator_only || q.holder == OPERATOR).collect();
         for q in &mut qs {
-            // The asker and every live session below it wait for the answer.
-            let mut n = 1u32;
-            let mut frontier = vec![q.asker.clone()];
-            while let Some(p) = frontier.pop() {
-                for c in sessions.iter().filter(|c| c.parent.as_deref() == Some(p.as_str()) && c.report.state.is_live()) {
-                    n += 1;
-                    frontier.push(c.report.id.clone());
-                }
-            }
-            q.blocked = n;
+            q.blocked = self.blocked_on(&q.asker, &sessions);
         }
         if open_only {
             qs.sort_by(|a, b| b.importance.cmp(&a.importance).then(b.blocked.cmp(&a.blocked)).then(a.created_at.cmp(&b.created_at)));

@@ -15,8 +15,7 @@ use std::sync::Arc;
 type Body = http_body_util::combinators::BoxBody<bytes::Bytes, Box<dyn std::error::Error + Send + Sync>>;
 
 pub async fn run(http: &reqwest::Client, ticket_url: &str, port: u16, launch: bool) -> Result<()> {
-    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
-    let r = client.get(ticket_url).send().await.context("redeeming the attach ticket")?;
+    let r = http.get(ticket_url).send().await.context("redeeming the attach ticket")?;
     let set = r.headers().get_all("set-cookie").iter().filter_map(|v| v.to_str().ok()).find(|v| v.starts_with("ocl_attach=")).map(String::from);
     let Some(set) = set else { bail!("the hub did not accept the ticket ({})", r.status()) };
     let cookie = set.split(';').next().unwrap_or("").to_string();

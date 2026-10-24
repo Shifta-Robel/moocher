@@ -161,7 +161,7 @@ export default function Nodes() {
           fallback={
             <form class="space-y-3" onSubmit={(e) => { e.preventDefault(); invite(); }}>
               <Field label="Name" hint="[a-z0-9-], unique in the cluster">
-                <input class={inputCls} value={name()} onInput={(e) => setName(e.currentTarget.value)} pattern="[a-z0-9-]+" required />
+                <input class={inputCls} value={name()} onInput={(e) => setName(e.currentTarget.value)} pattern="[a-z0-9\-]+" required />
               </Field>
               <label class="inline-flex items-center gap-2 text-sm">
                 <input type="checkbox" checked={relay()} onChange={(e) => setRelay(e.currentTarget.checked)} /> relay only (lends its IP, runs no agents; needs an allowed source IP)
@@ -172,7 +172,8 @@ export default function Nodes() {
             </form>
           }
         >
-          <div class="space-y-3 text-sm">
+          {/* Focus moves to Copy, the next step (keeps keyboard use, Escape included, inside the dialog). */}
+          <div class="space-y-3 text-sm" ref={(el) => queueMicrotask(() => el.querySelector<HTMLButtonElement>("button")?.focus())}>
             <p>Run this on the new machine (single use, valid for 15 minutes):</p>
             <pre class="overflow-x-auto rounded-lg bg-slate-950 p-3 text-xs text-slate-100">{join().command}</pre>
             <CopyButton text={join().command} />

@@ -56,7 +56,7 @@ Complete examples for a hub, a remote worker and a relay are in [`examples/remot
 
 | Key | Default | Meaning |
 |---|---|---|
-| `api_listen` | `127.0.0.1:7700` | Operator API. Keep it on loopback, or put a TLS proxy in front until Phase 4. |
+| `api_listen` | `127.0.0.1:7700` | Dashboard and API. Beyond loopback use `tls:` (below) or a TLS proxy. |
 | `link_socket` | `$XDG_RUNTIME_DIR/ocl/supervisor.sock` or `/run/ocl/supervisor.sock` | Unix socket (0600) for same-machine nodes. |
 | `link_listen` | off | TCP address for remote nodes (mTLS), e.g. `0.0.0.0:7443`. |
 | `public_names` | hostname, `localhost`, `127.0.0.1` | Names/IPs remote nodes use for the hub; they go into the link certificate (reissued when they change). The first one forms the join command. |
@@ -85,6 +85,25 @@ Complete examples for a hub, a remote worker and a relay are in [`examples/remot
 | `on_death.handoff_factor` | `0.5` | A hand-off to a fresh agent is estimated at this fraction of what was spent. |
 | `on_death.crashloop_deaths` | `3` | This many deaths within 10 minutes is a crash loop: no more automatic recoveries. |
 | `artifacts.max_size` | `2g` | Largest single artifact the hub accepts. Blobs live in `<data_dir>/artifacts/`. |
+| `tls.cert_file` / `tls.key_file` | off | Serve the dashboard and API over HTTPS with your certificate (PEM chain + key). Replaced files are picked up within a minute. |
+| `tls.acme.domains` | — | Get the certificate automatically (HTTP-01). The names must point at this machine. |
+| `tls.acme.email` | — | Contact for the CA (optional). |
+| `tls.acme.directory` | Let's Encrypt production | Any RFC 8555 directory, e.g. `https://acme-staging-v02.api.letsencrypt.org/directory`. |
+| `tls.acme.http01_listen` | `0.0.0.0:80` | Where the CA connects for the challenge; everything else there is redirected to HTTPS. Must be port 80 on the public address. |
+| `tls.acme.directory_ca` | — | Extra CA to trust for the directory (test CAs such as Pebble). |
+| `trusted_proxies` | `[]` | IPs/CIDRs of reverse proxies whose `X-Forwarded-For` / `X-Forwarded-Proto` are believed (client IP for lockouts, `Secure` cookies). |
+| `attach_listen` | off | Second listener for **Open in OpenCode**, e.g. `0.0.0.0:7444` (same certificate as the dashboard). |
+| `attach_url` | dashboard host + attach port | Public base URL of that listener, if it differs (e.g. behind a proxy). |
+| `login.session_hours` | `12` | Browser session lifetime. |
+| `login.max_failures` | `5` | Failed logins per account within 15 min before a lockout (per IP: 4×). |
+| `login.lockout_secs` | `900` | First lockout; doubles with each further lockout, up to 24 h. |
+| `notifications.quiet_hours` | — | `{ from: "22:00", to: "07:00" }` (local): only `vital` notifications go out then. |
+| `notifications.rules` | warning + vital → every configured channel | `[{ kinds: ["question.*", "task.halted"], min_severity: info, channels: [push, ntfy] }]`; first match wins; `[]` channels = in-app only. |
+| `notifications.web_push.subject` | `mailto:operator@localhost` | VAPID contact. The key pair is created on first start (`<data_dir>/vapid.key`). Set `web_push: null` to turn push off. |
+| `notifications.ntfy` | off | `{ url: "https://ntfy.sh/my-topic", token: "env:NTFY_TOKEN" }` |
+| `notifications.webhook` | off | `{ url: "https://…", secret: "file:/etc/ocl/hook-secret" }`: JSON POST, signed `X-OCL-Signature: sha256=<hmac>`. |
+
+Event kinds (for rules): `question.waiting`, `task.done|failed|cancelled`, `task.halted`, `recovery.auto`, `run.passed|failed`, `node.offline`, `node.back`, `quota.exhausted`, `quota.reset`, `budget.80`, `provider.auth_failed`, `provider.down`, `disk.warning`, `agent.report`, `login.lockout`, `tls.acme_failed`, `test`.
 
 ## providers.yaml
 

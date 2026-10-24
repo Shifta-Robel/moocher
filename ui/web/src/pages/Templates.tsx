@@ -100,7 +100,7 @@ export default function Templates() {
               </select>
             </Field>
             <Field label="Shared workspace" hint="name; empty = its own">
-              <input class={inputCls} value={shared()} onInput={(e) => setShared(e.currentTarget.value)} pattern="[a-z0-9-]*" />
+              <input class={inputCls} value={shared()} onInput={(e) => setShared(e.currentTarget.value)} pattern="[a-z0-9\-]*" />
             </Field>
           </div>
           <Show when={pick()?.overridable.role_append}>

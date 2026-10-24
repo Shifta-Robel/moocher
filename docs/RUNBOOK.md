@@ -177,7 +177,24 @@ ocl recover <h-id> restart        # or resume_elsewhere [--node X], handoff, aba
 - **Volumes of stopped instances** stay for `retain:` (default 24 h) under `data/instances/<id>/` and `data/workspaces/<id>/`; the node removes them when due. To free disk now, set `retain: never` on the template (it applies at the next stop), or delete those directories by hand for sessions that are `stopped`.
 - **Artifact blobs** live in the hub's `<data>/artifacts/` (back it up with the database). Nodes cache them in `data/cas/` up to `artifact_cache`.
 
-## 7. Debugging
+## 7. The dashboard: logins, HTTPS, attach, push
+
+| Situation | Fix |
+|---|---|
+| Locked out of your account (`too many failed logins`) | Wait it out, or on the hub `ocl-supervisor user set <name>` (sets a new password and clears the lockout). |
+| Lost the authenticator app | `ocl-supervisor user totp <name> --off`, log in, then `user totp <name>` again. |
+| Someone hammers the login page | Every failure is in `ocl audit` (`login.failed` with the IP); lockouts raise vital notifications. Put the hub behind a firewall or VPN if it does not need to be public. |
+| Log every browser out | Change the password (`ocl-supervisor user set`): it ends that user's sessions. |
+| ACME order fails | The supervisor log says why; a `tls.acme_failed` notification is raised. Check that the domain resolves to the hub, that port 80 reaches `http01_listen`, and try the staging directory first. Orders retry with backoff (1 min → 6 h). |
+| The certificate is not renewing | It renews 30 days before expiry, checked twice a day; `<data>/acme/cert.pem` shows the current one (`openssl x509 -noout -enddate -in …`). |
+| Replace your own certificate | Overwrite `cert_file` / `key_file`: picked up within a minute (an invalid pair is refused and the old one kept). |
+| Open in OpenCode: "Link expired" | The ticket is single use and lives 60 s: click **Open in OpenCode** again. |
+| Open in OpenCode: "Not attached" / 401 | The 8-hour attach cookie expired or belongs to another instance: open it again from the dashboard. |
+| Open in OpenCode does nothing | `attach_listen` is not set (the button is hidden then), or the port is firewalled; behind a proxy, set `attach_url` and proxy that port too (WebSocket upgrades included). |
+| Push never arrives | Push needs HTTPS (or localhost). Use **Send a test** on the Notifications page. If the subscription is gone (`404/410` from the push service) the hub drops it: enable push again. On iOS the dashboard must be added to the home screen. |
+| ntfy / webhook silent | Only `warning` and `vital` go out by default, and nothing but `vital` during quiet hours; check `notifications.rules`. Failures are in the supervisor log (`ntfy refused…`). |
+
+## 8. Debugging
 
 Logs are JSON: `journalctl -u opencode-node -o cat | jq -r '.fields.message'`. Raise verbosity with `OCL_LOG=debug` (or `OCL_LOG=info,opencode_node::gateway=debug`).
 

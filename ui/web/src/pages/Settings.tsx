@@ -88,7 +88,7 @@ export default function Settings() {
               </For>
             </ul>
             <form class="grid gap-2 sm:grid-cols-4" onSubmit={async (e) => { e.preventDefault(); if (await act(() => post("/users", { name: nu(), password: npw(), scope: nscope() }), "User saved")) { setNu(""); setNpw(""); refetch(); } }}>
-              <input class={inputCls} placeholder="name" pattern="[a-z0-9-]+" value={nu()} onInput={(e) => setNu(e.currentTarget.value)} required />
+              <input class={inputCls} placeholder="name" pattern="[a-z0-9\-]+" value={nu()} onInput={(e) => setNu(e.currentTarget.value)} required />
               <input class={inputCls} type="password" placeholder="password" minlength="10" value={npw()} onInput={(e) => setNpw(e.currentTarget.value)} required />
               <select class={inputCls} value={nscope()} onChange={(e) => setNscope(e.currentTarget.value)}>
                 <option value="read">read</option>

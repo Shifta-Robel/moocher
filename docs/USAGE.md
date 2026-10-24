@@ -1,6 +1,6 @@
 # opencode-cluster — Usage guide
 
-Practical, copy-pasteable examples for every feature that exists today (Phases 1–3: hub, local and remote nodes, relays, quotas, templates, artifacts, questions, recovery from dead agents, harvesting). Features from later phases are listed at the end. Enrolling machines and debugging them: [RUNBOOK.md](./RUNBOOK.md).
+Practical, copy-pasteable examples for every feature that exists today (Phases 1–4: hub, local and remote nodes, relays, quotas, templates, artifacts, questions, recovery from dead agents, harvesting, the web dashboard with login and HTTPS, Open in OpenCode, notifications, the TUI). Features from later phases are listed at the end. Enrolling machines and debugging them: [RUNBOOK.md](./RUNBOOK.md).
 
 Contents:
 1. [Mental model in 60 seconds](#1-mental-model-in-60-seconds)
@@ -25,7 +25,12 @@ Contents:
 20. [Artifacts](#20-artifacts)
 21. [When an agent dies](#21-when-an-agent-dies)
 22. [Outputs, harvesting and clean-up](#22-outputs-harvesting-and-clean-up)
-23. [What's coming](#23-whats-coming)
+23. [The web dashboard and login](#23-the-web-dashboard-and-login)
+24. [HTTPS on your domain](#24-https-on-your-domain)
+25. [Open in OpenCode](#25-open-in-opencode)
+26. [Notifications: phone push, ntfy, webhooks](#26-notifications-phone-push-ntfy-webhooks)
+27. [The terminal dashboard](#27-the-terminal-dashboard)
+28. [What's coming](#28-whats-coming)
 
 ---
 
@@ -609,7 +614,7 @@ When every route is used up, the session is `parked`, and `ocl status` shows the
 
 ```bash
 ocl status                       # nodes, sessions (state, todos, tokens, cost), tasks, totals
-watch -n2 ocl status             # poor man's dashboard until the web UI (Phase 4)
+ocl tui                          # dashboard in the terminal (or the web dashboard, §23)
 ocl events --limit 100           # recent event log
 ocl events -f                    # follow live
 ocl events -f --session s-81c2…  # one session: tool calls, state changes, turn ends
@@ -1065,11 +1070,146 @@ The lifecycle is `running → stopping → harvesting → stopped → reaped`. A
 
 ---
 
-## 23. What's coming
+## 23. The web dashboard and login
+
+The supervisor serves the dashboard itself (no separate web server): open `http://127.0.0.1:7700` on the hub, or your domain once HTTPS is set up (§24).
+
+```bash
+ocl-supervisor user set admin                 # asks for a password (≥ 10 characters)
+ocl-supervisor user set alice --scope operate # read | operate | admin, as for API tokens
+ocl-supervisor user totp admin                # authenticator-app codes (prints the secret / otpauth:// URI)
+ocl-supervisor user list
+```
+
+**Views:**
+- **Overview:** a status strip (nodes, providers waiting for a reset, questions, halts) and live instances grouped by node.
+- **Instances:** filter, and group by node, egress IP, template, task or status. Each instance has:
+  - tokens, cost, CPU, memory and disk;
+  - todos, activity, the chain, *what it was told*, placement, outputs and recovery;
+  - a message box (queue or steer);
+  - Interrupt, Stop and **Open in OpenCode**.
+- **Questions:** the inbox (§19) with one-click answers, the question mode, history and the assumption log.
+- **Tasks:** the bucket, drag to reorder (or ▲/▼ on a phone), halts with priced recovery buttons, workflows and runs.
+- **Quotas:** allowances with reset countdowns and overrides, plus egress IPs.
+- **Templates:** where each can run, and **New instance** with the overrides the template allows.
+- **Nodes & proxies:**
+  - host load, memory and disk;
+  - **Add machine** (shows the join command);
+  - approve, revoke and forget;
+  - the allowed source IPs;
+  - live route changes per agent, and **Write to YAML** to make one permanent.
+- **Artifacts:** search, lineage, upload and download.
+- **Notifications, Audit and Settings:** theme, password, users and push.
+
+Statuses always show a colour, an icon and a word: running ● (pulsing), idle, waiting ?, parked ◷, error, dead ✗ on a striped card, halted, stopped. Each node has a stable colour, used for the card's edge and its chip. Dark mode follows the system, or the toggle (remembered). On a phone the navigation is a bottom tab bar. The dashboard is a PWA ("Add to Home Screen").
+
+**Logging in:**
+- **Session:** a browser session lasts `login.session_hours` (12 h).
+- **Lockouts:** five failed logins in 15 minutes lock that account for 15 min, doubling each time (max 24 h). Twenty from one IP block that IP. A lockout is a vital notification, and every login, failure and logout is audited.
+- **Protection:** changes from the browser need the CSRF token the UI sends automatically.
+- **Scripts:** API tokens (`Authorization: Bearer`) keep working.
+
+---
+
+## 24. HTTPS on your domain
+
+Point your domain's DNS record at the hub (the only DNS needed), open ports 80 and 443, then:
+
+```yaml
+# supervisor.yaml
+api_listen: 0.0.0.0:443
+tls:
+  acme:
+    domains: [ocl.example.org]
+    email: you@example.org
+    http01_listen: 0.0.0.0:80      # challenges; everything else redirects to https
+attach_listen: 0.0.0.0:7444        # Open in OpenCode (§25), same certificate
+```
+
+- **First start:** the hub orders the certificate from Let's Encrypt. To try it first, set `directory: https://acme-staging-v02.api.letsencrypt.org/directory`.
+- **Storage:** the certificate is kept in `<data>/acme/` (keys 0600).
+- **Renewal:** it renews 30 days before expiry and is swapped in without a restart.
+- **Ports below 1024:** binding them needs `CAP_NET_BIND_SERVICE` (`AmbientCapabilities=CAP_NET_BIND_SERVICE` in the unit) or root.
+
+**Your own certificate:** `tls: { cert_file: /etc/ocl/fullchain.pem, key_file: /etc/ocl/key.pem }`. Replacing the files is picked up within a minute. It must be a server certificate: a self-signed certificate that is its own CA is rejected by rustls-based clients. Use a small private CA or mkcert, and give the CLI `OCL_CA_CERT=/path/ca.pem`.
+
+**Behind Caddy or nginx:** keep `api_listen` on loopback, set `trusted_proxies: [127.0.0.1]` (so lockouts see the real client IP and cookies get `Secure`), and proxy both the dashboard port and the attach port.
+
+`ocl` talks to HTTPS with `OCL_URL=https://ocl.example.org`.
+
+---
+
+## 25. Open in OpenCode
+
+**Open in OpenCode** on an instance page opens OpenCode's own web app for that instance, in a new tab. That includes its terminal, file view and session history.
+
+- **Where:** it is served from the hub's `attach_listen` port, a separate origin that OpenCode needs.
+- **How access works:**
+  1. The hub swaps a one-time, 60-second ticket for an 8-hour cookie.
+  2. The node checks that cookie on **every** request.
+  3. The node adds the container's OpenCode password itself; your browser never sees it.
+- **Bytes:** they travel over the node's existing link, so nodes need no open ports.
+- **One instance per browser:** opening another instance switches to it.
+- **Marking:** the instance shows *attached by …*, and the attach is audited.
+
+In a terminal:
+
+```bash
+ocl attach s-81c2…                  # runs `opencode attach` against a local proxy that adds the cookie
+ocl attach s-81c2… --no-launch      # just prints the local address (e.g. for a second terminal)
+```
+
+---
+
+## 26. Notifications: phone push, ntfy, webhooks
+
+Everything appears in the notification centre (bell, with an unread count). What also goes **out** is decided by rules. By default `warning` and `vital` go to every configured channel, and `info` stays in the dashboard. During quiet hours only `vital` goes out.
+
+- **Phone push (Web Push):**
+  1. Open **Notifications → Enable push on this device** (needs HTTPS).
+  2. On an iPhone, first use "Add to Home Screen".
+  3. Push works with the tab closed. Vital ones stay on screen until you react, and tapping one opens the right page.
+- **ntfy:**
+  ```yaml
+  notifications:
+    ntfy: { url: https://ntfy.sh/my-private-topic, token: "env:NTFY_TOKEN" }
+  ```
+- **Webhook:** set `webhook: { url: …, secret: "file:/etc/ocl/hook" }`. It POSTs JSON `{title, body, kind, severity, target, id, ts}`, signed with `X-OCL-Signature: sha256=…`.
+- **Rules:** `rules: [{ kinds: ["question.*", "task.halted"], min_severity: info, channels: [push] }]`. Event kinds are listed in CONFIG.md.
+- **Test:** **Send a test** on the Notifications page, or `curl -X POST …/api/v1/notifications/test`.
+
+What triggers them:
+- questions waiting for you;
+- halts, and dead agents recovered automatically;
+- tasks and runs finishing;
+- nodes going offline or coming back;
+- an allowance used up or reset;
+- a session at 80% of its budget;
+- a provider refusing its key, or unreachable;
+- disk at 90%;
+- login lockouts;
+- certificate problems.
+
+---
+
+## 27. The terminal dashboard
+
+```bash
+ocl tui
+```
+
+- **Views:** instances, questions, halts with tasks, and nodes. Switch with `1`–`4` or Tab.
+- **Keys:** ↑/↓ select, Enter shows details, `a` answers a question, `m` messages an instance, `x` stops it, `r` recovers a halt (cheapest option), `q` quits.
+- **Refresh:** every 2 s.
+- **Remote use:** it works over SSH with the same API token as `ocl`.
+
+---
+
+## 28. What's coming
 
 | Feature | Phase |
 |---|---|
 | ~~Remote nodes over mTLS, join tokens, `via_node` routes, quotas and failover, templates~~ | 2 ✔ (web UI for these: 4) |
 | ~~Artifact store, cross-machine shared workspaces, lineage, questions and escalation, dead-agent recovery and halts, harvesting~~ | 3 ✔ (UI views and push notifications for these: 4) |
-| Web UI (SolidJS, mobile-first: live sessions, drag-to-sort task board, enrollment), TUI, password login, built-in TLS | 4 |
+| ~~Web UI (SolidJS, mobile-first), TUI, password login, built-in TLS, Open in OpenCode, notifications~~ | 4 ✔ |
 | Load test (~10 sessions), pre-warmed containers, Quadlet units, event export, keyproxy usage metering | 5 |

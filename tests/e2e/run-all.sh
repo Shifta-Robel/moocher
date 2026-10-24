@@ -2,7 +2,11 @@
 # Run every e2e suite; prints a summary and exits non-zero if any failed.
 cd "$(dirname "$0")"
 rc=0
-for t in enroll relay quota templates stats resilience artifacts questions death harvest; do
+# Optional suites need extra tools: acme (PEBBLE_DIR), ui (PW_DIR + Chromium).
+suites="enroll relay quota templates stats resilience artifacts questions death harvest web"
+[ -n "${PEBBLE_DIR:-}" ] && suites="$suites acme"
+[ -n "${PW_DIR:-}" ] && suites="$suites ui"
+for t in $suites; do
   if ./$t.sh > "${OCL_E2E_DIR:-/tmp/ocl-e2e}/$t.out" 2>&1; then
     printf '%-12s ok    (%s checks)\n' "$t" "$(grep -c "32mPASS" "${OCL_E2E_DIR:-/tmp/ocl-e2e}/$t.out")"
   else

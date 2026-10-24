@@ -1,6 +1,6 @@
-# opencode-cluster — Architecture (v1, after Phase 2)
+# opencode-cluster — Architecture (v1, after Phase 4)
 
-> Status: Phases 1 and 2 implemented and verified end to end (see [`PHASE1.md`](./PHASE1.md), [`PHASE2.md`](./PHASE2.md)). Operations: [`RUNBOOK.md`](./RUNBOOK.md). Phase 0 notes: [`PHASE0.md`](./PHASE0.md). Running it: [`QUICKSTART.md`](./QUICKSTART.md). Config reference: [`CONFIG.md`](./CONFIG.md). Design additions (reviewed): [`PHASE1_5.md`](./PHASE1_5.md) (§12).
+> Status: Phases 1–4 implemented and verified end to end (see [`PHASE1.md`](./PHASE1.md), [`PHASE2.md`](./PHASE2.md), [`PHASE3.md`](./PHASE3.md), [`PHASE4.md`](./PHASE4.md)). Operations: [`RUNBOOK.md`](./RUNBOOK.md). Phase 0 notes: [`PHASE0.md`](./PHASE0.md). Running it: [`QUICKSTART.md`](./QUICKSTART.md). Config reference: [`CONFIG.md`](./CONFIG.md). Design additions (reviewed): [`PHASE1_5.md`](./PHASE1_5.md) (§12).
 > Sections marked **(Phase N)** describe designed-but-not-yet-built parts.
 
 ## 1. Goals in one paragraph
@@ -49,8 +49,8 @@ flowchart LR
 | `node-daemon/` (`opencode-node`) | Rust | Reads `~/.opencode-cluster/` (hot reload), manages Podman containers (podman CLI), drives OpenCode over its HTTP API, follows its event bus, runs **keyproxy** and **cluster MCP**, keeps an outbox and replays it after supervisor outages, reconciles on its own restart. | < 40 MB RSS (OpenCode containers excluded; ~420 MB each, measured) |
 | `ocl-bridge` | Rust, static musl, ~1 MB | Runs inside each container. Forwards UDS ⇄ loopback TCP in both directions, so the container needs **no network at all**. | negligible |
 | `shared-protocol/` | protobuf + Rust crate | gRPC node⇄supervisor envelope + JSON payload enums, REST DTOs, config schema with JSON Schema output (`opencode-node schema`). | — |
-| `ui/web` **(Phase 4)** | SolidJS + Vite, static build embedded in supervisor (rust-embed) | Mobile-first dashboard: agents, live tokens/cost, verdicts, task board with drag-to-reorder, node enrollment tokens, artifacts, command bar. | < 150 KB gz |
-| `cli/` (`ocl`) ✔ · `ui/tui` **(Phase 4)** | Rust (clap; ratatui) | Same actions as the web UI, for scripting and for SSH-only use. | — |
+| `ui/web` ✔ | SolidJS + Tailwind v4 + Kobalte (Vite), built into `supervisor/ui-dist` and embedded (rust-embed) | Mobile-first PWA dashboard: every view in PHASE1_5 §13c, live over SSE, Web Push service worker. | ~85 KB gz total (43 KB first load) |
+| `cli/` (`ocl`, `ocl tui`, `ocl attach`) ✔ | Rust (clap; ratatui) | Same actions as the web UI, for scripting and for SSH-only use. | — |
 
 ## 3. Key design decisions
 
@@ -111,19 +111,22 @@ We chose this over a pre-shared bearer token because:
 The operator UI uses ordinary server TLS (rustls; ACME, or a supervisor-CA certificate the operator trusts).
 
 **Adding a machine (API and CLI in Phase 2, web UI in Phase 4), as requested:**
-1. The operator (admin scope) runs `ocl node invite <name> [--relay]`, or in Phase 4 uses **Nodes → Add machine** with re-authentication. The API is `POST /api/v1/nodes/invite`.
+1. The operator (admin scope) runs `ocl node invite <name> [--relay]`, or uses **Nodes → Add machine** in the dashboard (admin scope). The API is `POST /api/v1/nodes/invite`.
 2. The reply carries a one-time join token (single use, 15 min, bound to that name and role) and a copy-paste command: `opencode-node join https://hub:7443 --token ocljoin.…`.
 3. The new machine generates its key locally, sends the CSR with the token, and receives its certificate plus the hub's CA. Then it starts `opencode-node` under systemd.
-4. The node shows up as **pending approval**. The operator approves it with `ocl node approve <name>` (in the UI from Phase 4; approval is optional and on by default). From then on its agents are eligible.
+4. The node shows up as **pending approval**. The operator approves it with `ocl node approve <name>` (or **Approve** in the dashboard; approval is optional and on by default). From then on its agents are eligible.
 5. Revoking a node (`ocl node revoke`) flags its certificates and closes its stream immediately.
 
 Every step is in the audit log. The token is useless after first use or once expired, and a leaked token can only enroll the name it was issued for, which is still subject to approval.
 
-**D6 — Operator authentication uses a password, a cookie and optional TOTP, plus API tokens for the CLI.**
-- **Password:** hashed with Argon2id.
-- **Session cookie:** `HttpOnly; Secure; SameSite=Strict`, plus a CSRF token on mutations.
-- **TOTP:** optional.
+**D6 — Operator authentication uses a password, a cookie and optional TOTP, plus API tokens for the CLI.** (Implemented in Phase 4.)
+- **Password:** hashed with Argon2id; users have the same `read|operate|admin` scopes as tokens (`ocl-supervisor user set`).
+- **Session cookie:** a random token kept only as its SHA-256; `HttpOnly; SameSite=Strict`, `Secure` over HTTPS; a CSRF token (`X-CSRF-Token`) on every change.
+- **TOTP:** optional (RFC 6238), each code accepted once.
+- **Lockouts:** per account and per source IP, doubling up to 24 h, with vital notifications; everything audited.
 - **CLI:** API tokens scoped to `read|operate|admin`.
+- **HTTPS:** rustls with a certificate from files or ACME HTTP-01 (instant-acme), hot-swapped on renewal; or a reverse proxy with `trusted_proxies`.
+- **Open in OpenCode:** a second origin (`attach_listen`); one-time ticket → cookie; the hub splices each browser connection through a node tunnel to an HTTP proxy on the node, which checks the cookie hash on every request and adds the container's OpenCode password.
 
 We chose this over OAuth because there is one trusted operator, everything is self-hosted, and the hub must keep working without an external IdP. Users and roles are already modelled, so OIDC can be added later as a login provider when we go multi-user.
 
@@ -218,7 +221,7 @@ sequenceDiagram
 
 ## 5a. Task bucket and the main agent
 
-The operator keeps a **bucket of tasks** (CLI now, web UI in Phase 4) and the cluster works through it.
+The operator keeps a **bucket of tasks** (CLI, dashboard and TUI) and the cluster works through it.
 
 | Label | When it starts |
 |---|---|
@@ -266,7 +269,7 @@ OpenCode agents already keep a todo list (the built-in `todowrite` tool). Each i
   - **FAIL** means a seeded todo was `cancelled`, the session errored, or a hard check failed.
   - **INCOMPLETE** means the session went idle with open items. The workflow can re-prompt ("continue with your open todos") up to `max_nudges` times.
 - **Optional hard checks** (`exit_code`, `test`, `regex`, `exec`) guard against an agent ticking boxes it didn't actually finish. The demo uses `pytest -q`.
-- **Sharing todos between agents.** `cluster_session_status` returns another session's todo list, so a reviewer or coordinator can see what a builder claimed to finish. A per-task rolled-up board is part of the Phase 4 UI.
+- **Sharing todos between agents.** `cluster_session_status` returns another session's todo list, so a reviewer or coordinator can see what a builder claimed to finish. The dashboard shows each instance's todos; a single rolled-up board per task is not built yet.
 
 ## 6b. Workspaces (configurable: isolated or shared)
 
@@ -346,7 +349,11 @@ This needs no git in the workspace and behaves the same for any tree. Syncs happ
 | Capability tokens | Container `opencode.json` | That agent. Scoped to its session, budget-capped, revoked when the session ends. |
 | Node private key | Node `0600` file or systemd-cred | That node. |
 | Operator API tokens | Supervisor DB, SHA-256 hashed, scoped `read`/`operate`/`admin` | Shown once at creation. |
-| Operator password | Supervisor DB (Argon2id) **(Phase 4)** | — |
+| Operator password | Supervisor DB (Argon2id) | — |
+| Browser sessions | Supervisor DB, SHA-256 of the cookie | The browser (HttpOnly cookie). |
+| VAPID key (Web Push) | Hub `<data>/vapid.key` (0600) | The supervisor. |
+| ACME account and certificate keys | Hub `<data>/acme/` (0600) | The supervisor. |
+| Container OpenCode passwords | Node store | That node; added by its attach proxy, never sent to the hub or browser. |
 | Cluster CA key | Hub `<data>/supervisor/pki/ca.key` (0600) | The supervisor. Replacing it means re-enrolling nodes (RUNBOOK §4.4). |
 | Join tokens | Supervisor DB, SHA-256 hashed | Shown once; single use; 15 min; bound to one name and role. |
 | Secret aliases | Each node's `node.yaml` `secrets:` (references only) | Hub templates name the alias; the value is resolved on the node. The hub never holds keys. |
@@ -354,7 +361,7 @@ This needs no git in the workspace and behaves the same for any tree. Syncs happ
 - **Network hops:**
   - Same-machine links use 0600 unix sockets.
   - Remote nodes use mTLS (TLS 1.3, Ed25519) with certificate-fingerprint identity, approval, revocation, and an optional source allowlist (`enforce_for: relay|all`).
-  - The UI gets server TLS in Phase 4. Until then, keep `api_listen` on loopback or put a TLS reverse proxy in front; the supervisor warns otherwise.
+  - The dashboard/API: built-in TLS (files or ACME) or a TLS proxy; plain HTTP beyond loopback logs a warning. The UI ships a strict CSP (`default-src 'self'`, no inline scripts), `X-Frame-Options: DENY`, `nosniff`.
   - Container↔node traffic stays on the host over UDS.
 - **Relayed LLM traffic** is TLS end to end. A relay sees only ciphertext and the destination host:port, and it only connects to its allowed ports and hosts. The local SOCKS entry point needs a per-daemon password, and containers cannot reach it anyway (`--network=none`).
 - **Live changes:** route and quota overrides from the operator are written to the node's `overrides.yaml` and audited at the hub. Nodes can refuse hub templates (`hub_templates: false`).
@@ -380,7 +387,7 @@ opencode-cluster/
                           cas,wsops}.rs
   bridge/            ocl-bridge (static musl)
   cli/               ocl (clap)
-  ui/                web (SolidJS) + tui (ratatui) — Phase 4
+  ui/web/            dashboard (SolidJS + Tailwind + Kobalte); built into supervisor/ui-dist
   images/agent/      Containerfile
   examples/          quickstart/ (hub config + run-local.sh), remote/ (hub, worker, relay configs), mock-llm/
   tests/e2e/         enroll, relay, quota, templates, stats, resilience, artifacts, questions, death, harvest

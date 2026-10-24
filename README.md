@@ -4,19 +4,20 @@ Run [OpenCode](https://opencode.ai) agents across several Linux machines as one 
 
 - **Supervisor** (hub): node registry, workflows (plan → build → review), a **task bucket** worked by a coordinator "main agent", REST/SSE API, hash-chained audit log. It holds no provider secrets.
 - **opencode-node** (every machine, including the hub): runs each OpenCode session in a locked-down **Podman** container (no network, read-only config, all capabilities dropped). It injects provider keys through a local proxy, so agents only ever hold a revocable, budget-capped capability token. It also serves the `cluster_*` MCP tools agents use to message, delegate and report.
-- **ocl**: a CLI over the API. The web UI (SolidJS, mobile-first) and TUI come in Phase 4.
+- **Dashboard**: a mobile-first web UI served by the supervisor (password login, HTTPS on your domain via Let's Encrypt, phone push), plus `ocl` (CLI) and `ocl tui`.
 - **Remote machines** join with a one-time token (`ocl node invite`, then `opencode-node join`). Relay-only machines lend their IP to other nodes' LLM calls.
 
-Status: **Phase 3 complete**:
+Status: **Phase 4 complete**:
 - remote workers and IP-lending relays over mTLS, with join tokens, approval, revocation and a source allowlist;
 - per-IP / key / account quotas with reset countdowns, and automatic failover to another IP;
 - scored placement, a hub template library and resource stats;
 - a content-addressed **artifact store** with lineage, and shared workspaces that work **across machines** (three-way sync);
 - **questions** that climb the agent chain to you according to a question mode, with an assumption log;
 - **dead agents** detected and recovered by cost (restart, resume on another machine, hand off) or the task **halted** for you, with one-command resume;
-- **harvesting** of declared outputs and transcripts when an instance ends, and retention of its volumes.
+- **harvesting** of declared outputs and transcripts when an instance ends, and retention of its volumes;
+- the **web dashboard** (every view, dark/light, phone layout), **Open in OpenCode** for any instance, notifications to your phone (Web Push), ntfy or a webhook, and a terminal dashboard.
 
-Verified with ten end-to-end suites (`tests/e2e/`). The UI, notifications and built-in auth are Phase 4, hardening Phase 5.
+Verified with thirteen end-to-end suites (`tests/e2e/`), including a real browser and an ACME CA. Hardening is Phase 5.
 
 ```bash
 examples/quickstart/run-local.sh --with-worker   # full demo with a mock LLM
@@ -28,6 +29,7 @@ Docs:
 - [Usage guide](docs/USAGE.md) (extensive examples)
 - [Config reference](docs/CONFIG.md)
 - [Runbook](docs/RUNBOOK.md) (enroll machines, rotate credentials, debug)
+- [Phase 4 report](docs/PHASE4.md)
 - [Phase 3 report](docs/PHASE3.md)
 - [Phase 2 report](docs/PHASE2.md)
 - [Phase 1 report](docs/PHASE1.md)

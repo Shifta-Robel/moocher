@@ -2,7 +2,7 @@
 // (PHASE1_5 §13b), so nothing depends on telling colours apart.
 import { Dialog as KDialog } from "@kobalte/core/dialog";
 import { Toast, toaster } from "@kobalte/core/toast";
-import { For, JSX, Show, createSignal, splitProps } from "solid-js";
+import { For, JSX, Show, createEffect, createSignal, onCleanup, splitProps } from "solid-js";
 import { Dynamic, Portal } from "solid-js/web";
 import * as I from "../icons";
 import type { State, Todo } from "../types";
@@ -236,6 +236,14 @@ export const inputCls =
   "w-full rounded-lg bg-white px-3 py-2 text-sm ring-1 ring-slate-300 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 dark:bg-slate-950 dark:ring-slate-700";
 
 export function Modal(p: { open: boolean; onClose: () => void; title: string; children: JSX.Element; wide?: boolean }) {
+  // Escape closes it even when focus fell back to the page (e.g. the focused
+  // button was replaced by the dialog's next step).
+  createEffect(() => {
+    if (!p.open) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && p.onClose();
+    document.addEventListener("keydown", onKey);
+    onCleanup(() => document.removeEventListener("keydown", onKey));
+  });
   return (
     <KDialog open={p.open} onOpenChange={(o) => !o && p.onClose()}>
       <KDialog.Portal>

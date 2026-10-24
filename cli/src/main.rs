@@ -20,6 +20,9 @@ struct Cli {
     url: String,
     #[arg(long, env = "OCL_TOKEN", hide_env_values = true, global = true)]
     token: Option<String>,
+    /// Extra CA certificate (PEM) to trust for the hub's HTTPS (self-signed or private CA).
+    #[arg(long, env = "OCL_CA_CERT", global = true)]
+    ca_cert: Option<std::path::PathBuf>,
     /// Print raw JSON.
     #[arg(long, global = true)]
     json: bool,
@@ -571,7 +574,13 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let api = Api { base: cli.url.trim_end_matches('/').to_string(), token: token(&cli)?, http: reqwest::Client::new() };
+    // No redirects: `ocl attach` needs the cookie from the ticket's 302 itself.
+    let mut hb = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    if let Some(ca) = &cli.ca_cert {
+        let pem = std::fs::read(ca).with_context(|| format!("reading {}", ca.display()))?;
+        hb = hb.add_root_certificate(reqwest::Certificate::from_pem(&pem)?);
+    }
+    let api = Api { base: cli.url.trim_end_matches('/').to_string(), token: token(&cli)?, http: hb.build()? };
     let raw = cli.json;
     let out = |v: &Value| println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
     match cli.cmd {

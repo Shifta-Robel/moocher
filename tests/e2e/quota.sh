@@ -65,9 +65,8 @@ grep -q "127.0.0.2" "$W/worker-b/overrides.yaml" && pass "override written to wo
 TURNS=$($O events --session "$SID" --limit 1000 --json | grep -c session.turn_ended)
 $O send "$SID" "Please also add a docstring to greet()." >/dev/null
 wait_for 30 "session is parked while both IPs are used up" bash -c "[ \"\$(SESS_FIELD $SID state)\" = parked ] 2>/dev/null || $O show $SID --json | grep -q '\"state\": \"parked\"'"
-sleep 4
-echo "  current task: $($O show "$SID" --json | python3 -c 'import sys,json;print((json.load(sys.stdin).get("current_task") or "")[:220])')"
-$O show "$SID" --json | python3 -c 'import sys,json;t=json.load(sys.stdin).get("current_task") or "";sys.exit(0 if t.startswith("resets in") else 1)' && pass "parked session shows the reset countdown" || fail "parked session shows the reset countdown"
+# Read the countdown while it is parked (it may resume within seconds).
+wait_for 20 "parked session shows the reset countdown" bash -c "$O show $SID --json | python3 -c 'import sys,json;s=json.load(sys.stdin);t=s.get(\"current_task\") or \"\";print(\"  current task:\", t[:200], file=sys.stderr);sys.exit(0 if s[\"state\"]==\"parked\" and t.startswith(\"resets in\") else 1)'"
 wait_for 120 "session resumes by itself after the reset and finishes the turn" bash -c "[ \$($O events --session $SID --limit 1000 --json | grep -c session.turn_ended) -gt $TURNS ]"
 grep -q '"""' "$W/worker-b/data/workspaces/$SID/greet.py" && pass "docstring added after resuming" || fail "docstring added after resuming"
 $O events --session "$SID" --limit 1000 | contains quota.parked && pass "quota.parked event recorded" || fail "quota.parked event recorded"
