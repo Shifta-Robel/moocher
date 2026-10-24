@@ -14,6 +14,8 @@ pub const CONTAINER_UID: u32 = 1000;
 /// Loopback port inside the container where the node gateway is reachable.
 pub const GATEWAY_PORT: u16 = 7777;
 const OPENCODE_PORT: u16 = 4096;
+/// Loopback port inside the container for the allowlist egress proxy.
+const PROXY_PORT: u16 = 3128;
 
 #[derive(Debug, Clone)]
 pub struct InstancePaths {
@@ -32,6 +34,10 @@ impl InstancePaths {
     }
     pub fn oc_sock(&self) -> PathBuf {
         self.run.join("oc.sock")
+    }
+    /// The node's egress proxy for `egress: allowlist`.
+    pub fn proxy_sock(&self) -> PathBuf {
+        self.run.join("proxy.sock")
     }
 }
 
@@ -201,7 +207,7 @@ impl Runtime {
             a.push("--label".into());
             a.push(format!("{k}={v}"));
         }
-        if s.container.egress == Egress::None {
+        if s.container.egress != Egress::Full {
             a.push("--network=none".into());
         }
         a.extend(
@@ -221,7 +227,8 @@ impl Runtime {
         if self.rootless {
             a.push(format!("--userns=keep-id:uid={CONTAINER_UID},gid={CONTAINER_UID}"));
         }
-        for (k, v) in opencode_env(s.password, "/etc/ocl") {
+        let allowlist = s.container.egress == Egress::Allowlist;
+        for (k, v) in opencode_env(s.password, "/etc/ocl").into_iter().chain(if allowlist { proxy_env(PROXY_PORT) } else { vec![] }) {
             a.push("-e".into());
             a.push(format!("{k}={v}"));
         }
@@ -231,6 +238,9 @@ impl Runtime {
             a.push(format!("{}:{}{}", host.display(), ctr, if ro { ":ro" } else { "" }));
         }
         a.push(s.image.into());
+        if allowlist {
+            a.extend(["--fwd".into(), format!("tcp:127.0.0.1:{PROXY_PORT}=unix:/run/ocl/proxy.sock")]);
+        }
         a.extend([
             "--fwd".into(),
             format!("tcp:127.0.0.1:{GATEWAY_PORT}=unix:/run/ocl/node.sock"),
@@ -258,8 +268,15 @@ impl Runtime {
         cmd.arg("--fwd")
             .arg(format!("tcp:127.0.0.1:{gw}=unix:{}", p.node_sock().display()))
             .arg("--fwd")
-            .arg(format!("unix:{}=tcp:127.0.0.1:{oc}", p.oc_sock().display()))
-            .arg("--")
+            .arg(format!("unix:{}=tcp:127.0.0.1:{oc}", p.oc_sock().display()));
+        if s.container.egress == Egress::Allowlist {
+            let px = free_port()?;
+            cmd.arg("--fwd").arg(format!("tcp:127.0.0.1:{px}=unix:{}", p.proxy_sock().display()));
+            for (k, v) in proxy_env(px) {
+                cmd.env(k, v);
+            }
+        }
+        cmd.arg("--")
             .arg(&self.opencode_bin)
             .args(["serve", "--port", &oc.to_string(), "--hostname", "127.0.0.1"])
             .current_dir(&p.workspace)
@@ -435,6 +452,15 @@ fn opencode_env(password: &str, config_dir: &str) -> Vec<(&'static str, String)>
         ("OPENCODE_DISABLE_LSP_DOWNLOAD", "1".into()),
         ("OPENCODE_DISABLE_CLAUDE_CODE", "1".into()),
     ]
+}
+
+/// Every common spelling, so curl, pip, git, npm and Bun all use the proxy.
+fn proxy_env(port: u16) -> Vec<(&'static str, String)> {
+    let url = format!("http://127.0.0.1:{port}");
+    let mut v: Vec<(&'static str, String)> = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"].into_iter().map(|k| (k, url.clone())).collect();
+    v.push(("NO_PROXY", "127.0.0.1,localhost".into()));
+    v.push(("no_proxy", "127.0.0.1,localhost".into()));
+    v
 }
 
 fn free_port() -> Result<u16> {

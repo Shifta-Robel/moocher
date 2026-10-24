@@ -571,6 +571,11 @@ impl Manager {
             })
         };
         inst.tasks.lock().unwrap().extend([h, watch]);
+        let allowlist = self.cfg.get().agents.get(&inst.agent).is_some_and(|a| a.cfg.container.egress == ocl_protocol::config::Egress::Allowlist);
+        if allowlist {
+            let px = crate::egress_proxy::EgressProxy::new(&inst.id, &inst.agent, self.cfg.clone(), self.link.clone());
+            inst.tasks.lock().unwrap().push(px.serve(inst.paths.proxy_sock())?);
+        }
         Ok(())
     }
 

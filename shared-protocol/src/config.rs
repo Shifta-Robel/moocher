@@ -1353,8 +1353,16 @@ pub struct ContainerSpec {
     #[serde(default = "default_pids")]
     pub pids: u32,
     /// `none` (default): no network at all, everything goes through the node socket.
+    /// `allowlist`: still no network, but an HTTP(S) proxy on the node lets
+    /// through connections to `allow_hosts` only.
     #[serde(default)]
     pub egress: Egress,
+    /// For `egress: allowlist`: `pypi.org`, `*.pythonhosted.org` (subdomains),
+    /// `host:port` (without a port: 80 and 443), or an IP literal. A host
+    /// that resolves to a private or loopback address is refused unless that
+    /// address is listed itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_hosts: Vec<String>,
     /// Disk the instance may use (workspace + OpenCode home), e.g. `5g`. Soft
     /// limit: at 90% the agent is told, at 100% it is interrupted.
     #[serde(default)]
@@ -1370,7 +1378,7 @@ fn default_tmp() -> String {
 
 impl Default for ContainerSpec {
     fn default() -> Self {
-        ContainerSpec { image: None, memory: default_memory(), cpus: default_cpus(), pids: default_pids(), egress: Egress::None, disk: None, tmp: default_tmp() }
+        ContainerSpec { image: None, memory: default_memory(), cpus: default_cpus(), pids: default_pids(), egress: Egress::None, allow_hosts: vec![], disk: None, tmp: default_tmp() }
     }
 }
 
@@ -1389,6 +1397,8 @@ fn default_pids() -> u32 {
 pub enum Egress {
     #[default]
     None,
+    /// HTTP(S) through the node's proxy, to `allow_hosts` only.
+    Allowlist,
     /// Container gets normal networking (package installs, webfetch). Use sparingly.
     Full,
 }
@@ -1577,6 +1587,16 @@ impl AgentConfig {
                 }
             }
         }
+        match (self.container.egress, self.container.allow_hosts.is_empty()) {
+            (Egress::Allowlist, true) => errs.push("container.egress=allowlist needs container.allow_hosts".into()),
+            (Egress::None | Egress::Full, false) => errs.push("container.allow_hosts is only used with container.egress=allowlist".into()),
+            _ => {}
+        }
+        for h in &self.container.allow_hosts {
+            if let Err(e) = HostPattern::parse(h) {
+                errs.push(format!("container.allow_hosts: {e}"));
+            }
+        }
         if self.workspace.mode == WorkspaceMode::Shared && self.workspace.name.is_none() {
             errs.push("workspace.mode=shared requires workspace.name".into());
         }
@@ -1596,6 +1616,61 @@ impl AgentConfig {
     }
 }
 
+/// One `allow_hosts` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPattern {
+    /// Lower-case host; `suffix` = `*.` form (subdomains of `host`).
+    pub host: String,
+    pub suffix: bool,
+    /// None = 80 and 443.
+    pub port: Option<u16>,
+}
+
+impl HostPattern {
+    pub fn parse(s: &str) -> Result<HostPattern, String> {
+        let s = s.trim().to_ascii_lowercase();
+        // `[v6]:port`, `v6`, `host:port`, `host`.
+        let (host, port) = if let Some(rest) = s.strip_prefix('[') {
+            let (h, after) = rest.split_once(']').ok_or_else(|| format!("{s:?}: unclosed ["))?;
+            (h.to_string(), after.strip_prefix(':'))
+        } else if s.matches(':').count() == 1 {
+            let (h, p) = s.split_once(':').unwrap();
+            (h.to_string(), Some(p))
+        } else {
+            (s.clone(), None)
+        };
+        let port = match port {
+            Some(p) => Some(p.parse::<u16>().ok().filter(|p| *p > 0).ok_or_else(|| format!("{s:?}: bad port"))?),
+            None => None,
+        };
+        let (host, suffix) = match host.strip_prefix("*.") {
+            Some(h) => (h.to_string(), true),
+            None => (host, false),
+        };
+        let ok = host.parse::<std::net::IpAddr>().is_ok() || (!host.is_empty() && host.split('.').all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')));
+        if !ok || (suffix && host.parse::<std::net::IpAddr>().is_ok()) {
+            return Err(format!("{s:?} is not a host name, *.domain or IP address"));
+        }
+        Ok(HostPattern { host, suffix, port })
+    }
+
+    pub fn matches(&self, host: &str, port: u16) -> bool {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        let port_ok = match self.port {
+            Some(p) => p == port,
+            None => port == 80 || port == 443,
+        };
+        let host_ok = if self.suffix { host.len() > self.host.len() && host.ends_with(&format!(".{}", self.host)) } else { host == self.host };
+        port_ok && host_ok
+    }
+
+    /// The entry names an address itself (so private addresses are fine).
+    pub fn is_ip(&self) -> bool {
+        self.host.parse::<std::net::IpAddr>().is_ok()
+    }
+}
+
 /// JSON Schemas for editor validation (`opencode-node schema`).
 pub fn schemas() -> BTreeMap<&'static str, serde_json::Value> {
     let mut m = BTreeMap::new();
@@ -1612,6 +1687,20 @@ pub fn schemas() -> BTreeMap<&'static str, serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_patterns() {
+        let p = |s: &str| HostPattern::parse(s).unwrap();
+        assert!(p("PyPI.org").matches("pypi.org", 443) && p("pypi.org").matches("pypi.org.", 80));
+        assert!(!p("pypi.org").matches("pypi.org", 8080) && !p("pypi.org").matches("evil-pypi.org", 443));
+        assert!(p("*.pythonhosted.org").matches("files.pythonhosted.org", 443));
+        assert!(!p("*.pythonhosted.org").matches("pythonhosted.org", 443) && !p("*.pythonhosted.org").matches("xpythonhosted.org", 443));
+        assert!(p("127.0.0.1:8099").matches("127.0.0.1", 8099) && !p("127.0.0.1:8099").matches("127.0.0.1", 443));
+        assert!(p("[::1]:80").matches("[::1]", 80) && p("::1").matches("::1", 443) && p("::1").is_ip());
+        for bad in ["", "*.1.2.3.4", "a b", "host:0", "host:x", "a..b"] {
+            assert!(HostPattern::parse(bad).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn agent_yaml_roundtrip() {

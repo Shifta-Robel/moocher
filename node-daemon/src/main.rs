@@ -4,6 +4,7 @@ mod attach;
 mod cas;
 mod cfgstore;
 mod egress;
+mod egress_proxy;
 mod gateway;
 mod link;
 mod manager;
