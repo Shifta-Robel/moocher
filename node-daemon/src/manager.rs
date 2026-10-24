@@ -92,7 +92,8 @@ pub struct Instance {
     pending_prompts: Mutex<Vec<(String, Delivery)>>,
     stopping: AtomicBool,
     /// A turn is in progress and its end has not been reported yet.
-    turn_open: AtomicBool,
+    /// Shared with the gateway: usage is compared with OpenCode's between turns.
+    turn_open: Arc<AtomicBool>,
 }
 
 pub fn random_hex(bytes: usize) -> String {
@@ -441,7 +442,7 @@ impl Manager {
             disk_warned: AtomicBool::new(false),
             disk_over: AtomicBool::new(false),
             prompted_at: std::sync::atomic::AtomicI64::new(0),
-            turn_open: AtomicBool::new(matches!(report.state, SessionState::Running | SessionState::Blocked | SessionState::Parked)),
+            turn_open: Arc::new(AtomicBool::new(matches!(report.state, SessionState::Running | SessionState::Blocked | SessionState::Parked))),
             report: Mutex::new(report),
             msg_usage: Mutex::new(HashMap::new()),
             seen_tools: Mutex::new(HashSet::new()),
@@ -580,7 +581,7 @@ impl Manager {
             root: inst.paths.workspace.clone(),
             runtime_path: self.rt.workspace_in_runtime(&inst.paths),
         };
-        let gw = Gateway::new(&inst.id, &inst.agent, inst.role, cap, inst.usage.clone(), inst.metered.clone(), inst.parked.clone(), inst.overrides.clone(), ws, &self.gw);
+        let gw = Gateway::new(&inst.id, &inst.agent, inst.role, cap, inst.usage.clone(), inst.metered.clone(), inst.turn_open.clone(), inst.parked.clone(), inst.overrides.clone(), ws, &self.gw);
         *inst.gateway.lock().unwrap() = Some(gw.clone());
         let h = gw.serve(inst.paths.node_sock())?;
         // Publish keyproxy's count as it moves (OpenCode's events do not cover it).
@@ -1018,6 +1019,8 @@ impl Manager {
         }
         if let Some(gw) = inst.gateway.lock().unwrap().clone() {
             gw.settle_tokens();
+            // OpenCode's count for the turn is final now (history absorbed).
+            gw.check_mismatch();
         }
         if inst.stopping.load(Ordering::Relaxed) {
             return; // stopped while we were collecting; not a finished turn

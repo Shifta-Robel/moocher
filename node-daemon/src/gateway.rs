@@ -42,6 +42,8 @@ pub struct Gateway {
     pub usage: Arc<Mutex<TokenUsage>>,
     /// keyproxy's own count of the same work (usage.rs).
     metered: Arc<crate::usage::Metered>,
+    /// The instance is in a turn: OpenCode's count may lag until it ends.
+    in_turn: Arc<std::sync::atomic::AtomicBool>,
     /// `usage.mismatch` was reported (once per session).
     mismatch_warned: Arc<std::sync::atomic::AtomicBool>,
     link: LinkHandle,
@@ -93,6 +95,7 @@ impl Gateway {
         cap: &str,
         usage: Arc<Mutex<TokenUsage>>,
         metered: Arc<crate::usage::Metered>,
+        in_turn: Arc<std::sync::atomic::AtomicBool>,
         parked: Parked,
         overrides: Arc<Mutex<SpawnOverrides>>,
         ws: WsRef,
@@ -106,6 +109,7 @@ impl Gateway {
             cfg: deps.cfg.clone(),
             usage,
             metered,
+            in_turn,
             mismatch_warned: Default::default(),
             link: deps.link.clone(),
             egress: deps.egress.clone(),
@@ -236,6 +240,14 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
     let Some(pdef) = snap.providers.get(&provider).cloned() else {
         return llm_error(StatusCode::BAD_GATEWAY, "provider not configured");
     };
+    // Read the request before any refusal: answering while the client is
+    // still sending a large body resets the connection and loses the answer.
+    let method = req.method().clone();
+    let mut headers = req.headers().clone();
+    let body = match axum::body::to_bytes(req.into_body(), MAX_BODY).await {
+        Ok(b) => b,
+        Err(_) => return llm_error(StatusCode::PAYLOAD_TOO_LARGE, "request too large"),
+    };
     let usage_total = {
         let u = g.effective_usage();
         let budget = g.overrides.lock().unwrap().budget_usd.or(agent.cfg.limits.budget_usd);
@@ -257,12 +269,6 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
             }
         }
         u.total()
-    };
-    let method = req.method().clone();
-    let mut headers = req.headers().clone();
-    let body = match axum::body::to_bytes(req.into_body(), MAX_BODY).await {
-        Ok(b) => b,
-        Err(_) => return llm_error(StatusCode::PAYLOAD_TOO_LARGE, "request too large"),
     };
     // Model allowlist: JSON bodies name the model (OpenAI/Anthropic); Gemini puts it in the path.
     let mut body = body;
@@ -426,12 +432,15 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
             crate::usage::Meter::new(pdef.api, &ct, move |mut u| {
                 crate::usage::price(&mut u, price.as_ref());
                 g.metered.add(&u);
-                // OpenCode accounts a step when it has processed the response;
-                // compare once it surely has (under load that takes seconds).
+                // During a turn OpenCode's count can lag (under load until the
+                // turn ends, when the manager compares). A call between turns
+                // was made around OpenCode: compare shortly after it.
                 if let Ok(rt) = tokio::runtime::Handle::try_current() {
                     rt.spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                        g.check_mismatch();
+                        if !g.in_turn.load(std::sync::atomic::Ordering::Relaxed) {
+                            g.check_mismatch();
+                        }
                     });
                 }
             })
@@ -494,7 +503,7 @@ impl Gateway {
     /// The provider billed noticeably more than OpenCode reports: calls made
     /// around OpenCode (the agent has a shell and the capability token), or a
     /// client that drops usage. Budgets already count the larger number.
-    fn check_mismatch(&self) {
+    pub fn check_mismatch(&self) {
         let (r, m) = (*self.usage.lock().unwrap(), self.metered.get());
         if crate::usage::mismatched(r.total(), m.total()) && !self.mismatch_warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
             tracing::warn!(session = %self.id, reported = r.total(), metered = m.total(), "provider usage exceeds what OpenCode reports");
