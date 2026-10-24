@@ -55,12 +55,12 @@ walkdir = "2"
 argon2 = "0.5"
 hmac = "0.12"
 sha1 = "0.10"
-p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+p256 = { version = "0.14", features = ["ecdh", "ecdsa", "getrandom"] }
 hkdf = "0.12"
 aes-gcm = "0.10"
 base64 = "0.22"
 rust-embed = { version = "8", features = ["debug-embed"] }
 instant-acme = { version = "0.7", default-features = false, features = ["ring", "hyper-rustls"] }
 httparse = "1"
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"

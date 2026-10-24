@@ -14,7 +14,7 @@ use base64::Engine;
 use ocl_protocol::config::{NotificationsConfig, NotifyRule};
 use ocl_protocol::model::{now_ms, Notification};
 use p256::ecdsa::signature::Signer;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use serde_json::json;
 use std::path::Path;
 
@@ -35,7 +35,7 @@ impl Notifier {
     pub fn new(data_dir: &Path) -> Notifier {
         let path = data_dir.join("vapid.key");
         let key = std::fs::read(&path).ok().and_then(|b| p256::SecretKey::from_slice(&b).ok()).unwrap_or_else(|| {
-            let k = p256::SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+            let k = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
             if std::fs::create_dir_all(data_dir).is_ok() && std::fs::write(&path, k.to_bytes()).is_ok() {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
@@ -47,7 +47,7 @@ impl Notifier {
 
     /// The VAPID public key (base64url, uncompressed point) browsers subscribe with.
     pub fn vapid_public(&self) -> String {
-        B64.encode(self.vapid.public_key().to_encoded_point(false).as_bytes())
+        B64.encode(self.vapid.public_key().to_sec1_point(false).as_bytes())
     }
 
     /// Which external channels a notification goes to, given the rules and quiet hours.
@@ -165,7 +165,7 @@ impl Notifier {
     fn push_request(&self, endpoint: &str, p256dh: &str, auth: &str, msg: &[u8], subject: &str, urgent: bool) -> Result<reqwest::RequestBuilder> {
         let ua_public = B64.decode(p256dh.trim_end_matches('=')).context("p256dh")?;
         let auth = B64.decode(auth.trim_end_matches('=')).context("auth")?;
-        let eph = p256::SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let eph = <p256::SecretKey as p256::elliptic_curve::Generate>::generate();
         let salt: [u8; 16] = rand::random();
         let body = encrypt_aes128gcm(msg, &ua_public, &auth, &eph, &salt)?;
         let url = reqwest::Url::parse(endpoint)?;
@@ -221,7 +221,7 @@ fn hkdf32(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Vec<u8> {
 /// RFC 8291 §3–4: one aes128gcm record, no padding.
 pub fn encrypt_aes128gcm(plain: &[u8], ua_public: &[u8], auth: &[u8], as_private: &p256::SecretKey, salt: &[u8; 16]) -> Result<Vec<u8>> {
     let ua = p256::PublicKey::from_sec1_bytes(ua_public).map_err(|_| anyhow!("p256dh is not a P-256 public key"))?;
-    let as_public = as_private.public_key().to_encoded_point(false);
+    let as_public = as_private.public_key().to_sec1_point(false);
     let shared = p256::ecdh::diffie_hellman(as_private.to_nonzero_scalar(), ua.as_affine());
     let mut key_info = b"WebPush: info\0".to_vec();
     key_info.extend_from_slice(ua_public);
