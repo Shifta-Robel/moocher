@@ -3,7 +3,7 @@ import { Show } from "solid-js";
 import * as I from "../icons";
 import { state } from "../store";
 import type { Session } from "../types";
-import { ago, money, num, todoProgress } from "../util";
+import { ago, billed, money, num, todoProgress } from "../util";
 import { Card, NodeChip, StatusBadge, nodeColor } from "./ui";
 
 export default function InstanceCard(p: { s: Session }) {
@@ -32,8 +32,8 @@ export default function InstanceCard(p: { s: Session }) {
             <I.ListChecks class="size-3.5" />
             {todoProgress(p.s.todos)}
           </span>
-          <span title="tokens">{num(p.s.tokens.input + p.s.tokens.output + p.s.tokens.reasoning)} tok</span>
-          <span title="cost">{money(p.s.tokens.cost_usd)}</span>
+          <span title="tokens">{num(billed(p.s).total)} tok</span>
+          <span title="cost">{money(billed(p.s).cost_usd)}</span>
           <span class="ml-auto" title="age">{ago(p.s.started_at)}</span>
           <Show when={p.s.attached_by && (p.s.attached_until ?? 0) > Date.now()}>
             <span class="inline-flex items-center gap-1 text-indigo-600 dark:text-indigo-400" title={`attached by ${p.s.attached_by}`}>

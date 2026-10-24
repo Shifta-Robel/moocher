@@ -40,6 +40,10 @@ pub struct Gateway {
     cap: Arc<String>,
     cfg: ConfigStore,
     pub usage: Arc<Mutex<TokenUsage>>,
+    /// keyproxy's own count of the same work (usage.rs).
+    metered: Arc<crate::usage::Metered>,
+    /// `usage.mismatch` was reported (once per session).
+    mismatch_warned: Arc<std::sync::atomic::AtomicBool>,
     link: LinkHandle,
     egress: Arc<Egress>,
     quotas: Arc<Quotas>,
@@ -88,6 +92,7 @@ impl Gateway {
         role: SessionRole,
         cap: &str,
         usage: Arc<Mutex<TokenUsage>>,
+        metered: Arc<crate::usage::Metered>,
         parked: Parked,
         overrides: Arc<Mutex<SpawnOverrides>>,
         ws: WsRef,
@@ -100,6 +105,8 @@ impl Gateway {
             cap: Arc::new(cap.into()),
             cfg: deps.cfg.clone(),
             usage,
+            metered,
+            mismatch_warned: Default::default(),
             link: deps.link.clone(),
             egress: deps.egress.clone(),
             quotas: deps.quotas.clone(),
@@ -230,7 +237,7 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
         return llm_error(StatusCode::BAD_GATEWAY, "provider not configured");
     };
     let usage_total = {
-        let u = *g.usage.lock().unwrap();
+        let u = g.effective_usage();
         let budget = g.overrides.lock().unwrap().budget_usd.or(agent.cfg.limits.budget_usd);
         if let Some(b) = budget {
             if u.cost_usd >= 0.8 * b && u.cost_usd < b && !g.budget_warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -258,11 +265,16 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
         Err(_) => return llm_error(StatusCode::PAYLOAD_TOO_LARGE, "request too large"),
     };
     // Model allowlist: JSON bodies name the model (OpenAI/Anthropic); Gemini puts it in the path.
-    if let Ok(v) = serde_json::from_slice::<Value>(&body) {
+    let mut body = body;
+    if let Ok(mut v) = serde_json::from_slice::<Value>(&body) {
         if let Some(m) = v.get("model").and_then(|m| m.as_str()) {
             if m != agent.cfg.provider.model {
                 return llm_error(StatusCode::FORBIDDEN, &format!("model {m} not allowed (profile model is {})", agent.cfg.provider.model));
             }
+        }
+        // The meter needs the provider's usage chunk at the end of a stream.
+        if crate::usage::ensure_stream_usage(pdef.api, &mut v) {
+            body = serde_json::to_vec(&v).unwrap_or_default().into();
         }
     }
     let (secret, account) = match &agent.cfg.provider.key {
@@ -407,7 +419,21 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
                 out = out.header(k, v);
             }
         }
-        let stream = upstream.bytes_stream().map(|r| r.map_err(std::io::Error::other));
+        let ct = upstream.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        let mut meter = (status.is_success()).then(|| {
+            let g = g.clone();
+            let price = pdef.prices.get(&agent.cfg.provider.model).cloned();
+            crate::usage::Meter::new(pdef.api, &ct, move |mut u| {
+                crate::usage::price(&mut u, price.as_ref());
+                g.metered.add(&u);
+            })
+        });
+        let stream = upstream.bytes_stream().map(move |r| {
+            if let (Ok(b), Some(m)) = (&r, &mut meter) {
+                m.feed(b);
+            }
+            r.map_err(std::io::Error::other)
+        });
         return out.body(Body::from_stream(stream)).unwrap_or_else(|_| llm_error(StatusCode::BAD_GATEWAY, "bad upstream response"));
     }
 
@@ -444,12 +470,33 @@ impl Gateway {
     /// Attribute tokens used since the last request to the bucket that served
     /// it (called before each request and when a turn ends).
     pub fn settle_tokens(&self) {
+        self.check_mismatch();
         let Some((t, route, before)) = self.prev.lock().unwrap().take() else { return };
-        let now_total = self.usage.lock().unwrap().total();
+        let now_total = self.effective_usage().total();
         let limits = self.cfg.get().providers.get(&t.provider).map(|p| quota::spec_for(p).limits).unwrap_or_default();
         self.quotas.record_tokens(&t, &route, &self.id, &limits, now_total.saturating_sub(before));
         // Later tokens of the same request (e.g. a resync) still belong there.
         *self.prev.lock().unwrap() = Some((t, route, now_total.max(before)));
+    }
+
+    /// What budgets and caps count: the larger of OpenCode's and keyproxy's tallies.
+    pub fn effective_usage(&self) -> TokenUsage {
+        TokenUsage::max_of(&self.usage.lock().unwrap(), &self.metered.get())
+    }
+
+    /// The provider billed noticeably more than OpenCode reports: calls made
+    /// around OpenCode (the agent has a shell and the capability token), or a
+    /// client that drops usage. Budgets already count the larger number.
+    fn check_mismatch(&self) {
+        let (r, m) = (*self.usage.lock().unwrap(), self.metered.get());
+        if crate::usage::mismatched(r.total(), m.total()) && !self.mismatch_warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(session = %self.id, reported = r.total(), metered = m.total(), "provider usage exceeds what OpenCode reports");
+            self.link.emit(NodeEvent::Activity {
+                session: self.id.clone(),
+                kind: "usage.mismatch".into(),
+                detail: json!({"reported_tokens": r.total(), "metered_tokens": m.total(), "reported_usd": r.cost_usd, "metered_usd": m.cost_usd}),
+            });
+        }
     }
 
     fn park(&self, until: Ts, provider: &str, why: &[String]) {

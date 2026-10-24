@@ -90,7 +90,7 @@ impl Sup {
             (Some(c), false, _) => format!("workspace: checkpoint from turn {} ({}); later changes are lost", c.turn, ago(c.at)),
             (None, false, _) => "workspace: no checkpoint; starts empty".to_string(),
         };
-        let handoff_cost = pol.handoff_factor * s.report.tokens.cost_usd;
+        let handoff_cost = pol.handoff_factor * s.report.billed().cost_usd;
         vec![
             RecoveryOption {
                 kind: "restart".into(),
@@ -139,7 +139,7 @@ impl Sup {
         let crashloop = recent >= pol.crashloop_deaths;
         let opts = self.recovery_options(&s);
         let (scope, tree) = self.scope_of(&s);
-        let spent: f64 = tree.iter().map(|x| x.report.tokens.cost_usd).sum();
+        let spent: f64 = tree.iter().map(|x| x.report.billed().cost_usd).sum();
         let provider = self.agent_info(&s.report.node, &s.report.agent).map(|a| a.provider).unwrap_or_default();
         let mut why_not = vec![];
         let best = opts.iter().filter(|o| o.available && o.kind != "abandon").min_by(|a, b| a.est_cost_usd.partial_cmp(&b.est_cost_usd).unwrap_or(std::cmp::Ordering::Equal)).cloned();

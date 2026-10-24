@@ -240,6 +240,7 @@ impl Sup {
                 state: SessionState::Starting,
                 opencode_id: None,
                 tokens: TokenUsage::default(),
+                metered: TokenUsage::default(),
                 todos: vec![],
                 current_task: Some("starting".into()),
                 last_text: None,
@@ -410,6 +411,7 @@ impl Sup {
                 let who = self.db.session(&session).map(|s| format!("{} ({session})", s.report.agent)).unwrap_or(session.clone());
                 let alert = match kind.as_str() {
                     "budget.80" => Some(("warning", format!("{who} used 80% of its budget"), format!("${:.4} of ${:.2}", detail["spent_usd"].as_f64().unwrap_or(0.0), detail["budget_usd"].as_f64().unwrap_or(0.0)))),
+                    "usage.mismatch" => Some(("warning", format!("{who} used more tokens than OpenCode reports"), format!("provider reported {} tokens, OpenCode {}; budgets count the larger number. Calls made around OpenCode?", detail["metered_tokens"], detail["reported_tokens"]))),
                     "provider.auth_failed" => Some(("vital", format!("{} refuses the key on {node}", detail["provider"].as_str().unwrap_or("provider")), format!("HTTP {} via route {} (used by {who}); check the secret on {node}", detail["status"], detail["route"].as_str().unwrap_or("?")))),
                     "provider.down" => Some(("warning", format!("{} unreachable from {node}", detail["provider"].as_str().unwrap_or("provider")), truncate(detail["why"].as_str().unwrap_or(""), 400))),
                     "disk.warning" => Some(("warning", format!("{who} is at {}% of its disk limit", detail["pct"]), String::new())),
@@ -709,7 +711,7 @@ impl Sup {
         let sessions = self.db.sessions(false);
         let mut totals = TokenUsage::default();
         for s in self.db.sessions(true) {
-            totals.add(&s.report.tokens);
+            totals.add(&s.report.billed());
         }
         Overview { nodes: self.node_views(), sessions, tasks: self.db.tasks(), totals }
     }
@@ -745,8 +747,8 @@ pub fn session_brief(s: &SessionInfo) -> Value {
         "title": s.title,
         "current_task": s.report.current_task,
         "todos": format!("{}/{}", s.report.todos.iter().filter(|t| t.status == "completed").count(), s.report.todos.len()),
-        "tokens": s.report.tokens.total(),
-        "cost_usd": s.report.tokens.cost_usd,
+        "tokens": s.report.billed().total(),
+        "cost_usd": s.report.billed().cost_usd,
         "parent": s.parent,
         "waiting_on": s.waiting_on,
     })
@@ -770,6 +772,7 @@ pub fn tests_report(id: &str) -> SessionReport {
         state: SessionState::Running,
         opencode_id: None,
         tokens: TokenUsage::default(),
+        metered: TokenUsage::default(),
         todos: vec![],
         current_task: None,
         last_text: None,
@@ -796,6 +799,7 @@ mod tests {
             state,
             opencode_id: None,
             tokens: TokenUsage::default(),
+            metered: TokenUsage::default(),
             todos: vec![],
             current_task: None,
             last_text: None,

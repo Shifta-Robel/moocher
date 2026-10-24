@@ -15,6 +15,7 @@ mod runtime;
 mod secrets;
 mod stats;
 mod store;
+mod usage;
 mod wsops;
 
 use anyhow::{Context, Result};

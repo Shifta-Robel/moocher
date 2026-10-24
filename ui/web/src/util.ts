@@ -1,3 +1,4 @@
+import type { Tokens } from "./types";
 import { createSignal } from "solid-js";
 
 // One clock for every countdown on the page.
@@ -43,3 +44,11 @@ export const todoProgress = (t: { status: string }[]) => (t.length ? `${t.filter
 export function cx(...c: (string | false | null | undefined)[]): string {
   return c.filter(Boolean).join(" ");
 }
+
+const tot = (t: { input: number; output: number; reasoning: number }) => t.input + t.output + t.reasoning;
+/** What a session cost: the larger of OpenCode's count and keyproxy's meter (as budgets count it). */
+export const billed = (s: { tokens: Tokens; metered?: Tokens }) => {
+  const m = s.metered;
+  const t = m && tot(m) > tot(s.tokens) ? m : s.tokens;
+  return { ...t, total: tot(t), cost_usd: Math.max(s.tokens.cost_usd, m?.cost_usd ?? 0) };
+};

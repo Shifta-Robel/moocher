@@ -66,6 +66,12 @@ impl TokenUsage {
     pub fn total(&self) -> u64 {
         self.input + self.output + self.reasoning
     }
+    /// The larger of two counts of the same work (what budgets enforce).
+    pub fn max_of(a: &TokenUsage, b: &TokenUsage) -> TokenUsage {
+        let mut u = if b.total() > a.total() { *b } else { *a };
+        u.cost_usd = a.cost_usd.max(b.cost_usd);
+        u
+    }
     pub fn add(&mut self, o: &TokenUsage) {
         self.input += o.input;
         self.output += o.output;
@@ -128,6 +134,10 @@ pub struct SessionReport {
     pub opencode_id: Option<String>,
     #[serde(default)]
     pub tokens: TokenUsage,
+    /// What keyproxy counted from the provider's own responses. Budgets and
+    /// token caps use the larger of this and `tokens` (OpenCode's count).
+    #[serde(default)]
+    pub metered: TokenUsage,
     #[serde(default)]
     pub todos: Vec<Todo>,
     /// The `in_progress` todo, or the last tool in use.
@@ -153,6 +163,13 @@ pub struct SessionReport {
     /// Assistant turns finished so far.
     #[serde(default)]
     pub turns: u32,
+}
+
+impl SessionReport {
+    /// What the session cost: the larger of OpenCode's count and keyproxy's meter.
+    pub fn billed(&self) -> TokenUsage {
+        TokenUsage::max_of(&self.tokens, &self.metered)
+    }
 }
 
 /// Supervisor-side view of a session (report + orchestration metadata).

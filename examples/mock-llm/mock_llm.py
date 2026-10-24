@@ -148,7 +148,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._rl = {}
         body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))) or b"{}")
-        LOG.append({"path": self.path, "auth": self.headers.get("authorization"), "model": body.get("model"), "client": self.client_address[0]})
+        LOG.append({"path": self.path, "auth": self.headers.get("authorization"), "model": body.get("model"), "client": self.client_address[0],
+                    "stream": bool(body.get("stream")), "include_usage": bool((body.get("stream_options") or {}).get("include_usage"))})
         if not self.path.endswith("/chat/completions"):
             return self._json(404, {"error": "not found"})
         if REQUIRE_KEY and self.headers.get("authorization") != f"Bearer {REQUIRE_KEY}":
@@ -196,8 +197,10 @@ class Handler(BaseHTTPRequestHandler):
         chunks = [
             {"choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
             {"choices": [{"index": 0, "delta": {}, "finish_reason": finish}]},
-            {"choices": [], "usage": usage},
         ]
+        # Like OpenAI: streams carry usage only when the request asks for it.
+        if (body.get("stream_options") or {}).get("include_usage"):
+            chunks.append({"choices": [], "usage": usage})
         for c in chunks:
             c.update({"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": model})
             self.wfile.write(f"data: {json.dumps(c)}\n\n".encode())

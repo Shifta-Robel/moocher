@@ -6,7 +6,7 @@ import { Button, Card, Empty, Importance, NodeChip, PageHeader, Pill, Sparkline,
 import * as I from "../icons";
 import { events, isLive, state, statsTick } from "../store";
 import type { LogEvent, RecoveryOption } from "../types";
-import { ago, bytes, clock, money, num } from "../util";
+import { ago, billed, bytes, clock, money, num } from "../util";
 
 function Stat(p: { label: string; value: string; hint?: string }) {
   return (
@@ -124,8 +124,8 @@ export default function Instance() {
             </Card>
           </Show>
           <div class="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-6">
-            <Stat label="tokens" value={num(si().tokens.input + si().tokens.output + si().tokens.reasoning)} hint={`in ${num(si().tokens.input)} · out ${num(si().tokens.output)}`} />
-            <Stat label="cost" value={money(si().tokens.cost_usd)} />
+            <Stat label="tokens" value={num(billed(si()).total)} hint={`in ${num(billed(si()).input)} · out ${num(billed(si()).output)}`} />
+            <Stat label="cost" value={money(billed(si()).cost_usd)} hint={si().metered && billed(si()).total !== si().tokens.input + si().tokens.output + si().tokens.reasoning ? `metered; OpenCode says ${num(si().tokens.input + si().tokens.output + si().tokens.reasoning)} tok` : undefined} />
             <Stat label="context" value={num(si().context_tokens ?? 0)} hint="last request" />
             <Stat label="turns" value={`${si().turns ?? 0}`} />
             <Stat label="CPU" value={stats()?.latest?.cpu_pct != null ? `${stats().latest.cpu_pct.toFixed(1)}%` : "–"} />

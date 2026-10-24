@@ -119,7 +119,7 @@ pub fn draw(f: &mut Frame, app: &App) {
                         Cell::from(s.report.node.clone()),
                         Cell::from(label).style(st),
                         Cell::from(format!("{done}/{}", s.report.todos.len())),
-                        Cell::from(format!("${:.4}", s.report.tokens.cost_usd)),
+                        Cell::from(format!("${:.4}", s.report.billed().cost_usd)),
                         Cell::from(s.report.error.clone().or(s.report.current_task.clone()).unwrap_or_default()),
                     ])
                 })

@@ -8,7 +8,7 @@ export interface Tokens { input: number; output: number; reasoning: number; cach
 
 export interface Session {
   id: string; node: string; agent: string; state: State;
-  tokens: Tokens; todos: Todo[]; current_task?: string | null; last_text?: string | null; error?: string | null;
+  tokens: Tokens; metered?: Tokens; todos: Todo[]; current_task?: string | null; last_text?: string | null; error?: string | null;
   model?: string | null; workspace?: string | null; started_at: number; updated_at: number;
   context_tokens?: number; dead_reason?: string | null; turns?: number;
   title?: string | null; task_id?: number | null; parent?: string | null; run_id?: string | null; step?: string | null;

@@ -64,6 +64,8 @@ pub struct Instance {
     /// replaying a message update never double counts.
     msg_usage: Mutex<HashMap<String, TokenUsage>>,
     usage: Arc<Mutex<TokenUsage>>,
+    /// keyproxy's own count (usage.rs); survives restarts through the report.
+    metered: Arc<crate::usage::Metered>,
     /// Set by the gateway while every route's allowance is used up.
     parked: crate::gateway::Parked,
     gateway: Mutex<Option<Gateway>>,
@@ -411,6 +413,7 @@ impl Manager {
             oc_agent,
             oc_id: Mutex::new(report.opencode_id.clone()),
             usage: Arc::new(Mutex::new(report.tokens)),
+            metered: Arc::new(crate::usage::Metered::new(report.metered)),
             parked: Arc::new(Mutex::new(None)),
             gateway: Mutex::new(None),
             overrides: Arc::new(Mutex::new(SpawnOverrides::default())),
@@ -496,6 +499,7 @@ impl Manager {
             state: SessionState::Starting,
             opencode_id: None,
             tokens: TokenUsage::default(),
+            metered: TokenUsage::default(),
             todos: vec![],
             current_task: Some("starting".into()),
             last_text: None,
@@ -548,15 +552,25 @@ impl Manager {
         Ok(json!({"id": spec.id}))
     }
 
-    fn start_gateway(&self, inst: &Arc<Instance>, cap: &str) -> Result<()> {
+    fn start_gateway(self: &Arc<Self>, inst: &Arc<Instance>, cap: &str) -> Result<()> {
         let ws = crate::gateway::WsRef {
             root: inst.paths.workspace.clone(),
             runtime_path: self.rt.workspace_in_runtime(&inst.paths),
         };
-        let gw = Gateway::new(&inst.id, &inst.agent, inst.role, cap, inst.usage.clone(), inst.parked.clone(), inst.overrides.clone(), ws, &self.gw);
+        let gw = Gateway::new(&inst.id, &inst.agent, inst.role, cap, inst.usage.clone(), inst.metered.clone(), inst.parked.clone(), inst.overrides.clone(), ws, &self.gw);
         *inst.gateway.lock().unwrap() = Some(gw.clone());
         let h = gw.serve(inst.paths.node_sock())?;
-        inst.tasks.lock().unwrap().push(h);
+        // Publish keyproxy's count as it moves (OpenCode's events do not cover it).
+        let watch = {
+            let (me, inst) = (self.clone(), inst.clone());
+            tokio::spawn(async move {
+                loop {
+                    inst.metered.changed.notified().await;
+                    me.update(&inst, |_| {});
+                }
+            })
+        };
+        inst.tasks.lock().unwrap().extend([h, watch]);
         Ok(())
     }
 
@@ -629,6 +643,7 @@ impl Manager {
                 r.state = before;
             }
             r.tokens = *inst.usage.lock().unwrap();
+            r.metered = inst.metered.get();
             r.updated_at = now_ms();
             r.clone()
         };
@@ -735,13 +750,8 @@ impl Manager {
     fn priced(&self, agent: &str, mut u: TokenUsage) -> TokenUsage {
         if u.cost_usd == 0.0 {
             let snap = self.cfg.get();
-            if let Some(p) = snap
-                .agents
-                .get(agent)
-                .and_then(|a| snap.providers.get(&a.cfg.provider.id).and_then(|p| p.prices.get(&a.cfg.provider.model)))
-            {
-                u.cost_usd = (u.input as f64 * p.input_per_mtok + (u.output + u.reasoning) as f64 * p.output_per_mtok) / 1e6;
-            }
+            let price = snap.agents.get(agent).and_then(|a| snap.providers.get(&a.cfg.provider.id).and_then(|p| p.prices.get(&a.cfg.provider.model)));
+            crate::usage::price(&mut u, price);
         }
         u
     }

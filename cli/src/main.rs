@@ -473,8 +473,8 @@ fn print_sessions(ss: &[SessionInfo]) {
             r.node,
             r.state.as_str(),
             todos(&r.todos),
-            r.tokens.total(),
-            format!("${:.4}", r.tokens.cost_usd),
+            r.billed().total(),
+            format!("${:.4}", r.billed().cost_usd),
             ago(r.started_at),
             cur.chars().take(60).collect::<String>()
         );
@@ -851,6 +851,10 @@ async fn run(cli: Cli) -> Result<()> {
                 "tokens in {} out {} reasoning {} cache r/w {}/{}  cost ${:.4}",
                 r.tokens.input, r.tokens.output, r.tokens.reasoning, r.tokens.cache_read, r.tokens.cache_write, r.tokens.cost_usd
             );
+            if r.metered.total() != r.tokens.total() {
+                let m = &r.metered;
+                println!("metered by keyproxy: in {} out {} reasoning {} cache r/w {}/{}  cost ${:.4}", m.input, m.output, m.reasoning, m.cache_read, m.cache_write, m.cost_usd);
+            }
             if let Some(v) = s.verdict {
                 println!("verdict {v:?}");
             }

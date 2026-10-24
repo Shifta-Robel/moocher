@@ -879,10 +879,10 @@ async fn metrics(State(sup): S) -> impl IntoResponse {
     for s in &sessions {
         *by_state.entry(s.report.state.as_str()).or_default() += 1;
         let a = s.report.agent.clone();
-        for (k, v) in [("input", s.report.tokens.input), ("output", s.report.tokens.output), ("reasoning", s.report.tokens.reasoning), ("cache_read", s.report.tokens.cache_read)] {
+        for (k, v) in [("input", s.report.billed().input), ("output", s.report.billed().output), ("reasoning", s.report.billed().reasoning), ("cache_read", s.report.billed().cache_read)] {
             *tokens.entry((a.clone(), k)).or_default() += v;
         }
-        *cost.entry(a).or_default() += s.report.tokens.cost_usd;
+        *cost.entry(a).or_default() += s.report.billed().cost_usd;
     }
     let _ = writeln!(out, "# TYPE ocl_sessions gauge");
     for (k, v) in by_state {
