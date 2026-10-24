@@ -426,6 +426,14 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
             crate::usage::Meter::new(pdef.api, &ct, move |mut u| {
                 crate::usage::price(&mut u, price.as_ref());
                 g.metered.add(&u);
+                // OpenCode accounts a step when it has processed the response;
+                // compare once it surely has (under load that takes seconds).
+                if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                    rt.spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        g.check_mismatch();
+                    });
+                }
             })
         });
         let stream = upstream.bytes_stream().map(move |r| {
@@ -470,7 +478,6 @@ impl Gateway {
     /// Attribute tokens used since the last request to the bucket that served
     /// it (called before each request and when a turn ends).
     pub fn settle_tokens(&self) {
-        self.check_mismatch();
         let Some((t, route, before)) = self.prev.lock().unwrap().take() else { return };
         let now_total = self.effective_usage().total();
         let limits = self.cfg.get().providers.get(&t.provider).map(|p| quota::spec_for(p).limits).unwrap_or_default();

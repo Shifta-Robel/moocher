@@ -45,6 +45,7 @@ Complete examples for a hub, a remote worker and a relay are in [`examples/remot
 | `labels` | `{}` | Free-form, shown in the UI. |
 | `checkpoint_every_turns` | `3` | Send a checkpoint (workspace snapshot + transcript) to the hub every N finished turns, so a session can resume on another machine if this one is lost. `0` turns it off. |
 | `artifact_cache` | `2g` | Local artifact cache (`<data>/cas`); least recently used blobs are dropped beyond it. |
+| `disk_enforce` | `soft` | How `container.disk` is enforced. `soft`: measured every few seconds; the agent is told at 90% and interrupted at 100%. `hard`: also a filesystem quota over the OpenCode home and the isolated workspace together, so writes past the limit fail (ENOSPC). Needs the data dir on XFS mounted with `prjquota`, or on btrfs, and the node running as root; otherwise the node refuses to start. Shared workspaces stay soft. |
 | `runtime.kind` | `podman` | `podman`, or `process` (dev/CI only: no isolation). |
 | `runtime.podman` | `podman` | Podman binary. |
 | `runtime.image` | `localhost/ocl-agent:1.19.4` | Default agent image. |
@@ -85,6 +86,11 @@ Complete examples for a hub, a remote worker and a relay are in [`examples/remot
 | `on_death.handoff_factor` | `0.5` | A hand-off to a fresh agent is estimated at this fraction of what was spent. |
 | `on_death.crashloop_deaths` | `3` | This many deaths within 10 minutes is a crash loop: no more automatic recoveries. |
 | `artifacts.max_size` | `2g` | Largest single artifact the hub accepts. Blobs live in `<data_dir>/artifacts/`. |
+| `artifacts.retain` | keep all | Expire artifacts older than this (`90d`). Kept regardless: those tagged with a `keep_tags` tag, and those still referenced (live sessions, open tasks and runs, open halts, checkpoints, shared workspaces, any `art://b3/…` in the config files). Checked hourly; `ocl housekeeping --dry-run` shows what would go. |
+| `artifacts.keep_tags` | `[keep]` | Tags that keep an artifact forever (`ocl artifact put --tag keep`). |
+| `events.export` | `true` | Export the event log by UTC day to `<data_dir>/exports/events-YYYYMMDD.jsonl.zst` (JSON lines; a day's file may hold several zstd frames, which `zstdcat` and `ocl-supervisor events-cat` read as one). |
+| `events.retain` | `30d` | Events older than this leave the database. With export on, only exported events are pruned. |
+| `events.export_keep` | keep all | Delete export files older than this. |
 | `tls.cert_file` / `tls.key_file` | off | Serve the dashboard and API over HTTPS with your certificate (PEM chain + key). Replaced files are picked up within a minute. |
 | `tls.acme.domains` | — | Get the certificate automatically (HTTP-01). The names must point at this machine. |
 | `tls.acme.email` | — | Contact for the CA (optional). |
@@ -103,7 +109,7 @@ Complete examples for a hub, a remote worker and a relay are in [`examples/remot
 | `notifications.ntfy` | off | `{ url: "https://ntfy.sh/my-topic", token: "env:NTFY_TOKEN" }` |
 | `notifications.webhook` | off | `{ url: "https://…", secret: "file:/etc/ocl/hook-secret" }`: JSON POST, signed `X-OCL-Signature: sha256=<hmac>`. |
 
-Event kinds (for rules): `question.waiting`, `task.done|failed|cancelled`, `task.halted`, `recovery.auto`, `run.passed|failed`, `node.offline`, `node.back`, `quota.exhausted`, `quota.reset`, `budget.80`, `provider.auth_failed`, `provider.down`, `disk.warning`, `agent.report`, `login.lockout`, `tls.acme_failed`, `test`.
+Event kinds (for rules): `question.waiting`, `task.done|failed|cancelled`, `task.halted`, `recovery.auto`, `run.passed|failed`, `node.offline`, `node.back`, `quota.exhausted`, `quota.reset`, `budget.80`, `provider.auth_failed`, `provider.down`, `disk.warning`, `usage.mismatch`, `agent.report`, `login.lockout`, `tls.acme_failed`, `test`.
 
 ## providers.yaml
 
@@ -203,8 +209,13 @@ container:
   memory: 1g
   cpus: 1.0
   pids: 512
-  egress: none                      # none (default) | full
-  disk: 5g                          # soft limit for workspace + home: warn at 90%, interrupt at 100%
+  egress: none                      # none (default) | allowlist | full
+  # allowlist: the container still has no network; HTTP(S)_PROXY point at the
+  # node, which lets through CONNECT/HTTP to these hosts only. Without a port:
+  # 80 and 443. A name that resolves to a private/loopback address is refused
+  # unless that address is listed itself. Edits apply to the next connection.
+  # allow_hosts: [pypi.org, "*.pythonhosted.org", "github.com", "10.0.0.5:3128"]
+  disk: 5g                          # workspace + home: warn at 90%, interrupt at 100% (node disk_enforce: hard adds a quota)
   tmp: 512m                         # size of the in-memory /tmp
 workspace:
   mode: isolated                    # isolated | shared
@@ -212,7 +223,8 @@ workspace:
   seed: art://b3/…                  # optional: a new workspace starts from this artifact (tree or file)
 limits:
   max_sessions: 2                   # per node
-  budget_usd: 1.00                  # per session; keyproxy refuses calls beyond it
+  budget_usd: 1.00                  # per session; keyproxy refuses calls beyond it, counting the larger of
+                                    # OpenCode's tokens and what the provider itself reported (keyproxy meter)
   max_tokens: 500000                # per session (input+output+reasoning)
   wall_clock_secs: 1800             # the session is aborted after this
 success:                            # reserved: ad-hoc sessions currently get a todo-only verdict;

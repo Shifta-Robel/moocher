@@ -137,7 +137,7 @@ We chose this over OAuth because there is one trusted operator, everything is se
 - with mounts: workspace, OpenCode home (so sessions survive a container restart), generated config read-only at `/etc/ocl`, and the socket dir at `/run/ocl`;
 - with labels `ocl.node`, `ocl.session`, `ocl.agent` for rediscovery.
 
-`container.egress: full` gives an agent normal networking (package installs, webfetch). An allowlisted egress proxy is Phase 5. The image is built from `images/agent/Containerfile`: OpenCode from npm (pinned) plus `ocl-bridge`, git, python3 and pytest. The base image is configurable.
+`container.egress: full` gives an agent normal networking (package installs, webfetch). `egress: allowlist` keeps `--network=none` and lets HTTP(S) through a per-instance proxy on the node, to `allow_hosts` only (USAGE §29). The image is built from `images/agent/Containerfile`: OpenCode from npm (pinned) plus `ocl-bridge`, git, python3 and pytest. The base image is configurable.
 
 **D8 — Durability works the same way at every level: desired state, observed state, reconcile.**
 - **Supervisor restart:** containers keep running, and nodes keep buffering events in their outbox. Each node reconnects with a full **inventory snapshot**, and the supervisor reconciles it against SQLite. Unknown sessions are adopted; missing ones are marked `lost`, which the recovery policy treats as a death (§7a). An instance that was replaced while its node was away is stopped when the node returns. **Nothing is orphaned.**
@@ -253,8 +253,8 @@ The operator keeps a **bucket of tasks** (CLI, dashboard and TUI) and the cluste
   - Per route and provider: time to response headers and errors.
   - Relay tunnel setup times.
   - `/metrics` adds `ocl_relay_tunnels_total` and `ocl_relay_bytes_total`.
-- **Tokens and cost** come from OpenCode's per-step assistant messages. Cost uses OpenCode's figure when it is non-zero, otherwise the `prices` table in `providers.yaml`; keyless gateways cost `$0`. Keyproxy enforces `budget_usd` / `max_tokens` against the same counters. Parsing usage directly from provider responses is Phase 5.
-- **Event log:** append-only `events` table (session state changes, tool calls, turn ends, verdicts, task and run transitions). Read it with `GET /api/v1/events` or `ocl events -f`. Daily export to `events-YYYYMMDD.jsonl.zst` is Phase 5.
+- **Tokens and cost** come from OpenCode's per-step assistant messages. Cost uses OpenCode's figure when it is non-zero, otherwise the `prices` table in `providers.yaml`; keyless gateways cost `$0`. Keyproxy also meters usage itself from every provider response (JSON and SSE; OpenAI, Responses, Anthropic, Gemini formats) and enforces `budget_usd` / `max_tokens` against the larger of the two counts; a large gap raises `usage.mismatch` (USAGE §28).
+- **Event log:** append-only `events` table (session state changes, tool calls, turn ends, verdicts, task and run transitions). Read it with `GET /api/v1/events` or `ocl events -f`. Exported by UTC day to `exports/events-YYYYMMDD.jsonl.zst` and pruned after `events.retain` once exported (USAGE §30).
 - **Logs and metrics:** JSON logs (`tracing`, level via `OCL_LOG`). The supervisor's `/metrics` (bearer token) exposes `ocl_nodes_connected`, `ocl_sessions{state}`, `ocl_tokens_total{agent,kind}`, `ocl_cost_usd_total{agent}` and `ocl_tasks{status}`.
 - **Audit log:** append-only and **hash-chained** (`h_n = SHA-256(h_{n-1} ‖ length-prefixed fields)`) for every control action: who (operator token name, `session:<id>` for agent tool calls, or `system`), what, target and result. `ocl audit --verify` checks the chain, and a unit test proves tampering is detected.
 
@@ -331,7 +331,7 @@ This needs no git in the workspace and behaves the same for any tree. Syncs happ
 | Credential-injecting LLM proxy | LiteLLM proxy | ❌ Build (thin, in Rust) | LiteLLM is Python with a 300 MB+ footprint and far more features than we need. Ours is a header-rewriting pass-through of a few hundred lines, inside `opencode-node`. |
 | Keyless: Kilo | **OpenKilo** | ✅ Reuse its endpoint as a provider template | Free models through Kilo's gateway with no key. Routing it through keyproxy keeps metering and egress routing the same as for BYOK providers. |
 | Keyless: Pollinations | gen.pollinations.ai `/v1` (direct) · KeylessAI worker | ✅ Pollinations direct (token optional) · ⚠️ KeylessAI as best-effort fallback | KeylessAI is a third-party Cloudflare worker with no SLA. The legacy `text.pollinations.ai/openai` endpoint is deprecated. |
-| Containers | **Podman** (rootless or rootful) driven via the podman CLI | ✅ Reuse | Daemonless, works with systemd. The CLI keeps us independent of libpod API versions. Quadlet units for the daemons come in Phase 5. |
+| Containers | **Podman** (rootless or rootful) driven via the podman CLI | ✅ Reuse | Daemonless, works with systemd. The CLI keeps us independent of libpod API versions. Hardened systemd units and a Quadlet for the supervisor are in `deploy/` (USAGE §15). |
 | Agent image | Our `images/agent/Containerfile`: OpenCode from npm (pinned) on a configurable base | ✅ Thin build | The upstream GHCR image works too. Building from npm keeps one pinned version for both the image and the API test fixture. |
 | Message bus | NATS / Redis | ❌ Reject (v1) | See D4. |
 | Overlay network | Tailscale/Headscale/WireGuard | 🔁 Optional | Not required, because nodes dial out over mTLS. |

@@ -3,7 +3,7 @@
 cd "$(dirname "$0")"
 rc=0
 # Optional suites need extra tools: acme (PEBBLE_DIR), ui (PW_DIR + Chromium).
-suites="enroll relay quota templates stats resilience artifacts questions death harvest web metering egress ops"
+suites="enroll relay quota templates stats resilience artifacts questions death harvest web metering egress ops load"
 [ -n "${PEBBLE_DIR:-}" ] && suites="$suites acme"
 [ -n "${PW_DIR:-}" ] && suites="$suites ui"
 for t in $suites; do

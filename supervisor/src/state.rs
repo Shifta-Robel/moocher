@@ -45,7 +45,13 @@ pub struct Sup {
     pub notifier: crate::notify::Notifier,
     /// Nodes that disconnected while this supervisor ran (for "node back").
     pub went_offline: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// When this process started: nodes could not reach a hub that was down.
+    pub started_at: Ts,
 }
+
+/// After a hub restart, nodes reconnect with backoff (up to 60 s): nothing
+/// is declared lost before this, whatever `disconnect_grace_secs` says.
+const STARTUP_GRACE_MS: i64 = 90_000;
 
 /// Who performed an action, for the audit log.
 #[derive(Debug, Clone)]
@@ -106,6 +112,7 @@ impl Sup {
             attach: Default::default(),
             notifier: crate::notify::Notifier::new(&data),
             went_offline: Default::default(),
+            started_at: now_ms(),
         })
     }
 
@@ -723,7 +730,12 @@ impl Sup {
     /// counts as a death (`node_lost`) for the recovery policy.
     pub fn expire_unreachable(self: &Arc<Self>) {
         let grace = self.cfg.disconnect_grace_secs as i64 * 1000;
-        for n in self.db.nodes().into_iter().filter(|n| !n.connected && now_ms() - n.last_seen > grace) {
+        let now = now_ms();
+        if now - self.started_at < STARTUP_GRACE_MS.max(grace) {
+            return;
+        }
+        // A node last seen before this hub started has only had since the start to come back.
+        for n in self.db.nodes().into_iter().filter(|n| !n.connected && now - n.last_seen.max(self.started_at) > grace) {
             for mut s in self.db.sessions_on(&n.name) {
                 if s.report.state == SessionState::Unreachable {
                     s.report.state = SessionState::Lost;

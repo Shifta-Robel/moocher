@@ -59,7 +59,7 @@ secrets:
 
 - **Hub library:** `templates/` on the hub is pushed to nodes on connect. A node offers a template only when it can resolve every secret alias. The key itself still never leaves that node.
 - **Spawning:** `POST /api/v1/instances {template, node?, overrides, parent?, task?}`, `ocl spawn`, the web UI's **New instance** sheet, and the MCP tool `cluster_spawn_agent(template, prompt, overrides)`. Overrides outside `overridable` are rejected and audited.
-- **Warm pool (Phase 5):** `instances.warm: 1` keeps one booted container per template, which hides the ~35 s cold start.
+- **Warm pool (deferred):** `instances.warm: 1` would keep one booted container per template to hide the cold start. Pre-seeding OpenCode's model catalog cut that start from ~35 s to ~4 s, so the pool was deferred (PHASE5.md).
 
 ## 3. Egress IPs, quotas and reset times
 

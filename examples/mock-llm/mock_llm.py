@@ -41,6 +41,7 @@ REQUIRE_KEY = None
 IP_QUOTA = 0
 IP_WINDOW = 60
 WINDOWS = {}  # client ip -> [window start, count]
+STATS = {"chat": 0, "rate_limited": 0, "by_ip": {}}  # since start (the log keeps 50)
 
 
 def est_tokens(obj):
@@ -141,6 +142,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.endswith("/models"):
             names = sorted(f[:-5] for f in os.listdir(SCRIPTS) if f.endswith(".json"))
             return self._json(200, {"object": "list", "data": [{"id": n, "object": "model"} for n in names]})
+        if self.path.endswith("/_stats"):
+            return self._json(200, STATS)
         if self.path.endswith("/_log"):
             return self._json(200, LOG[-50:])
         self._json(404, {"error": "not found"})
@@ -155,7 +158,11 @@ class Handler(BaseHTTPRequestHandler):
         if REQUIRE_KEY and self.headers.get("authorization") != f"Bearer {REQUIRE_KEY}":
             return self._json(401, {"error": {"message": "mock: wrong or missing API key"}})
         allowed, rl = self._quota()
+        ip = self.client_address[0]
+        STATS["chat"] += 1
+        STATS["by_ip"][ip] = STATS["by_ip"].get(ip, 0) + 1
         if not allowed:
+            STATS["rate_limited"] += 1
             data = json.dumps({"error": {"message": "mock: rate limit exceeded for this IP", "type": "rate_limit"}}).encode()
             self.send_response(429)
             for k, v in rl.items():

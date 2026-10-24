@@ -260,7 +260,7 @@ impl Sup {
     /// Operator: apply a recovery option to a halt (or directly to a dead session).
     pub async fn resolve(self: &Arc<Self>, actor: &Actor, target: &str, option: &str, node: Option<String>) -> Result<serde_json::Value> {
         let _g = self.recovery_lock.lock().await;
-        let mut h = match self.db.halt(target) {
+        let h = match self.db.halt(target) {
             Some(h) => h,
             None => {
                 // A dead session without a halt (e.g. auto-recovery exhausted on a lone session).
@@ -278,14 +278,32 @@ impl Sup {
         }
         let dead = self.session(&h.dead_session)?;
         let out = self.recover_session(actor, &dead, option, node).await?;
+        self.close_halt(actor, h, &dead, option, out).await
+    }
+
+    /// A session declared lost reported in again, alive: its halt (if any)
+    /// is moot. The paused tree resumes as after any other resolution.
+    pub async fn node_back(self: &Arc<Self>, session: &str) {
+        let _g = self.recovery_lock.lock().await;
+        let Ok(s) = self.session(session) else { return };
+        for h in self.db.halts(true).into_iter().filter(|h| h.dead_session == session) {
+            tracing::info!(session, halt = h.id, "lost session is back; resolving its halt");
+            if let Err(e) = self.close_halt(&Actor::System, h, &s, "node_back", json!({"note": "the node came back with the session still running"})).await {
+                tracing::warn!(session, error = %e, "resolving halt after node came back");
+            }
+        }
+    }
+
+    async fn close_halt(self: &Arc<Self>, actor: &Actor, mut h: Halt, dead: &SessionInfo, option: &str, out: serde_json::Value) -> Result<serde_json::Value> {
         let mut resumed = vec![];
         if option != "abandon" {
             for id in &h.sessions {
                 if let Ok(s) = self.session(id) {
-                    let prompt = format!(
-                        "[cluster] Work was paused because {} ({}) died ({}). The operator chose `{option}`; continue where you left off.",
-                        dead.report.agent, dead.report.id, h.reason
-                    );
+                    let prompt = if option == "node_back" {
+                        format!("[cluster] Work was paused because {} ({}) seemed lost; its machine is back and it kept running. Continue where you left off.", dead.report.agent, dead.report.id)
+                    } else {
+                        format!("[cluster] Work was paused because {} ({}) died ({}). The operator chose `{option}`; continue where you left off.", dead.report.agent, dead.report.id, h.reason)
+                    };
                     match self.nodes.call(&s.report.node, NodeCommand::Restart { session: id.clone(), prompt }, LONG).await {
                         Ok(_) => resumed.push(id.clone()),
                         Err(e) => tracing::warn!(session = id, error = %e, "resume after halt failed"),

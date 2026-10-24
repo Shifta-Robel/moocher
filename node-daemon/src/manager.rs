@@ -84,6 +84,8 @@ pub struct Instance {
     /// Disk limit state: the agent was warned (90%) / it is over the limit.
     disk_warned: AtomicBool,
     disk_over: AtomicBool,
+    /// When we last sent OpenCode a prompt: a turn ends only once it answered.
+    prompted_at: std::sync::atomic::AtomicI64,
     /// Tool calls already reported as activity (part ids).
     seen_tools: Mutex<HashSet<String>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -438,6 +440,7 @@ impl Manager {
             checkpointing: AtomicBool::new(false),
             disk_warned: AtomicBool::new(false),
             disk_over: AtomicBool::new(false),
+            prompted_at: std::sync::atomic::AtomicI64::new(0),
             turn_open: AtomicBool::new(matches!(report.state, SessionState::Running | SessionState::Blocked | SessionState::Parked)),
             report: Mutex::new(report),
             msg_usage: Mutex::new(HashMap::new()),
@@ -638,6 +641,7 @@ impl Manager {
             }
         }
         inst.turn_open.store(true, Ordering::Relaxed);
+        inst.prompted_at.store(now_ms(), Ordering::Relaxed);
         inst.oc.prompt(&oc_id, text, &inst.oc_provider, &inst.oc_model, &inst.oc_agent).await?;
         self.update(inst, |r| {
             r.state = SessionState::Running;
@@ -989,11 +993,25 @@ impl Manager {
         if !inst.oc.pending_permissions().await.unwrap_or_default().is_empty() {
             return; // blocked, not finished
         }
-        if !inst.turn_open.swap(false, Ordering::Relaxed) {
+        if !inst.turn_open.load(Ordering::Relaxed) {
             return; // already reported
         }
-        if let Ok(msgs) = inst.oc.messages(&oc_id).await {
-            self.absorb_history(inst, &msgs);
+        let msgs = inst.oc.messages(&oc_id).await.ok();
+        // `prompt_async` returns before OpenCode marks the session busy: under
+        // load it can still look idle right after a prompt. The turn is over
+        // only once an answer to that prompt exists (or after a minute, so an
+        // answer that never comes cannot keep the session running forever).
+        let since = inst.prompted_at.load(Ordering::Relaxed);
+        if let Some(m) = &msgs {
+            if !answered_since(m, since) && now_ms() - since < 60_000 {
+                return;
+            }
+        }
+        if !inst.turn_open.swap(false, Ordering::Relaxed) {
+            return; // reported meanwhile
+        }
+        if let Some(msgs) = &msgs {
+            self.absorb_history(inst, msgs);
         }
         if let Ok(t) = inst.oc.todos(&oc_id).await {
             self.update(inst, |r| r.todos = t);
@@ -1547,6 +1565,12 @@ fn role_str(r: SessionRole) -> &'static str {
         SessionRole::Coordinator => "coordinator",
         SessionRole::Worker => "worker",
     }
+}
+
+/// The history ends with an assistant message created at or after `since`
+/// (OpenCode stamps messages with the same host clock, in ms).
+fn answered_since(msgs: &[Value], since: i64) -> bool {
+    msgs.last().is_some_and(|m| m["info"]["role"] == "assistant" && m["info"]["time"]["created"].as_i64().is_some_and(|t| t >= since - 1000))
 }
 
 fn current_task(todos: &[Todo]) -> Option<String> {

@@ -17,7 +17,7 @@ Status: **Phase 4 complete**:
 - **harvesting** of declared outputs and transcripts when an instance ends, and retention of its volumes;
 - the **web dashboard** (every view, dark/light, phone layout), **Open in OpenCode** for any instance, notifications to your phone (Web Push), ntfy or a webhook, and a terminal dashboard.
 
-Verified with thirteen end-to-end suites (`tests/e2e/`), including a real browser and an ACME CA. Hardening is Phase 5.
+Verified with seventeen end-to-end suites (`tests/e2e/`), including a real browser, an ACME CA, and load and chaos tests. Phase 5 adds the hardening: keyproxy usage metering, egress allowlists, hard disk quotas, event export and artifact expiry, and systemd/Quadlet units. See [docs/PHASE5.md](docs/PHASE5.md).
 
 ```bash
 examples/quickstart/run-local.sh --with-worker   # full demo with a mock LLM

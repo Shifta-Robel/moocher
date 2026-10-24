@@ -33,7 +33,7 @@ C1=$(around); C2=$(around)
 [ "$C1$C2" = 200200 ] && pass "two direct calls served (streamed)" || fail "two direct calls served (got $C1 $C2)"
 wait_for 10 "the meter counts them; OpenCode's count does not move" bash -c "[ \"\$(sess 's[\"metered\"][\"input\"] > s[\"tokens\"][\"input\"] + 90000' $SID)\" = True ]"
 sess '"  OpenCode: %d tok $%.5f  metered: %d tok $%.5f" % (s["tokens"]["input"]+s["tokens"]["output"], s["tokens"]["cost_usd"], s["metered"]["input"]+s["metered"]["output"], s["metered"]["cost_usd"])' "$SID"
-wait_for 10 "usage.mismatch recorded" bash -c "$O events --session $SID --limit 1000 | grep -q usage.mismatch"
+wait_for 30 "usage.mismatch recorded" bash -c "$O events --session $SID --limit 1000 | grep -q usage.mismatch"
 wait_for 10 "and raised as a warning notification" bash -c "$O notifications | grep -q 'more tokens than OpenCode reports'"
 $O show "$SID" | contains "metered by keyproxy" && pass "ocl show prints the metered count" || fail "ocl show prints the metered count"
 $O sessions --json | python3 -c "import sys,json;s=[x for x in json.load(sys.stdin) if x['id']=='$SID'][0];sys.exit(0 if s['metered']['cost_usd']>=0.05 else 1)" \

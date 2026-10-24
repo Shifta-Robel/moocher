@@ -194,7 +194,20 @@ ocl recover <h-id> restart        # or resume_elsewhere [--node X], handoff, aba
 | Push never arrives | Push needs HTTPS (or localhost). Use **Send a test** on the Notifications page. If the subscription is gone (`404/410` from the push service) the hub drops it: enable push again. On iOS the dashboard must be added to the home screen. |
 | ntfy / webhook silent | Only `warning` and `vital` go out by default, and nothing but `vital` during quiet hours; check `notifications.rules`. Failures are in the supervisor log (`ntfy refused…`). |
 
-## 8. Debugging
+## 8. Housekeeping, disks, egress, metering
+
+| Situation | Fix |
+|---|---|
+| The database keeps growing | Events are pruned after `events.retain` (30 d), but only once exported: check that `<data_dir>/exports/` gets a file per day and that the supervisor log has no `housekeeping failed`. `ocl housekeeping --dry-run` shows what a run would do. |
+| An artifact you still need was expired | Expiry only happens with `artifacts.retain` set. Tag what must stay (`ocl artifact put … --tag keep`), or reference it from a config file (`workspace.seed`). Use `--dry-run` before you shorten `retain`. |
+| Read old events | `zstdcat exports/events-YYYYMMDD.jsonl.zst \| jq …`, or `ocl-supervisor events-cat FILE` without zstd. |
+| Node refuses to start: `disk_enforce: hard needs …` | Hard limits need XFS with `prjquota`, or btrfs, under the data dir, and a root node. Fix the mount (`prjquota` in fstab, then remount), move `runtime.data_dir`, or use `disk_enforce: soft`. |
+| Writes fail with `Disk quota exceeded` | The instance hit `container.disk` with `disk_enforce: hard`. Raise the limit for new instances, or clean up from the dashboard's Files tab. |
+| A tool in the container cannot download (`403 … egress refused`) | The host is not in `container.allow_hosts` (or resolves to an internal address). The refusal is in `ocl events --session <id>` (`egress.denied`, with the reason). Add the host; edits apply to the next connection. Tools that ignore `HTTPS_PROXY` cannot reach anything at all. |
+| `usage.mismatch` warning | The provider billed more than OpenCode reported. Usually something in the container called keyproxy directly (the agent has a shell and the capability token). Budgets already count the larger number. Look at the agent's bash history in its transcript; tighten `tools.bash`. |
+| Load: many sessions park at once | The shared allowance of one IP or key is used up; the hub counts it across all nodes. Add failover routes on another IP (relays), or lower concurrency. `ocl quotas` shows who used what. |
+
+## 9. Debugging
 
 Logs are JSON: `journalctl -u opencode-node -o cat | jq -r '.fields.message'`. Raise verbosity with `OCL_LOG=debug` (or `OCL_LOG=info,opencode_node::gateway=debug`).
 

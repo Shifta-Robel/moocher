@@ -405,7 +405,12 @@ impl Sup {
                 }
                 continue;
             }
+            let was_lost = all.iter().any(|x| x.report.id == s.id && x.report.state == SessionState::Lost);
             self.merge_report(s.clone());
+            if was_lost && s.state.is_live() {
+                let (me, id) = (self.clone(), s.id.clone());
+                tokio::spawn(async move { me.node_back(&id).await });
+            }
         }
         // Sessions we believed were on this node but it no longer has.
         for mut s in self.db.sessions_on(&h.node) {

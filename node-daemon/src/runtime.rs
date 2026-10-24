@@ -269,6 +269,11 @@ impl Runtime {
             .arg(format!("tcp:127.0.0.1:{gw}=unix:{}", p.node_sock().display()))
             .arg("--fwd")
             .arg(format!("unix:{}=tcp:127.0.0.1:{oc}", p.oc_sock().display()));
+        if s.container.egress == Egress::None {
+            // Like the container, where nothing can be fetched: OpenCode shells
+            // out to npm on first tool use, which here would hit the registry.
+            cmd.env("npm_config_offline", "true");
+        }
         if s.container.egress == Egress::Allowlist {
             let px = free_port()?;
             cmd.arg("--fwd").arg(format!("tcp:127.0.0.1:{px}=unix:{}", p.proxy_sock().display()));

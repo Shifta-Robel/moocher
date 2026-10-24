@@ -1,6 +1,6 @@
 # opencode-cluster — Usage guide
 
-Practical, copy-pasteable examples for every feature that exists today (Phases 1–4: hub, local and remote nodes, relays, quotas, templates, artifacts, questions, recovery from dead agents, harvesting, the web dashboard with login and HTTPS, Open in OpenCode, notifications, the TUI). Features from later phases are listed at the end. Enrolling machines and debugging them: [RUNBOOK.md](./RUNBOOK.md).
+Practical, copy-pasteable examples for every feature that exists today (Phases 1–5: hub, local and remote nodes, relays, quotas, templates, artifacts, questions, recovery from dead agents, harvesting, the web dashboard with login and HTTPS, Open in OpenCode, notifications, the TUI, usage metering, egress allowlists, housekeeping, hard disk limits, systemd units). Features from later phases are listed at the end. Enrolling machines and debugging them: [RUNBOOK.md](./RUNBOOK.md).
 
 Contents:
 1. [Mental model in 60 seconds](#1-mental-model-in-60-seconds)
@@ -30,7 +30,11 @@ Contents:
 25. [Open in OpenCode](#25-open-in-opencode)
 26. [Notifications: phone push, ntfy, webhooks](#26-notifications-phone-push-ntfy-webhooks)
 27. [The terminal dashboard](#27-the-terminal-dashboard)
-28. [What's coming](#28-whats-coming)
+28. [Usage metering](#28-usage-metering)
+29. [Network allowlists](#29-network-allowlists-egress-allowlist)
+30. [Housekeeping: event export and artifact expiry](#30-housekeeping-event-export-and-artifact-expiry)
+31. [Hard disk limits](#31-hard-disk-limits)
+32. [What's coming](#32-whats-coming)
 
 ---
 
@@ -537,8 +541,10 @@ container:
   memory: 1g               # podman --memory
   cpus: 1.0
   pids: 512
-  egress: none             # none = no network at all (recommended); full = normal networking
+  egress: none             # none = no network at all (recommended); allowlist = HTTP(S) to listed hosts (§29); full = normal networking
 ```
+
+Budgets and token caps count what the provider reported, not only what OpenCode says (§28).
 
 Per node: `max_sessions` in `node.yaml`. Budget for about 420 MB of RAM per session.
 
@@ -780,54 +786,28 @@ while read -r ev; do notify-send "agent needs permission" "$ev"; done
 
 ## 15. Running as systemd services
 
-```ini
-# /etc/systemd/system/ocl-supervisor.service
-[Unit]
-Description=opencode-cluster supervisor
-After=network-online.target
+Ready-made units are in `deploy/`; `tests/deploy-check.sh` runs `systemd-analyze verify` and `security` on them and checks the Quadlet.
 
-[Service]
-User=ocl
-Environment=OCL_CONFIG_DIR=/home/ocl/.opencode-cluster
-ExecStart=/usr/local/bin/ocl-supervisor run
-Restart=on-failure
-NoNewPrivileges=yes
-ProtectSystem=strict
-ReadWritePaths=/home/ocl/.opencode-cluster /run/ocl
-RuntimeDirectory=ocl
-RuntimeDirectoryPreserve=yes
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```ini
-# /etc/systemd/system/opencode-node.service
-[Unit]
-Description=opencode-cluster node
-After=ocl-supervisor.service
-
-[Service]
-User=ocl
-Environment=OCL_CONFIG_DIR=/home/ocl/.opencode-cluster
-Environment=OCL_BRIDGE=/usr/local/bin/ocl-bridge
-# Provider keys as encrypted credentials: referenced in agents as systemd-creds:<name>
-LoadCredentialEncrypted=openrouter:/etc/ocl/creds/openrouter.cred
-LoadCredentialEncrypted=groq:/etc/ocl/creds/groq.cred
-ExecStart=/usr/local/bin/opencode-node run
-Restart=on-failure
-# Containers keep running across restarts of this unit; it re-attaches.
-KillMode=process
-
-[Install]
-WantedBy=multi-user.target
-```
+| File | What |
+|---|---|
+| `deploy/systemd/ocl-supervisor.service` | The hub, as user `ocl`, config and state in `/var/lib/ocl/hub`, link socket in `/run/ocl-hub`. Fully sandboxed (`systemd-analyze security`: 1.6, "OK"); only `CAP_NET_BIND_SERVICE` for ports 80/443. |
+| `deploy/systemd/opencode-node.service` | A node with rootful Podman, config in `/etc/ocl/node`. Lighter sandbox (Podman needs mounts and namespaces; the agents' sandbox is their container). `KillMode=process`: agent containers survive a restart of the daemon and are re-adopted. |
+| `deploy/systemd/opencode-node.user.service` | A node with rootless Podman as a user service (`loginctl enable-linger`). |
+| `deploy/quadlet/ocl-supervisor.container` + `images/supervisor/Containerfile` | The hub as a Podman Quadlet: read-only root, no capabilities, uid 10001. |
 
 ```bash
-# create an encrypted credential (never stored in plain text)
-sudo systemd-creds encrypt --name=openrouter - /etc/ocl/creds/openrouter.cred   # paste key, Ctrl-D
-sudo loginctl enable-linger ocl     # rootless podman: keep the user's containers alive without a login
+sudo useradd --system --home-dir /var/lib/ocl --shell /usr/sbin/nologin ocl
+sudo install -m 0644 deploy/systemd/ocl-supervisor.service deploy/systemd/opencode-node.service /etc/systemd/system/
+# supervisor.yaml in /var/lib/ocl/hub:  link_socket: /run/ocl-hub/link.sock
+# node.yaml in /etc/ocl/node:           supervisor: unix:///run/ocl-hub/link.sock
 sudo systemctl daemon-reload && sudo systemctl enable --now ocl-supervisor opencode-node
+```
+
+Provider keys as encrypted credentials, referenced in agents as `systemd-creds:<name>`:
+
+```bash
+sudo systemd-creds encrypt --name=openrouter - /etc/ocl/creds/openrouter.cred   # paste key, Ctrl-D
+sudo systemctl edit opencode-node     # add: [Service] LoadCredentialEncrypted=openrouter:/etc/ocl/creds/openrouter.cred
 journalctl -u opencode-node -o cat | jq -r '.fields.message'      # logs are JSON
 ```
 
@@ -1205,11 +1185,62 @@ ocl tui
 
 ---
 
-## 28. What's coming
+## 28. Usage metering
+
+OpenCode reports its tokens from inside the container, where the agent also has a shell and the capability token for keyproxy. So keyproxy keeps its own count. It reads the usage the provider puts in every response: in JSON bodies and in streams, without holding the stream back. It understands four formats:
+- OpenAI-compatible chat;
+- the OpenAI Responses API;
+- Anthropic's `message_start` / `message_delta`;
+- Gemini's `usageMetadata`.
+
+For OpenAI-compatible streams, keyproxy adds `stream_options.include_usage` when the request lacks it.
+
+- `ocl show <id>` prints the metered count when it differs. The dashboard shows the larger of the two counts as the session's tokens and cost, and so do `ocl sessions`, stats and recovery cost estimates.
+- `budget_usd` and `max_tokens` are enforced on the larger count. A call made around OpenCode with `curl` and the token still runs into the budget.
+- When the meter is ahead of OpenCode by more than 25% and 2000 tokens, the session raises `usage.mismatch`, a warning notification, once.
+
+## 29. Network allowlists (`egress: allowlist`)
+
+```yaml
+container:
+  egress: allowlist
+  allow_hosts: [pypi.org, "*.pythonhosted.org", github.com, "*.githubusercontent.com"]
+```
+
+The container keeps `--network=none`. Inside it, `HTTP_PROXY`/`HTTPS_PROXY` (and lower-case) point at `127.0.0.1:3128`, which the bridge forwards to a proxy run by the node for this instance alone. pip, npm, git, curl and Bun pick it up. The proxy:
+- **Accepts two request forms**: `CONNECT host:port`, a byte tunnel that keeps TLS end to end, and plain `http://` requests.
+- **Checks host and port** against the list on every connection, so edits apply at once. An entry without a port means 80 and 443; `*.domain` means subdomains only.
+- **Refuses internal addresses**: a listed name that resolves to a loopback, private, link-local or CGNAT address is refused, so an allowed name cannot be pointed at the node or your LAN. List the address itself (`10.0.0.5:3128`) to allow one.
+- **Records refusals** as `egress.denied` events, with the reason, at most once per host per 10 minutes.
+
+## 30. Housekeeping: event export and artifact expiry
+
+Every hour the hub:
+- **Exports events** by UTC day to `<data_dir>/exports/events-YYYYMMDD.jsonl.zst`, one JSON event per line. The export is incremental, so every event is written exactly once, including late ones.
+- **Prunes events** older than `events.retain` (30 days) from the database, but only once they are exported.
+- **Expires artifacts** older than `artifacts.retain` (off by default). Artifacts tagged `keep` are spared, and so is anything still referenced: live sessions, open tasks and runs, open halts, checkpoints, shared workspaces, and `art://b3/…` in config files such as an agent's `workspace.seed`.
+
+```bash
+ocl housekeeping --dry-run --ahead 1d       # what tomorrow's run would do, changing nothing
+ocl housekeeping                             # run now (admin; audited)
+zstdcat ~/.opencode-cluster/supervisor/exports/events-20261024.jsonl.zst | jq -c 'select(.kind=="session.dead")'
+ocl-supervisor events-cat …/events-20261024.jsonl.zst     # the same without zstd installed
+```
+
+## 31. Hard disk limits
+
+`container.disk` is soft by default (§10). For a limit the kernel enforces, set `disk_enforce: hard` in `node.yaml`:
+- **Requirements**: the node's data dir on XFS mounted with `prjquota`, or on btrfs, and the node running as root.
+- **What it limits**: the instance's OpenCode home and its isolated workspace share one XFS project or btrfs qgroup, so a write past the limit fails with "Disk quota exceeded".
+- **Startup check**: the node checks all of this at start and refuses to run, with the reason, where it cannot work.
+- **Shared workspaces** belong to several sessions and stay soft.
+
+## 32. What's coming
 
 | Feature | Phase |
 |---|---|
 | ~~Remote nodes over mTLS, join tokens, `via_node` routes, quotas and failover, templates~~ | 2 ✔ (web UI for these: 4) |
 | ~~Artifact store, cross-machine shared workspaces, lineage, questions and escalation, dead-agent recovery and halts, harvesting~~ | 3 ✔ (UI views and push notifications for these: 4) |
 | ~~Web UI (SolidJS, mobile-first), TUI, password login, built-in TLS, Open in OpenCode, notifications~~ | 4 ✔ |
-| Load test (~10 sessions), pre-warmed containers, Quadlet units, event export, keyproxy usage metering | 5 |
+| ~~Load and chaos tests, Quadlet and systemd units, event export, artifact expiry, keyproxy usage metering, egress allowlists, hard disk quotas~~ | 5 ✔ |
+| Pre-warmed containers (instance boot is ~4 s; see PHASE5.md) | later |

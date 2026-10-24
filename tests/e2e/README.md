@@ -20,6 +20,10 @@ not needed; container isolation itself is covered by the Phase 1 demo.
 | `acme.sh` | The hub gets its certificate from Pebble (Let's Encrypt's test CA) over HTTP-01, serves with it, redirects HTTP, reuses it after a restart. Needs `PEBBLE_DIR`. |
 | `ui.sh` | The dashboard in headless Chromium (`ui-check.mjs`, Playwright): login, overview, New instance, live updates, preamble, messages, Open in OpenCode, answering a question, the question mode, the task board, Add machine, dark mode, the phone layout, logout, no JavaScript errors. Needs `PW_DIR`. Screenshots in `$OCL_E2E_DIR/shots`. |
 | `harvest.sh` | Outputs collected on stop (files, a glob as one tree, a missing one reported), delivered into the parent's workspace and the task workspace, the transcript as an artifact, `retain:` never vs. the default. |
+| `metering.sh` | keyproxy's own usage meter: it agrees with OpenCode on a normal turn and asks streams for usage; calls made around OpenCode with the capability token are counted, raise `usage.mismatch`, and run into the budget; the count survives a node restart. |
+| `egress.sh` | `egress: allowlist`: the agent's shell reaches a listed host through the node proxy (plain HTTP and CONNECT); unlisted hosts and a listed name resolving to loopback are refused and recorded; live allowlist edits; an allowlist without hosts is rejected. |
+| `ops.sh` | Daily event export (incremental zstd frames, idempotent), pruning only exported events, artifact expiry sparing tagged and referenced artifacts (dry run first), audit; `disk_enforce: hard` refusing to start where quotas cannot work. |
+| `load.sh` | Load and chaos: 12 instances over 3 nodes against a too-small shared allowance (parking, bounded 429s, latency and memory); a worker killed with 4 instances mid-task (each resumed elsewhere or halted, nothing placed on the dead node); the supervisor killed under load (all finish, no duplicate events, no false `node_lost`, audit intact). ~6 minutes. |
 
 ## Running
 
