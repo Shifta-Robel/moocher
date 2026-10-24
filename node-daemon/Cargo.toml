@@ -36,6 +36,9 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 time = { workspace = true, features = ["parsing"] }
 libc = "0.2"
+blake3.workspace = true
+globset.workspace = true
+walkdir.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -35,6 +35,9 @@ pub const ENDPOINTS: &[(&str, &str)] = &[
     ("get", "/event"),
     ("get", "/permission"),
     ("post", "/permission/{requestID}/reply"),
+    ("get", "/question"),
+    ("post", "/question/{requestID}/reply"),
+    ("post", "/question/{requestID}/reject"),
 ];
 
 #[derive(Clone)]
@@ -189,6 +192,23 @@ impl Client {
 
     pub async fn reply_permission(&self, request: &str, reply: &str) -> Result<()> {
         self.call(Method::POST, &self.scoped(&format!("/permission/{request}/reply")), Some(json!({"reply": reply}))).await?;
+        Ok(())
+    }
+
+    /// Pending `question` tool requests (`[{id, sessionID, questions: [...]}]`).
+    pub async fn pending_questions(&self) -> Result<Vec<Value>> {
+        let v = self.call(Method::GET, &self.scoped("/question"), None).await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
+    /// One answer list per question in the request (labels or free text).
+    pub async fn reply_question(&self, request: &str, answers: &[Vec<String>]) -> Result<()> {
+        self.call(Method::POST, &self.scoped(&format!("/question/{request}/reply")), Some(json!({"answers": answers}))).await?;
+        Ok(())
+    }
+
+    pub async fn reject_question(&self, request: &str) -> Result<()> {
+        self.call(Method::POST, &self.scoped(&format!("/question/{request}/reject")), None).await?;
         Ok(())
     }
 

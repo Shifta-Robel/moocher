@@ -6,7 +6,9 @@
 //!   node, per request) and forwards over the agent's egress route. The agent
 //!   only ever holds the capability token.
 //! * `/mcp` — **cluster MCP server** (streamable HTTP, JSON responses): the
-//!   tools agents use to message, spawn and report to the cluster.
+//!   tools agents use to message, spawn, ask, share artifacts and report to
+//!   the cluster. Artifact uploads/downloads run here on the node (the node
+//!   reads and writes the workspace host-side); the rest goes to the hub.
 
 use crate::cfgstore::ConfigStore;
 use crate::egress::Egress;
@@ -48,7 +50,20 @@ pub struct Gateway {
     /// Route of the last successful call (to report failovers once).
     last_route: Arc<Mutex<Option<String>>>,
     /// Per-instance changes allowed by the template (budget, preferred route).
-    overrides: Arc<SpawnOverrides>,
+    /// Shared with the instance: the operator can raise the budget live.
+    overrides: Arc<Mutex<SpawnOverrides>>,
+    /// The budget-exhausted question was raised (until the budget changes).
+    budget_flagged: Arc<std::sync::atomic::AtomicBool>,
+    ws: Arc<WsRef>,
+    files: Arc<crate::wsops::WsOps>,
+    /// Artifacts this session fetched: lineage parents of what it shares.
+    fetched: Arc<Mutex<Vec<String>>>,
+}
+
+/// The instance's workspace: host directory and the path the agent sees.
+pub struct WsRef {
+    pub root: PathBuf,
+    pub runtime_path: String,
 }
 
 const MAX_BODY: usize = 32 * 1024 * 1024;
@@ -58,11 +73,22 @@ pub struct GatewayDeps {
     pub link: LinkHandle,
     pub egress: Arc<Egress>,
     pub quotas: Arc<Quotas>,
+    pub files: Arc<crate::wsops::WsOps>,
 }
 
 impl Gateway {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(id: &str, agent: &str, role: SessionRole, cap: &str, usage: Arc<Mutex<TokenUsage>>, parked: Parked, overrides: SpawnOverrides, deps: &GatewayDeps) -> Self {
+    pub fn new(
+        id: &str,
+        agent: &str,
+        role: SessionRole,
+        cap: &str,
+        usage: Arc<Mutex<TokenUsage>>,
+        parked: Parked,
+        overrides: Arc<Mutex<SpawnOverrides>>,
+        ws: WsRef,
+        deps: &GatewayDeps,
+    ) -> Self {
         Gateway {
             id: id.into(),
             agent: agent.into(),
@@ -76,8 +102,22 @@ impl Gateway {
             parked,
             prev: Arc::new(Mutex::new(None)),
             last_route: Arc::new(Mutex::new(None)),
-            overrides: Arc::new(overrides),
+            overrides,
+            budget_flagged: Default::default(),
+            ws: Arc::new(ws),
+            files: deps.files.clone(),
+            fetched: Default::default(),
         }
+    }
+
+    /// Artifacts this session fetched (lineage of what it produces).
+    pub fn fetched(&self) -> Vec<String> {
+        self.fetched.lock().unwrap().clone()
+    }
+
+    /// The budget changed: a new exhaustion should ask again.
+    pub fn budget_changed(&self) {
+        self.budget_flagged.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Bind the socket and serve until the returned task is aborted.
@@ -173,9 +213,14 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
     };
     let usage_total = {
         let u = *g.usage.lock().unwrap();
-        if let Some(b) = g.overrides.budget_usd.or(agent.cfg.limits.budget_usd) {
+        let budget = g.overrides.lock().unwrap().budget_usd.or(agent.cfg.limits.budget_usd);
+        if let Some(b) = budget {
             if u.cost_usd >= b {
-                return llm_error(StatusCode::TOO_MANY_REQUESTS, &format!("session budget ${b:.2} exhausted"));
+                if !g.budget_flagged.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    // Spending past a budget is the operator's call (a vital question).
+                    g.link.emit(NodeEvent::BudgetExhausted { session: g.id.clone(), budget_usd: b, spent_usd: u.cost_usd });
+                }
+                return llm_error(StatusCode::TOO_MANY_REQUESTS, &format!("session budget ${b:.2} exhausted; the operator has been asked whether to raise it"));
             }
         }
         if let Some(m) = agent.cfg.limits.max_tokens {
@@ -245,7 +290,8 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
 
     // Try the preferred route, then the failovers, skipping exhausted allowances.
     let mut plan = snap.route_plan(&agent.cfg);
-    if let Some(r) = &g.overrides.route {
+    let preferred = g.overrides.lock().unwrap().route.clone();
+    if let Some(r) = &preferred {
         // The spawner chose where this instance prefers to go; failovers stay.
         plan.failover.retain(|f| f != r);
         if plan.prefer != *r {
@@ -411,6 +457,52 @@ impl Gateway {
 
 // ---------------------------------------------------------------------- MCP
 
+impl Gateway {
+    /// A path the agent gave (relative, or absolute under its workspace) ->
+    /// relative to the workspace root.
+    fn rel_path(&self, p: &str) -> anyhow::Result<String> {
+        let p = p.trim();
+        let rel = match p.strip_prefix(&self.ws.runtime_path) {
+            Some(r) => r.trim_start_matches('/'),
+            None if p.starts_with('/') => anyhow::bail!("{p} is outside your workspace ({})", self.ws.runtime_path),
+            None => p,
+        };
+        ocl_protocol::archive::clean_rel(rel)
+    }
+
+    async fn local_tool(&self, name: &str, a: &Value) -> anyhow::Result<Value> {
+        let s = |k: &str| a.get(k).and_then(|v| v.as_str()).map(String::from);
+        let root = std::fs::canonicalize(&self.ws.root)?;
+        match name {
+            "artifact_put" => {
+                let rel = self.rel_path(&s("path").ok_or_else(|| anyhow::anyhow!("missing path"))?)?;
+                let tags: Vec<String> = a.get("tags").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+                let info = crate::cas::PutInfo { name: s("name").unwrap_or_default(), session: Some(self.id.clone()), parents: self.fetched.lock().unwrap().clone(), tags, ..Default::default() };
+                let m = self.files.put_path(&root, &rel, info).await?;
+                Ok(json!({"ref": m.reference, "name": m.name, "kind": m.kind, "size": m.size, "parents": m.parents}))
+            }
+            _ => {
+                let reference = s("ref").ok_or_else(|| anyhow::anyhow!("missing ref"))?;
+                let dest = match s("path") {
+                    Some(p) => self.rel_path(&p)?,
+                    None => String::new(),
+                };
+                let (blob, meta) = self.files.cas.get(&reference).await?;
+                let written = self.files.place_at(&root, &blob, &meta, &dest).await?;
+                {
+                    let mut f = self.fetched.lock().unwrap();
+                    if !f.contains(&meta.reference) {
+                        f.push(meta.reference.clone());
+                    }
+                }
+                self.link.emit(NodeEvent::Activity { session: self.id.clone(), kind: "artifact.get".into(), detail: json!({"ref": meta.reference, "written": written.len()}) });
+                let shown: Vec<&String> = written.iter().take(50).collect();
+                Ok(json!({"ref": meta.reference, "name": meta.name, "kind": meta.kind, "written": shown, "files": written.len()}))
+            }
+        }
+    }
+}
+
 struct ToolDef {
     name: &'static str,
     desc: &'static str,
@@ -426,7 +518,17 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "send_message",
         desc: "Send a message to another session in the cluster. delivery: queue (after its current turn, default), steer (inject now), inbox (it reads it with read_inbox).",
-        schema: || obj(json!({"to": {"type": "string", "description": "session id"}, "text": {"type": "string"}, "delivery": {"type": "string", "enum": ["queue", "steer", "inbox"]}}), &["to", "text"]),
+        schema: || {
+            obj(
+                json!({
+                    "to": {"type": "string", "description": "session id"},
+                    "text": {"type": "string"},
+                    "delivery": {"type": "string", "enum": ["queue", "steer", "inbox"]},
+                    "artifacts": {"type": "array", "items": {"type": "string"}, "description": "art:// references to attach (share files with cluster_artifact_put first)"}
+                }),
+                &["to", "text"],
+            )
+        },
         coordinator: false,
     },
     ToolDef { name: "read_inbox", desc: "Read and clear messages left for you by other sessions.", schema: || obj(json!({}), &[]), coordinator: false },
@@ -474,6 +576,86 @@ const TOOLS: &[ToolDef] = &[
         coordinator: true,
     },
     ToolDef { name: "task_fail", desc: "Give up on your task with a reason.", schema: || obj(json!({"reason": {"type": "string"}}), &["reason"]), coordinator: true },
+    ToolDef {
+        name: "ask",
+        desc: "Ask a question you cannot decide yourself. It goes to the agent that started you, then up the chain, and to the operator depending on the question mode. Returns at once; the answer arrives as a message, so continue with other work if you can. importance: low (a preference), normal (affects the result), vital (money, credentials, deleting data, irreversible or external actions). Rules may raise importance, never lower it.",
+        schema: || {
+            obj(
+                json!({
+                    "question": {"type": "string"},
+                    "options": {"type": "array", "items": {"type": "string"}, "description": "possible answers, if any"},
+                    "importance": {"type": "string", "enum": ["low", "normal", "vital"]},
+                    "context": {"type": "string", "description": "what you know and what depends on the answer"}
+                }),
+                &["question"],
+            )
+        },
+        coordinator: false,
+    },
+    ToolDef {
+        name: "answer",
+        desc: "Answer a question an agent you started asked you (id from the question message or cluster_questions).",
+        schema: || obj(json!({"id": {"type": "string"}, "answer": {"type": "string"}}), &["id", "answer"]),
+        coordinator: false,
+    },
+    ToolDef {
+        name: "escalate",
+        desc: "Pass a question you hold up the chain (towards the operator), adding what you know in note.",
+        schema: || obj(json!({"id": {"type": "string"}, "note": {"type": "string"}}), &["id"]),
+        coordinator: false,
+    },
+    ToolDef { name: "questions", desc: "Questions waiting for your answer.", schema: || obj(json!({}), &[]), coordinator: false },
+    ToolDef {
+        name: "report_up",
+        desc: "Send a short status report to whoever started you (the operator if nobody did). Not a question: no answer is expected.",
+        schema: || obj(json!({"message": {"type": "string"}}), &["message"]),
+        coordinator: false,
+    },
+    ToolDef {
+        name: "log_assumption",
+        desc: "Record a decision you made without asking (what you assumed and why) in the assumption log the operator reviews.",
+        schema: || obj(json!({"text": {"type": "string"}}), &["text"]),
+        coordinator: false,
+    },
+    ToolDef {
+        name: "artifact_put",
+        desc: "Share a file or directory from your workspace as an artifact. Returns its reference (art://b3/...), which you can pass to other agents in messages. Directories are packed as a tree.",
+        schema: || {
+            obj(
+                json!({
+                    "path": {"type": "string", "description": "file or directory, relative to your workspace"},
+                    "name": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}}
+                }),
+                &["path"],
+            )
+        },
+        coordinator: false,
+    },
+    ToolDef {
+        name: "artifact_get",
+        desc: "Fetch an artifact into your workspace. A file goes to `path` (default: its name); a tree is unpacked into the directory `path` (default: the workspace root).",
+        schema: || obj(json!({"ref": {"type": "string", "description": "art://b3/..."}, "path": {"type": "string"}}), &["ref"]),
+        coordinator: false,
+    },
+    ToolDef {
+        name: "artifact_list",
+        desc: "List artifacts in the cluster (newest first), optionally filtered by text or to your task.",
+        schema: || obj(json!({"query": {"type": "string"}, "task_only": {"type": "boolean"}}), &[]),
+        coordinator: false,
+    },
+    ToolDef {
+        name: "artifact_info",
+        desc: "Metadata and lineage of an artifact: who made it, from which artifacts, and what was made from it.",
+        schema: || obj(json!({"ref": {"type": "string"}}), &["ref"]),
+        coordinator: false,
+    },
+    ToolDef {
+        name: "sync_workspace",
+        desc: "Shared workspaces on several machines: exchange changes with the other copies now (it also happens after every turn). Files changed on both sides are kept as yours, theirs next to them as <file>.theirs.",
+        schema: || obj(json!({}), &[]),
+        coordinator: false,
+    },
 ];
 
 /// Cluster tools a session with this role and allowlist can call (for the preamble).
@@ -502,11 +684,14 @@ impl Gateway {
 fn to_call(name: &str, a: &Value) -> Result<AgentCall, String> {
     let s = |k: &str| a.get(k).and_then(|v| v.as_str()).map(String::from).ok_or_else(|| format!("missing string argument {k:?}"));
     Ok(match name {
-        "send_message" => AgentCall::Send {
-            to: s("to")?,
-            text: s("text")?,
-            delivery: a.get("delivery").and_then(|d| serde_json::from_value(d.clone()).ok()).unwrap_or_default(),
-        },
+        "send_message" => {
+            let mut text = s("text")?;
+            let refs: Vec<String> = a.get("artifacts").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+            if !refs.is_empty() {
+                text.push_str(&format!("\n\nAttached artifacts (fetch with cluster_artifact_get): {}", refs.join(", ")));
+            }
+            AgentCall::Send { to: s("to")?, text, delivery: a.get("delivery").and_then(|d| serde_json::from_value(d.clone()).ok()).unwrap_or_default() }
+        }
         "read_inbox" => AgentCall::Inbox,
         "list_agents" => AgentCall::ListAgents,
         "list_nodes" => AgentCall::ListNodes,
@@ -525,6 +710,20 @@ fn to_call(name: &str, a: &Value) -> Result<AgentCall, String> {
         "task_note" => AgentCall::TaskNote { note: s("note")? },
         "task_complete" => AgentCall::TaskComplete { summary: s("summary")? },
         "task_fail" => AgentCall::TaskFail { reason: s("reason")? },
+        "ask" => AgentCall::Ask {
+            question: s("question")?,
+            options: a.get("options").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default(),
+            importance: s("importance").ok().and_then(|i| ocl_protocol::model::Importance::parse(&i)),
+            context: s("context").ok(),
+        },
+        "answer" => AgentCall::Answer { id: s("id")?, answer: s("answer")? },
+        "escalate" => AgentCall::Escalate { id: s("id")?, note: s("note").ok() },
+        "questions" => AgentCall::Questions,
+        "report_up" => AgentCall::ReportUp { message: s("message")? },
+        "log_assumption" => AgentCall::LogAssumption { text: s("text")? },
+        "artifact_list" => AgentCall::ArtifactList { query: s("query").ok(), task_only: a.get("task_only").and_then(|v| v.as_bool()).unwrap_or(false) },
+        "artifact_info" => AgentCall::ArtifactInfo { reference: s("ref")? },
+        "sync_workspace" => AgentCall::SyncWorkspace,
         _ => return Err(format!("unknown tool {name}")),
     })
 }
@@ -582,6 +781,13 @@ async fn handle_rpc(g: &Gateway, m: &Value) -> Option<Value> {
             };
             if !g.tool_allowed(def) {
                 return Some(ok(json!({"content": [{"type": "text", "text": format!("tool {name} is not permitted for this session")}], "isError": true})));
+            }
+            // Artifact bytes move here on the node, next to the workspace.
+            if name == "artifact_put" || name == "artifact_get" {
+                return Some(match g.local_tool(name, &args).await {
+                    Ok(v) => ok(json!({"content": [{"type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default()}], "isError": false})),
+                    Err(e) => ok(json!({"content": [{"type": "text", "text": format!("cluster error: {e:#}")}], "isError": true})),
+                });
             }
             let call = match to_call(name, &args) {
                 Ok(c) => c,

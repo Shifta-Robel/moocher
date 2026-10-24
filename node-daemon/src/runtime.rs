@@ -61,6 +61,15 @@ pub struct Runtime {
     procs: Mutex<HashMap<String, (u32, u16)>>,
     /// podman: id -> cgroup v2 directory (looked up once)
     cgroups: Mutex<HashMap<String, PathBuf>>,
+    /// process runtime: exit codes of instances whose process ended.
+    exited: std::sync::Arc<Mutex<HashMap<String, i32>>>,
+}
+
+/// How an instance's container/process ended.
+#[derive(Debug, Clone)]
+pub struct Exit {
+    pub code: i32,
+    pub oom: bool,
 }
 
 pub fn container_name(id: &str) -> String {
@@ -84,7 +93,49 @@ impl Runtime {
             bridge_bin,
             procs: Mutex::new(HashMap::new()),
             cgroups: Mutex::new(HashMap::new()),
+            exited: Default::default(),
         })
+    }
+
+    /// Files written into workspaces must belong to the container user (rootful Podman).
+    pub fn chown_target(&self) -> Option<u32> {
+        (self.kind == RuntimeKind::Podman && !self.rootless).then_some(CONTAINER_UID)
+    }
+
+    /// Instances (of `ids`) whose container/process has ended, with how.
+    pub async fn ended(&self, node: &str, ids: &[String]) -> HashMap<String, Exit> {
+        let mut out = HashMap::new();
+        match self.kind {
+            RuntimeKind::Process => {
+                let ex = self.exited.lock().unwrap();
+                for id in ids {
+                    if let Some(code) = ex.get(id) {
+                        out.insert(id.clone(), Exit { code: *code, oom: false });
+                    }
+                }
+            }
+            RuntimeKind::Podman => {
+                let Ok(found) = self.list(node).await else { return out };
+                for id in ids {
+                    match found.iter().find(|f| &f.id == id) {
+                        Some(f) if f.running => {}
+                        Some(_) => {
+                            let fmt = "{{.State.ExitCode}} {{.State.OOMKilled}}";
+                            let info = self.podman(&["inspect", "--format", fmt, &container_name(id)]).await.unwrap_or_default();
+                            let mut it = info.split_whitespace();
+                            let code = it.next().and_then(|c| c.parse().ok()).unwrap_or(-1);
+                            let oom = it.next() == Some("true");
+                            out.insert(id.clone(), Exit { code, oom });
+                        }
+                        // Removed behind our back.
+                        None => {
+                            out.insert(id.clone(), Exit { code: -1, oom: false });
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Path of the workspace as seen by OpenCode.
@@ -118,6 +169,14 @@ impl Runtime {
             std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
         }
         std::fs::set_permissions(&paths.run, std::fs::Permissions::from_mode(0o700))?;
+        // Agents only use the provider in the generated config. Without a cached
+        // model catalog, OpenCode fetches models.dev at boot; on a host whose DNS
+        // prefers unreachable IPv6 that stalls each new instance for ~30 s.
+        let catalog = paths.home.join(".cache/opencode/models.json");
+        if !catalog.exists() {
+            std::fs::create_dir_all(catalog.parent().unwrap())?;
+            std::fs::write(&catalog, "{}")?;
+        }
         if self.kind == RuntimeKind::Podman && !self.rootless {
             // Rootful podman: container uid 1000 is host uid 1000.
             for d in [&paths.run, &paths.home, &paths.workspace] {
@@ -212,11 +271,18 @@ impl Runtime {
             cmd.env(k, v);
         }
         let child = cmd.spawn().with_context(|| format!("starting {}", self.bridge_bin.display()))?;
-        self.procs.lock().unwrap().insert(s.id.to_string(), (child.id(), gw));
-        // Reap in the background so it never becomes a zombie.
+        let pid = child.id();
+        self.procs.lock().unwrap().insert(s.id.to_string(), (pid, gw));
+        self.exited.lock().unwrap().remove(s.id);
+        // Reap in the background so it never becomes a zombie, and remember how it ended.
+        let (exited, id) = (self.exited.clone(), s.id.to_string());
         std::thread::spawn(move || {
             let mut child = child;
-            let _ = child.wait();
+            let code = child.wait().ok().map(|st| {
+                use std::os::unix::process::ExitStatusExt;
+                st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(1))
+            });
+            exited.lock().unwrap().insert(id, code.unwrap_or(-1));
         });
         Ok(())
     }
@@ -246,6 +312,7 @@ impl Runtime {
         }
     }
 
+    /// Stop the container (it is kept until `remove`) or the process.
     pub async fn stop(&self, id: &str) -> Result<()> {
         self.cgroups.lock().unwrap().remove(id);
         match self.kind {
@@ -253,14 +320,29 @@ impl Runtime {
                 self.podman(&["stop", "-t", "10", &container_name(id)]).await?;
             }
             RuntimeKind::Process => {
-                if let Some((pid, _)) = self.procs.lock().unwrap().remove(id) {
-                    if pid != 0 {
-                        let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+                // Keep the gateway port so a restart reuses the generated config.
+                let pid = self.procs.lock().unwrap().get(id).map(|(p, _)| *p).unwrap_or(0);
+                if pid != 0 {
+                    let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+                    for _ in 0..50 {
+                        if self.exited.lock().unwrap().contains_key(id) {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
+                }
+                if let Some(e) = self.procs.lock().unwrap().get_mut(id) {
+                    e.0 = 0;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Forget an instance's bookkeeping (process runtime) after it is reaped.
+    pub fn forget(&self, id: &str) {
+        self.procs.lock().unwrap().remove(id);
+        self.exited.lock().unwrap().remove(id);
     }
 
     pub async fn remove(&self, id: &str) -> Result<()> {
@@ -272,7 +354,7 @@ impl Runtime {
 
     pub async fn list(&self, node: &str) -> Result<Vec<Found>> {
         if self.kind == RuntimeKind::Process {
-            return Ok(self.procs.lock().unwrap().keys().map(|id| Found { id: id.clone(), running: true }).collect());
+            return Ok(self.procs.lock().unwrap().iter().map(|(id, (pid, _))| Found { id: id.clone(), running: *pid != 0 }).collect());
         }
         let out = self.podman(&["ps", "-a", "--filter", &format!("label=ocl.node={node}"), "--format", "json"]).await?;
         let v: serde_json::Value = serde_json::from_str(&out).unwrap_or(serde_json::Value::Array(vec![]));
@@ -290,6 +372,8 @@ impl Runtime {
             .unwrap_or_default())
     }
 
+    /// Start a kept container again. The process runtime has nothing to
+    /// start: callers relaunch with `launch` (same paths, same home).
     pub async fn start_existing(&self, id: &str) -> Result<()> {
         if self.kind == RuntimeKind::Podman {
             self.podman(&["start", &container_name(id)]).await?;
@@ -361,7 +445,7 @@ fn is_root() -> bool {
     std::fs::metadata("/proc/self").map(|m| std::os::unix::fs::MetadataExt::uid(&m) == 0).unwrap_or(false)
 }
 
-fn chown_r(path: &Path, uid: u32) -> Result<()> {
+pub fn chown_r(path: &Path, uid: u32) -> Result<()> {
     std::os::unix::fs::chown(path, Some(uid), Some(uid))?;
     if path.is_dir() {
         for e in std::fs::read_dir(path)? {

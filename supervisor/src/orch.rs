@@ -48,6 +48,8 @@ impl Sup {
             s.verdict = Some(if error.is_some() { Verdict::Fail } else { todo_verdict(&todos, &[], true) });
             self.save_session(&s);
         }
+        // Other machines working in the same shared workspace get this turn's changes.
+        self.ws_after_turn(&s).await;
         if let Some(run) = s.run_id.clone() {
             if let Err(e) = self.advance_run(&run, &s, last_text.clone(), &todos, error.clone()).await {
                 tracing::warn!(run, error = %e, "workflow step handling failed");
@@ -84,8 +86,9 @@ impl Sup {
     pub async fn start_run(self: &Arc<Self>, actor: &Actor, workflow: &str, input: &str, task_id: Option<i64>) -> Result<WorkflowRun> {
         let wf = self.workflows().into_iter().find(|w| w.name == workflow).ok_or_else(|| anyhow!("no workflow named {workflow:?}"))?;
         let first = wf.steps.first().ok_or_else(|| anyhow!("workflow {workflow} has no steps"))?.clone();
-        // Phase 1: a run's shared workspace lives on one node, so every step must
-        // be runnable there. Pick a node that has all the step agents.
+        // Prefer one node that has every step's agent (no workspace copies).
+        // Otherwise each step is placed on its own and the run's shared
+        // workspace follows it through the artifact store.
         let mut node = first.node.clone();
         if node.is_none() {
             let mut cands = self.candidates(&first.agent);
@@ -94,8 +97,10 @@ impl Sup {
                 cands.retain(|n| c.contains(n) || st.node.as_deref() == Some(n.as_str()));
             }
             node = cands.into_iter().next();
-            if node.is_none() {
-                bail!("no single connected node has all agents of workflow {workflow} ({})", wf.steps.iter().map(|s| s.agent.as_str()).collect::<Vec<_>>().join(", "));
+            for st in &wf.steps {
+                if st.node.is_none() && self.candidates(&st.agent).is_empty() {
+                    bail!("no connected node can run step {} (agent {})", st.name, st.agent);
+                }
             }
         }
         let id = ocl_protocol::new_id("r");
@@ -146,7 +151,9 @@ impl Sup {
                 prompt.push_str(&format!("- {t}\n"));
             }
         }
-        let node = step.node.clone().or(node).or_else(|| run.steps.last().and_then(|p| self.db.session(&p.session)).map(|s| s.report.node));
+        // Stay on the previous step's node when it can run this step too.
+        let prev_node = run.steps.last().and_then(|p| self.db.session(&p.session)).map(|s| s.report.node).filter(|n| self.candidates(&step.agent).contains(n));
+        let node = step.node.clone().or(node.filter(|n| self.candidates(&step.agent).contains(n))).or(prev_node);
         let s = self
             .spawn(
                 &Actor::System,
@@ -155,7 +162,7 @@ impl Sup {
                     prompt: Some(prompt),
                     node,
                     title: Some(format!("{} · {}", wf.name, step.name)),
-                    workspace: Some(wf.workspace.clone().unwrap_or(WorkspaceSpec { mode: WorkspaceMode::Shared, name: Some(run.workspace.clone()) })),
+                    workspace: Some(wf.workspace.clone().unwrap_or(WorkspaceSpec { mode: WorkspaceMode::Shared, name: Some(run.workspace.clone()), seed: None })),
                     task_id: run.task_id,
                     run_id: Some(run.id.clone()),
                     step: Some(step.name.clone()),
@@ -327,6 +334,7 @@ impl Sup {
             updated_at: now,
             started_at: None,
             finished_at: None,
+            question_mode: c.question_mode,
         };
         self.db.insert_task(&mut t)?;
         let _ = self.stream.send(StreamEvent::Task(t.clone()));
@@ -350,6 +358,9 @@ impl Sup {
         }
         if let Some(v) = p.rank {
             t.rank = v;
+        }
+        if let Some(v) = p.question_mode {
+            t.question_mode = Some(v);
         }
         t.updated_at = now_ms();
         self.save_task(&t);
@@ -419,7 +430,7 @@ impl Sup {
                             prompt: Some(prompt),
                             node: sched.coordinator_node.clone(),
                             title: Some(format!("task #{} coordinator", t.id)),
-                            workspace: Some(WorkspaceSpec { mode: WorkspaceMode::Shared, name: Some(format!("task-{}", t.id)) }),
+                            workspace: Some(WorkspaceSpec { mode: WorkspaceMode::Shared, name: Some(format!("task-{}", t.id)), seed: None }),
                             task_id: Some(t.id),
                             role: SessionRole::Coordinator,
                             extra_instructions: Some(COORDINATOR_BRIEFING.into()),
@@ -464,6 +475,17 @@ impl Sup {
         if matches!(t.status, TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled) {
             return Ok(());
         }
+        // Halted sessions are kept for a resume; ending the task ends them too.
+        let halted: Vec<String> = self.db.sessions(true).into_iter().filter(|s| s.task_id == Some(id) && s.report.state == SessionState::Halted).map(|s| s.report.id).collect();
+        for s in halted {
+            let _ = self.stop_with(&Actor::System, &s, false, "task_end").await;
+        }
+        for mut h in self.db.halts(true).into_iter().filter(|h| h.scope == format!("task:{id}")) {
+            h.status = "resolved".into();
+            h.resolution = Some(format!("task ended ({})", status.as_str()));
+            h.resolved_at = Some(now_ms());
+            let _ = self.db.put_halt(&h);
+        }
         t.status = status;
         t.result = Some(result);
         t.finished_at = Some(now_ms());
@@ -482,7 +504,7 @@ impl Sup {
                 let _ = me.cancel_run(&Actor::System, &r).await;
             }
             for s in sessions {
-                let _ = me.stop(&Actor::System, &s, false).await;
+                let _ = me.stop_with(&Actor::System, &s, false, "task_end").await;
             }
         });
         Ok(())
@@ -521,6 +543,7 @@ impl Sup {
     /// Scheduler tick (every ~2s).
     pub async fn schedule(self: &Arc<Self>, idle_since: &mut Option<Ts>) {
         self.expire_unreachable();
+        self.question_tick().await;
         if !self.cfg.tasks.enabled {
             return;
         }

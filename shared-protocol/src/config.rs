@@ -76,6 +76,21 @@ pub struct NodeConfig {
     pub default_route: Option<String>,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// Send a checkpoint (workspace snapshot + transcript) to the hub every N
+    /// finished turns, so a session can resume elsewhere if this machine dies.
+    /// 0 turns checkpoints off.
+    #[serde(default = "default_checkpoint_turns")]
+    pub checkpoint_every_turns: u32,
+    /// Local artifact cache size; least recently used blobs are dropped beyond it.
+    #[serde(default = "default_cache_size")]
+    pub artifact_cache: String,
+}
+
+fn default_checkpoint_turns() -> u32 {
+    3
+}
+fn default_cache_size() -> String {
+    "2g".into()
 }
 
 fn default_node_max_sessions() -> u32 {
@@ -198,6 +213,133 @@ pub struct SupervisorConfig {
     /// Seconds a disconnected node's sessions stay `unreachable` before becoming `lost`.
     #[serde(default = "default_grace")]
     pub disconnect_grace_secs: u64,
+    /// Questions from agents: who sees what (PHASE1_5 §6).
+    #[serde(default)]
+    pub questions: QuestionsConfig,
+    /// What happens when an agent dies (PHASE1_5 §8). Templates may override it.
+    #[serde(default)]
+    pub on_death: DeathPolicy,
+    #[serde(default)]
+    pub artifacts: ArtifactsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QuestionsConfig {
+    /// Starting mode; switch it live with `ocl questions mode` (per task too).
+    #[serde(default)]
+    pub mode: crate::model::QuestionMode,
+    /// An agent holding a question for this long without answering or
+    /// escalating passes it up automatically.
+    #[serde(default = "default_answer_timeout")]
+    pub answer_timeout_secs: u64,
+    /// Words that make a question `vital` (the rules only ever raise importance).
+    #[serde(default = "default_vital_words")]
+    pub vital_keywords: Vec<String>,
+    /// Words that make a question operator-only: no agent may answer it.
+    #[serde(default = "default_operator_words")]
+    pub operator_only_keywords: Vec<String>,
+}
+
+fn default_answer_timeout() -> u64 {
+    300
+}
+
+fn default_vital_words() -> Vec<String> {
+    [
+        "spend", "money", "pay for", "purchase", "invoice", "billing", "credit card", "budget", "credential", "password", "secret", "api key",
+        "delete", "drop table", "rm -rf", "wipe", "irreversible", "cannot be undone", "force push", "push --force", "deploy", "production",
+        "publish", "send email",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+fn default_operator_words() -> Vec<String> {
+    ["credential", "password", "secret", "api key", "private key"].map(String::from).to_vec()
+}
+
+impl Default for QuestionsConfig {
+    fn default() -> Self {
+        QuestionsConfig {
+            mode: Default::default(),
+            answer_timeout_secs: default_answer_timeout(),
+            vital_keywords: default_vital_words(),
+            operator_only_keywords: default_operator_words(),
+        }
+    }
+}
+
+/// Recovery policy for dead agents. The cheapest recovery runs automatically
+/// at most `auto_retry` times, unless it would cost more than
+/// `max_auto_cost_usd` or `max_auto_fraction` of what the task has spent;
+/// then the task is halted and the operator chooses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeathPolicy {
+    #[serde(default = "default_auto_retry")]
+    pub auto_retry: u32,
+    #[serde(default = "default_max_auto_cost")]
+    pub max_auto_cost_usd: f64,
+    #[serde(default = "default_max_auto_fraction")]
+    pub max_auto_fraction: f64,
+    /// $0 providers: halt instead when a retry would use more than this
+    /// fraction of the allowance left.
+    #[serde(default = "default_max_auto_fraction")]
+    pub keyless_quota_fraction: f64,
+    /// A fresh agent costs about this fraction of what was spent so far.
+    #[serde(default = "default_handoff_factor")]
+    pub handoff_factor: f64,
+    /// Deaths within 10 minutes that count as a crash loop (no more auto restarts).
+    #[serde(default = "default_crashloop")]
+    pub crashloop_deaths: u32,
+}
+
+fn default_auto_retry() -> u32 {
+    1
+}
+fn default_max_auto_cost() -> f64 {
+    0.50
+}
+fn default_max_auto_fraction() -> f64 {
+    0.25
+}
+fn default_handoff_factor() -> f64 {
+    0.5
+}
+fn default_crashloop() -> u32 {
+    3
+}
+
+impl Default for DeathPolicy {
+    fn default() -> Self {
+        DeathPolicy {
+            auto_retry: default_auto_retry(),
+            max_auto_cost_usd: default_max_auto_cost(),
+            max_auto_fraction: default_max_auto_fraction(),
+            keyless_quota_fraction: default_max_auto_fraction(),
+            handoff_factor: default_handoff_factor(),
+            crashloop_deaths: default_crashloop(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactsConfig {
+    /// Largest single artifact accepted (e.g. `2g`).
+    #[serde(default = "default_max_artifact")]
+    pub max_size: String,
+}
+
+fn default_max_artifact() -> String {
+    "2g".into()
+}
+
+impl Default for ArtifactsConfig {
+    fn default() -> Self {
+        ArtifactsConfig { max_size: default_max_artifact() }
+    }
 }
 
 impl Default for SupervisorConfig {
@@ -212,6 +354,9 @@ impl Default for SupervisorConfig {
             data_dir: None,
             tasks: TaskSchedulerConfig::default(),
             disconnect_grace_secs: default_grace(),
+            questions: QuestionsConfig::default(),
+            on_death: DeathPolicy::default(),
+            artifacts: ArtifactsConfig::default(),
         }
     }
 }
@@ -769,6 +914,77 @@ pub struct AgentConfig {
     /// What whoever spawns an instance (operator or coordinator) may change.
     #[serde(default)]
     pub overridable: Overridable,
+    /// Files collected when the instance stops, dies or its task ends.
+    #[serde(default)]
+    pub outputs: Vec<OutputSpec>,
+    /// Also keep the conversation as an artifact when the instance ends.
+    #[serde(default)]
+    pub transcript: bool,
+    /// How long the container's volumes are kept after it ends: a duration
+    /// (`24h`, the default), `on_failure` (24 h, only after a failure or death),
+    /// `always` or `never`.
+    #[serde(default = "default_retain")]
+    pub retain: String,
+    /// Overrides the supervisor's `on_death` for this template.
+    #[serde(default)]
+    pub on_death: Option<DeathPolicy>,
+}
+
+fn default_retain() -> String {
+    "24h".into()
+}
+
+/// One harvested output: `{ path: "dist/**", to: parent_workspace, dest: "from-builder/" }`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OutputSpec {
+    /// File, directory or glob relative to the workspace (`report.md`, `dist/`, `**/*.whl`).
+    pub path: String,
+    /// `artifact` (default), `parent_workspace`, `task_workspace` or
+    /// `workspace:<name>` (a shared workspace).
+    #[serde(default = "default_output_to")]
+    pub to: String,
+    /// Directory inside the destination workspace (default: same relative path).
+    #[serde(default)]
+    pub dest: Option<String>,
+    /// Artifact name (default: the path).
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+fn default_output_to() -> String {
+    "artifact".into()
+}
+
+/// When a stopped instance's volumes are removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retain {
+    /// Keep for this many milliseconds.
+    For(i64),
+    /// Keep for 24 h only if the instance failed or died; otherwise remove at once.
+    OnFailure,
+    Always,
+    Never,
+}
+
+impl Retain {
+    pub fn parse(s: &str) -> Option<Retain> {
+        Some(match s.trim() {
+            "always" => Retain::Always,
+            "never" | "0" => Retain::Never,
+            "on_failure" | "on-failure" => Retain::OnFailure,
+            d => Retain::For(parse_duration_ms(d)?),
+        })
+    }
+    /// Milliseconds to keep after the end, `None` = forever.
+    pub fn keep_ms(self, failed: bool) -> Option<i64> {
+        match self {
+            Retain::For(ms) => Some(ms),
+            Retain::OnFailure => Some(if failed { 86_400_000 } else { 0 }),
+            Retain::Always => None,
+            Retain::Never => Some(0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1008,14 +1224,18 @@ pub enum Egress {
 pub struct WorkspaceSpec {
     #[serde(default)]
     pub mode: WorkspaceMode,
-    /// `shared` mode: sessions with the same name share one workspace (per node).
+    /// `shared` mode: sessions with the same name share one workspace. Across
+    /// machines it is synced through the artifact store.
     #[serde(default)]
     pub name: Option<String>,
+    /// Start a new workspace from an artifact (`art://b3/…`, a file or tree).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<String>,
 }
 
 impl Default for WorkspaceSpec {
     fn default() -> Self {
-        WorkspaceSpec { mode: WorkspaceMode::Isolated, name: None }
+        WorkspaceSpec { mode: WorkspaceMode::Isolated, name: None, seed: None }
     }
 }
 
@@ -1186,6 +1406,18 @@ impl AgentConfig {
         if self.workspace.mode == WorkspaceMode::Shared && self.workspace.name.is_none() {
             errs.push("workspace.mode=shared requires workspace.name".into());
         }
+        if Retain::parse(&self.retain).is_none() {
+            errs.push(format!("retain {:?} must be a duration (24h), on_failure, always or never", self.retain));
+        }
+        for o in &self.outputs {
+            let ok = matches!(o.to.as_str(), "artifact" | "parent_workspace" | "task_workspace") || o.to.strip_prefix("workspace:").is_some_and(valid_name);
+            if !ok {
+                errs.push(format!("outputs: to {:?} must be artifact, parent_workspace, task_workspace or workspace:<name>", o.to));
+            }
+            if o.path.starts_with('/') || o.path.split('/').any(|c| c == "..") {
+                errs.push(format!("outputs: path {:?} must be relative to the workspace", o.path));
+            }
+        }
         errs
     }
 }
@@ -1288,6 +1520,22 @@ success: { todos: ["write module"], checks: [ { exit_code: "pytest -q" } ] }
         assert!(SpawnOverrides { role_append: Some("x".into()), ..Default::default() }.check(&strict).is_err());
         let both: AgentConfig = serde_yaml::from_str("name: b\nprovider: { id: groq, model: m, key: { ref: 'env:X', secret: y } }").unwrap();
         assert_eq!(both.validate(&builtin_providers()).len(), 1);
+    }
+
+    #[test]
+    fn retention_and_outputs() {
+        assert_eq!(Retain::parse("24h"), Some(Retain::For(86_400_000)));
+        assert_eq!(Retain::parse("never").unwrap().keep_ms(false), Some(0));
+        assert_eq!(Retain::parse("always").unwrap().keep_ms(true), None);
+        let f = Retain::parse("on_failure").unwrap();
+        assert_eq!((f.keep_ms(false), f.keep_ms(true)), (Some(0), Some(86_400_000)));
+        assert_eq!(Retain::parse("soon"), None);
+        let y = "name: a\nprovider: { id: groq, model: m, key: { ref: \"env:K\" } }\noutputs:\n  - { path: report.md, to: parent_workspace }\n  - { path: ../etc/passwd }\n  - { path: x, to: somewhere }\nretain: soon\n";
+        let a: AgentConfig = serde_yaml::from_str(y).unwrap();
+        let errs = a.validate(&builtin_providers());
+        assert!(errs.iter().any(|e| e.contains("relative to the workspace")), "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("to \"somewhere\"")), "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("retain")), "{errs:?}");
     }
 
     #[test]

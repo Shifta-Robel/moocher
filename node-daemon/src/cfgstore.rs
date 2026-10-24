@@ -83,6 +83,9 @@ impl Snapshot {
                 source: a.source.into(),
                 max_instances: a.cfg.instances.max,
                 overridable: a.cfg.overridable.clone(),
+                price_in_per_mtok: self.providers.get(&a.cfg.provider.id).and_then(|p| p.prices.get(&a.cfg.provider.model)).map(|p| p.input_per_mtok).unwrap_or(0.0),
+                price_out_per_mtok: self.providers.get(&a.cfg.provider.id).and_then(|p| p.prices.get(&a.cfg.provider.model)).map(|p| p.output_per_mtok).unwrap_or(0.0),
+                on_death: a.cfg.on_death.clone(),
             })
             .collect()
     }

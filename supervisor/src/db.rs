@@ -83,7 +83,18 @@ impl Db {
              CREATE INDEX IF NOT EXISTS instance_stats_session ON instance_stats(session, ts);
              CREATE TABLE IF NOT EXISTS route_stats(node TEXT NOT NULL, route TEXT NOT NULL, provider TEXT NOT NULL, info TEXT NOT NULL, PRIMARY KEY(node, route, provider));
              CREATE TABLE IF NOT EXISTS quota_buckets(node TEXT NOT NULL, provider TEXT NOT NULL, scope_id TEXT NOT NULL, kind TEXT NOT NULL,
-                info TEXT NOT NULL, PRIMARY KEY(node, provider, scope_id, kind));",
+                info TEXT NOT NULL, PRIMARY KEY(node, provider, scope_id, kind));
+             CREATE TABLE IF NOT EXISTS artifacts(hash TEXT PRIMARY KEY, name TEXT NOT NULL, task_id INTEGER, created_at INTEGER NOT NULL, info TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS questions(id TEXT PRIMARY KEY, status TEXT NOT NULL, asker TEXT NOT NULL, holder TEXT NOT NULL,
+                request TEXT, updated_at INTEGER NOT NULL, info TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS questions_status ON questions(status);
+             CREATE TABLE IF NOT EXISTS assumptions(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, task_id INTEGER, info TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS checkpoints(session TEXT PRIMARY KEY, info TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS harvests(id INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT NOT NULL, ts INTEGER NOT NULL, info TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS harvests_session ON harvests(session);
+             CREATE TABLE IF NOT EXISTS halts(id TEXT PRIMARY KEY, status TEXT NOT NULL, scope TEXT NOT NULL, info TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, read INTEGER NOT NULL DEFAULT 0, info TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS workspaces(name TEXT PRIMARY KEY, info TEXT NOT NULL);",
         )?;
         {
             use std::os::unix::fs::PermissionsExt;
@@ -560,6 +571,172 @@ impl Db {
         Ok(n)
     }
 
+    // --------------------------------------------------------- artifacts
+
+    pub fn put_artifact(&self, a: &ArtifactMeta) -> Result<()> {
+        self.c.lock().unwrap().execute(
+            "INSERT INTO artifacts(hash,name,task_id,created_at,info) VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(hash) DO UPDATE SET info=excluded.info, name=excluded.name, task_id=excluded.task_id",
+            params![a.hash, a.name, a.task_id, a.created_at, serde_json::to_string(a)?],
+        )?;
+        Ok(())
+    }
+
+    /// By full hash or a unique prefix.
+    pub fn artifact(&self, hash: &str) -> Option<ArtifactMeta> {
+        let rows: Vec<ArtifactMeta> = self.json_rows("SELECT info FROM artifacts WHERE hash LIKE ?1 || '%' LIMIT 2", params![hash]);
+        if rows.len() == 1 {
+            rows.into_iter().next()
+        } else {
+            rows.into_iter().find(|a| a.hash == hash)
+        }
+    }
+
+    pub fn artifacts(&self, query: Option<&str>, task: Option<i64>, limit: i64) -> Vec<ArtifactMeta> {
+        let q = format!("%{}%", query.unwrap_or(""));
+        match task {
+            Some(t) => self.json_rows("SELECT info FROM artifacts WHERE task_id=?1 AND (name LIKE ?2 OR info LIKE ?2) ORDER BY created_at DESC LIMIT ?3", params![t, q, limit]),
+            None => self.json_rows("SELECT info FROM artifacts WHERE name LIKE ?1 OR info LIKE ?1 ORDER BY created_at DESC LIMIT ?2", params![q, limit]),
+        }
+    }
+
+    // --------------------------------------------------------- questions
+
+    pub fn put_question(&self, q: &Question) -> Result<()> {
+        let status = serde_json::to_value(q.status)?.as_str().unwrap_or("open").to_string();
+        self.c.lock().unwrap().execute(
+            "INSERT INTO questions(id,status,asker,holder,request,updated_at,info) VALUES(?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(id) DO UPDATE SET status=excluded.status, holder=excluded.holder, updated_at=excluded.updated_at, info=excluded.info",
+            params![q.id, status, q.asker, q.holder, q.request, q.updated_at, serde_json::to_string(q)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn question(&self, id: &str) -> Option<Question> {
+        self.json_rows("SELECT info FROM questions WHERE id=?1", params![id]).into_iter().next()
+    }
+
+    pub fn question_by_request(&self, asker: &str, request: &str) -> Option<Question> {
+        self.json_rows("SELECT info FROM questions WHERE asker=?1 AND request=?2", params![asker, request]).into_iter().next()
+    }
+
+    pub fn questions(&self, open_only: bool) -> Vec<Question> {
+        if open_only {
+            self.json_rows("SELECT info FROM questions WHERE status='open' ORDER BY updated_at", [])
+        } else {
+            self.json_rows("SELECT info FROM questions ORDER BY updated_at DESC LIMIT 500", [])
+        }
+    }
+
+    pub fn add_assumption(&self, a: &Assumption) -> Result<i64> {
+        let c = self.c.lock().unwrap();
+        c.execute("INSERT INTO assumptions(ts,task_id,info) VALUES(?1,?2,'{}')", params![a.ts, a.task_id])?;
+        let id = c.last_insert_rowid();
+        let mut a = a.clone();
+        a.id = id;
+        c.execute("UPDATE assumptions SET info=?2 WHERE id=?1", params![id, serde_json::to_string(&a)?])?;
+        Ok(id)
+    }
+
+    pub fn assumptions(&self, task: Option<i64>) -> Vec<Assumption> {
+        match task {
+            Some(t) => self.json_rows("SELECT info FROM assumptions WHERE task_id=?1 ORDER BY id", params![t]),
+            None => self.json_rows("SELECT info FROM assumptions ORDER BY id DESC LIMIT 500", []),
+        }
+    }
+
+    // --------------------------------------------- checkpoints & harvests
+
+    pub fn put_checkpoint(&self, c: &Checkpoint) -> Result<()> {
+        self.c.lock().unwrap().execute(
+            "INSERT INTO checkpoints(session,info) VALUES(?1,?2) ON CONFLICT(session) DO UPDATE SET info=excluded.info",
+            params![c.session, serde_json::to_string(c)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn checkpoint(&self, session: &str) -> Option<Checkpoint> {
+        self.json_rows("SELECT info FROM checkpoints WHERE session=?1", params![session]).into_iter().next()
+    }
+
+    pub fn add_harvest(&self, h: &Harvest) -> Result<()> {
+        self.c.lock().unwrap().execute("INSERT INTO harvests(session,ts,info) VALUES(?1,?2,?3)", params![h.session, h.at, serde_json::to_string(h)?])?;
+        Ok(())
+    }
+
+    pub fn harvests(&self, session: Option<&str>) -> Vec<Harvest> {
+        match session {
+            Some(s) => self.json_rows("SELECT info FROM harvests WHERE session=?1 ORDER BY id", params![s]),
+            None => self.json_rows("SELECT info FROM harvests ORDER BY id DESC LIMIT 200", []),
+        }
+    }
+
+    // ------------------------------------------------- halts & notifications
+
+    pub fn put_halt(&self, h: &Halt) -> Result<()> {
+        self.c.lock().unwrap().execute(
+            "INSERT INTO halts(id,status,scope,info) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET status=excluded.status, info=excluded.info",
+            params![h.id, h.status, h.scope, serde_json::to_string(h)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn halt(&self, id: &str) -> Option<Halt> {
+        self.json_rows("SELECT info FROM halts WHERE id=?1", params![id]).into_iter().next()
+    }
+
+    pub fn halts(&self, open_only: bool) -> Vec<Halt> {
+        if open_only {
+            self.json_rows("SELECT info FROM halts WHERE status='open' ORDER BY rowid", [])
+        } else {
+            self.json_rows("SELECT info FROM halts ORDER BY rowid DESC LIMIT 200", [])
+        }
+    }
+
+    pub fn add_notification(&self, n: &Notification) -> Result<Notification> {
+        let c = self.c.lock().unwrap();
+        c.execute("INSERT INTO notifications(ts,info) VALUES(?1,'{}')", params![n.ts])?;
+        let mut n = n.clone();
+        n.id = c.last_insert_rowid();
+        c.execute("UPDATE notifications SET info=?2 WHERE id=?1", params![n.id, serde_json::to_string(&n)?])?;
+        Ok(n)
+    }
+
+    pub fn notifications(&self, unread_only: bool, limit: i64) -> Vec<Notification> {
+        let rows: Vec<(Notification, bool)> = {
+            let c = self.c.lock().unwrap();
+            let Ok(mut st) = c.prepare("SELECT info, read FROM notifications ORDER BY id DESC LIMIT ?1") else { return vec![] };
+            st.query_map(params![limit], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)))
+                .map(|it| it.filter_map(|r| r.ok()).filter_map(|(s, rd)| Some((serde_json::from_str(&s).ok()?, rd))).collect())
+                .unwrap_or_default()
+        };
+        rows.into_iter()
+            .map(|(mut n, rd)| {
+                n.read = rd;
+                n
+            })
+            .filter(|n| !unread_only || !n.read)
+            .collect()
+    }
+
+    pub fn mark_notifications_read(&self, upto: i64) -> Result<usize> {
+        Ok(self.c.lock().unwrap().execute("UPDATE notifications SET read=1 WHERE id<=?1 AND read=0", params![upto])?)
+    }
+
+    // -------------------------------------------------------- workspaces
+
+    pub fn put_workspace(&self, name: &str, info: &serde_json::Value) -> Result<()> {
+        self.c.lock().unwrap().execute(
+            "INSERT INTO workspaces(name,info) VALUES(?1,?2) ON CONFLICT(name) DO UPDATE SET info=excluded.info",
+            params![name, info.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn workspace(&self, name: &str) -> Option<serde_json::Value> {
+        self.json_rows("SELECT info FROM workspaces WHERE name=?1", params![name]).into_iter().next()
+    }
+
     fn json_rows<T: serde::de::DeserializeOwned, P: rusqlite::Params>(&self, sql: &str, p: P) -> Vec<T> {
         let c = self.c.lock().unwrap();
         let Ok(mut st) = c.prepare(sql) else { return vec![] };
@@ -624,6 +801,7 @@ mod tests {
             updated_at: 0,
             started_at: None,
             finished_at: None,
+            question_mode: None,
         };
         for (t, r, s) in [("b", 2.0, TaskStatus::Queued), ("done", 0.5, TaskStatus::Done), ("a", 1.0, TaskStatus::Queued), ("run", 9.0, TaskStatus::Running)] {
             db.insert_task(&mut mk(t, r, s)).unwrap();

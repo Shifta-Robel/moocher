@@ -16,6 +16,10 @@ pub struct SpawnRequest {
     pub workspace: Option<crate::config::WorkspaceSpec>,
     #[serde(default)]
     pub overrides: crate::config::SpawnOverrides,
+    /// `coordinator` gives the session the coordinator-only tools
+    /// (spawn_agent, stop_session, ...) without a task.
+    #[serde(default)]
+    pub role: SessionRole,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +46,8 @@ pub struct TaskCreate {
     /// Default: end of the list.
     #[serde(default)]
     pub rank: Option<f64>,
+    #[serde(default)]
+    pub question_mode: Option<QuestionMode>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -56,6 +62,8 @@ pub struct TaskPatch {
     pub tags: Option<Vec<String>>,
     #[serde(default)]
     pub rank: Option<f64>,
+    #[serde(default)]
+    pub question_mode: Option<QuestionMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +99,42 @@ pub enum StreamEvent {
     Egress { node: String, ips: Vec<EgressIp> },
     /// New resource samples from a node (`/stats` has them).
     Stats { node: String },
+    Question(Question),
+    Notification(Notification),
+    Halt(Halt),
+    Artifact(ArtifactMeta),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnswerRequest {
+    /// Free text, or the label of one of the options.
+    #[serde(default)]
+    pub answer: Option<String>,
+    /// 1-based option number.
+    #[serde(default)]
+    pub choice: Option<usize>,
+    /// "Let the agent decide": the asker decides; logged as an assumption.
+    #[serde(default)]
+    pub let_agent_decide: bool,
+    #[serde(default)]
+    pub reject: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModeRequest {
+    pub mode: QuestionMode,
+    /// Only this task (default: the whole cluster).
+    #[serde(default)]
+    pub task: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoverRequest {
+    /// `restart`, `resume_elsewhere`, `handoff`, `abandon`.
+    pub option: String,
+    /// For resume_elsewhere: preferred node.
+    #[serde(default)]
+    pub node: Option<String>,
 }
 
 /// A quota bucket merged across the nodes that report it (same provider and

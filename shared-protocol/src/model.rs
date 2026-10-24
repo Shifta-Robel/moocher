@@ -25,6 +25,10 @@ pub enum SessionState {
     Unreachable,
     /// Node came back without it, or grace period expired.
     Lost,
+    /// The container or process died (`dead_reason` says why); volumes are kept.
+    Dead,
+    /// Interrupted and stopped by a halt; the container is kept so it can resume.
+    Halted,
 }
 
 impl SessionState {
@@ -42,6 +46,8 @@ impl SessionState {
             SessionState::Stopped => "stopped",
             SessionState::Unreachable => "unreachable",
             SessionState::Lost => "lost",
+            SessionState::Dead => "dead",
+            SessionState::Halted => "halted",
         }
     }
 }
@@ -137,6 +143,16 @@ pub struct SessionReport {
     pub workspace: Option<String>,
     pub started_at: Ts,
     pub updated_at: Ts,
+    /// Context size of the latest assistant message (input + cache read): what
+    /// a restart would have to re-read.
+    #[serde(default)]
+    pub context_tokens: u64,
+    /// `oom`, `exit:<code>`, `crashloop`, `wall_clock`, `node_lost` (state `dead`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dead_reason: Option<String>,
+    /// Assistant turns finished so far.
+    #[serde(default)]
+    pub turns: u32,
 }
 
 /// Supervisor-side view of a session (report + orchestration metadata).
@@ -161,6 +177,18 @@ pub struct SessionInfo {
     /// Why the supervisor put it on its node.
     #[serde(default)]
     pub placement: Option<String>,
+    /// Open questions this session asked and is waiting on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_on: Vec<String>,
+    /// Times it died and was recovered automatically or by the operator.
+    #[serde(default)]
+    pub deaths: u32,
+    /// The session this one replaced after a death (resume elsewhere / handoff).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<String>,
+    /// The first prompt (truncated), to brief a replacement if it dies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,6 +223,14 @@ pub struct AgentInfo {
     pub max_instances: Option<u32>,
     #[serde(default)]
     pub overridable: crate::config::Overridable,
+    /// USD per million input / output tokens (0 for keyless providers): used
+    /// to estimate what a recovery would cost.
+    #[serde(default)]
+    pub price_in_per_mtok: f64,
+    #[serde(default)]
+    pub price_out_per_mtok: f64,
+    #[serde(default)]
+    pub on_death: Option<crate::config::DeathPolicy>,
 }
 
 fn default_source() -> String {
@@ -406,6 +442,8 @@ pub enum TaskStatus {
     Done,
     Failed,
     Cancelled,
+    /// An agent died and recovery needs the operator (see `halts`).
+    Halted,
 }
 
 impl TaskStatus {
@@ -416,6 +454,7 @@ impl TaskStatus {
             TaskStatus::Done => "done",
             TaskStatus::Failed => "failed",
             TaskStatus::Cancelled => "cancelled",
+            TaskStatus::Halted => "halted",
         }
     }
     pub fn parse(s: &str) -> Option<TaskStatus> {
@@ -425,6 +464,7 @@ impl TaskStatus {
             "done" => TaskStatus::Done,
             "failed" => TaskStatus::Failed,
             "cancelled" => TaskStatus::Cancelled,
+            "halted" => TaskStatus::Halted,
             _ => return None,
         })
     }
@@ -454,6 +494,9 @@ pub struct Task {
     pub started_at: Option<Ts>,
     #[serde(default)]
     pub finished_at: Option<Ts>,
+    /// Overrides the cluster's question mode for this task's agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_mode: Option<QuestionMode>,
 }
 
 // --------------------------------------------------------------- workflows
@@ -465,6 +508,7 @@ pub enum RunStatus {
     Passed,
     Failed,
     Cancelled,
+    Halted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -492,6 +536,354 @@ pub struct WorkflowRun {
     pub updated_at: Ts,
     #[serde(default)]
     pub task_id: Option<i64>,
+}
+
+// ---------------------------------------------------------------- questions
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Importance {
+    Low,
+    #[default]
+    Normal,
+    Vital,
+}
+
+impl Importance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Importance::Low => "low",
+            Importance::Normal => "normal",
+            Importance::Vital => "vital",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Importance> {
+        Some(match s {
+            "low" => Importance::Low,
+            "normal" | "important" | "medium" => Importance::Normal,
+            "vital" | "critical" | "high" => Importance::Vital,
+            _ => return None,
+        })
+    }
+}
+
+/// What reaches the operator (PHASE1_5 §6c).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionMode {
+    /// Every question, immediately; agents in the chain see it but do not answer.
+    AskMeEverything,
+    /// `normal` and `vital` questions the chain could not answer.
+    #[default]
+    ImportantAndVital,
+    /// Only `vital` questions, after the chain fails.
+    VitalOnly,
+    /// Nothing except what no agent may decide (secrets, budgets); the rest
+    /// is decided in the chain and written to the assumption log.
+    Autonomous,
+}
+
+impl QuestionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QuestionMode::AskMeEverything => "ask_me_everything",
+            QuestionMode::ImportantAndVital => "important_and_vital",
+            QuestionMode::VitalOnly => "vital_only",
+            QuestionMode::Autonomous => "autonomous",
+        }
+    }
+    pub fn parse(s: &str) -> Option<QuestionMode> {
+        Some(match s.replace('-', "_").as_str() {
+            "ask_me_everything" | "everything" => QuestionMode::AskMeEverything,
+            "important_and_vital" | "important" => QuestionMode::ImportantAndVital,
+            "vital_only" | "vital" => QuestionMode::VitalOnly,
+            "autonomous" => QuestionMode::Autonomous,
+            _ => return None,
+        })
+    }
+    /// Whether a question of this importance reaches the operator once the
+    /// chain could not answer it.
+    pub fn reaches_operator(self, imp: Importance) -> bool {
+        match self {
+            QuestionMode::AskMeEverything => true,
+            QuestionMode::ImportantAndVital => imp >= Importance::Normal,
+            QuestionMode::VitalOnly => imp == Importance::Vital,
+            QuestionMode::Autonomous => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionKind {
+    /// `cluster_ask`: the answer arrives as a message.
+    Ask,
+    /// OpenCode's own `question` tool: the session waits for the reply.
+    Opencode,
+    /// An `ask` permission (once / always / reject).
+    Permission,
+    /// A session reached its budget: raise it or stop (operator only).
+    Budget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionStatus {
+    Open,
+    /// Answered by the operator, or by an agent that held it.
+    Answered,
+    /// Nobody above could answer: the top agent (or the asker) decided, and
+    /// the decision is in the assumption log.
+    Decided,
+    Rejected,
+    /// The asker went away or answered it elsewhere.
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuestionOption {
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// One holder of a question on its way up the chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Hop {
+    /// Session id, or `operator`.
+    pub holder: String,
+    pub at: Ts,
+    /// Who moved it here: `asked`, `escalated by s-…`, `timeout`, `mode`.
+    pub why: String,
+    /// Context added by whoever escalated it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Question {
+    pub id: String,
+    pub kind: QuestionKind,
+    pub asker: String,
+    pub asker_agent: String,
+    pub node: String,
+    #[serde(default)]
+    pub task_id: Option<i64>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    pub text: String,
+    #[serde(default)]
+    pub options: Vec<QuestionOption>,
+    #[serde(default)]
+    pub multiple: bool,
+    #[serde(default)]
+    pub context: Option<String>,
+    /// After the rules (which only ever raise it).
+    pub importance: Importance,
+    /// What the asker said.
+    pub asked_importance: Importance,
+    /// Why the rules raised it.
+    #[serde(default)]
+    pub raised_because: Vec<String>,
+    /// No agent may answer (secrets, budgets, operator-only permissions).
+    #[serde(default)]
+    pub operator_only: bool,
+    /// Mode in effect when it was routed.
+    pub mode: QuestionMode,
+    /// Session id of the current holder, or `operator`.
+    pub holder: String,
+    pub holder_since: Ts,
+    /// The holder must decide itself: nobody above it will answer.
+    #[serde(default)]
+    pub top_decides: bool,
+    pub chain: Vec<Hop>,
+    pub status: QuestionStatus,
+    #[serde(default)]
+    pub answer: Option<String>,
+    #[serde(default)]
+    pub answered_by: Option<String>,
+    /// OpenCode request id (question tool / permission) on the asker's node.
+    #[serde(default)]
+    pub request: Option<String>,
+    /// Instances blocked on it (asker and its live descendants); set in views.
+    #[serde(default)]
+    pub blocked: u32,
+    pub created_at: Ts,
+    pub updated_at: Ts,
+}
+
+/// A decision made without the operator, for later review.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Assumption {
+    pub id: i64,
+    pub ts: Ts,
+    #[serde(default)]
+    pub task_id: Option<i64>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// The session that acted on it.
+    pub session: String,
+    #[serde(default)]
+    pub question: Option<String>,
+    /// Session id that decided, or `asker` / `operator-delegated`.
+    pub decided_by: String,
+    pub text: String,
+    pub mode: QuestionMode,
+}
+
+// ---------------------------------------------------------------- artifacts
+
+/// Metadata of a content-addressed artifact (blob identity = BLAKE3 hash).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactMeta {
+    /// `art://b3/<hex>`
+    pub reference: String,
+    pub hash: String,
+    pub size: u64,
+    pub name: String,
+    #[serde(default)]
+    pub media_type: String,
+    /// `file`, or `tree` (a directory as tar.zst).
+    pub kind: String,
+    #[serde(default)]
+    pub producer: Option<String>,
+    #[serde(default)]
+    pub node: Option<String>,
+    /// Lineage: artifacts this one was made from.
+    #[serde(default)]
+    pub parents: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub task_id: Option<i64>,
+    pub created_at: Ts,
+}
+
+pub fn art_ref(hash: &str) -> String {
+    format!("art://b3/{hash}")
+}
+
+/// `art://b3/<hex>`, `b3/<hex>`, `<hex>` or a unique prefix of 8+ hex -> the hex part.
+pub fn parse_art_ref(s: &str) -> Option<String> {
+    let h = s.trim().trim_start_matches("art://").trim_start_matches("b3/").to_ascii_lowercase();
+    (h.len() >= 8 && h.len() <= 64 && h.chars().all(|c| c.is_ascii_hexdigit())).then_some(h)
+}
+
+/// Latest checkpoint of a session: what "resume elsewhere" starts from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub session: String,
+    pub node: String,
+    pub turn: u32,
+    #[serde(default)]
+    pub workspace_ref: Option<String>,
+    #[serde(default)]
+    pub transcript_ref: Option<String>,
+    #[serde(default)]
+    pub todos: Vec<Todo>,
+    pub at: Ts,
+}
+
+/// One harvested output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarvestedOutput {
+    /// The `outputs[].path` pattern it matched.
+    pub pattern: String,
+    /// Path inside the workspace (a directory for a tree).
+    pub path: String,
+    pub reference: String,
+    pub size: u64,
+    /// `file` or `tree`.
+    #[serde(default)]
+    pub kind: String,
+    /// `artifact`, `parent_workspace`, `task_workspace`, `workspace:<name>`.
+    pub to: String,
+    #[serde(default)]
+    pub dest: Option<String>,
+    /// Where it ended up (set by the supervisor when it delivers it).
+    #[serde(default)]
+    pub delivered: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Harvest {
+    pub session: String,
+    pub node: String,
+    pub at: Ts,
+    /// `stop`, `task_end`, `death`, `halt`, `node_lost`.
+    pub trigger: String,
+    #[serde(default)]
+    pub outputs: Vec<HarvestedOutput>,
+    #[serde(default)]
+    pub transcript_ref: Option<String>,
+    /// Patterns that matched nothing.
+    #[serde(default)]
+    pub missing: Vec<String>,
+    /// Taken from the latest checkpoint because the node was gone: anything
+    /// written after `checkpoint_at` is unrecoverable.
+    #[serde(default)]
+    pub from_checkpoint: bool,
+    #[serde(default)]
+    pub checkpoint_at: Option<Ts>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+// ------------------------------------------------------- death and recovery
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryOption {
+    /// `restart`, `resume_elsewhere`, `handoff`, `abandon`.
+    pub kind: String,
+    pub available: bool,
+    /// Estimated extra spend in USD (0 for keyless providers).
+    pub est_cost_usd: f64,
+    /// For $0 providers: estimated requests against the allowance left.
+    #[serde(default)]
+    pub est_requests: Option<u64>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Halt {
+    pub id: String,
+    /// `task:<id>`, `run:<id>` or `session:<id>`.
+    pub scope: String,
+    pub dead_session: String,
+    pub reason: String,
+    pub at: Ts,
+    /// Spend of the halted tree so far.
+    pub spent_usd: f64,
+    #[serde(default)]
+    pub current_todo: Option<String>,
+    pub options: Vec<RecoveryOption>,
+    /// Sessions interrupted and kept by the halt.
+    #[serde(default)]
+    pub sessions: Vec<String>,
+    /// `open`, `resolved`.
+    pub status: String,
+    #[serde(default)]
+    pub resolution: Option<String>,
+    #[serde(default)]
+    pub resolved_at: Option<Ts>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Notification {
+    pub id: i64,
+    pub ts: Ts,
+    /// e.g. `question.waiting`, `session.dead`, `task.halted`, `recovery.auto`.
+    pub kind: String,
+    /// `info`, `warning`, `vital`.
+    pub severity: String,
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    /// What it is about: `q-…`, `s-…`, `task:3`, `h-…`.
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub read: bool,
 }
 
 // ------------------------------------------------------------- event log

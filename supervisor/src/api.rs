@@ -132,7 +132,22 @@ pub fn router(sup: Arc<Sup>) -> Router {
         .route("/audit", get(audit))
         .route("/audit/verify", get(audit_verify))
         .route("/tokens", get(list_tokens).post(create_token))
-        .route("/tokens/{name}", axum::routing::delete(revoke_token));
+        .route("/tokens/{name}", axum::routing::delete(revoke_token))
+        .route("/questions", get(questions))
+        .route("/questions/mode", get(question_mode).post(set_question_mode))
+        .route("/questions/{id}", get(question))
+        .route("/questions/{id}/answer", post(answer_question))
+        .route("/assumptions", get(assumptions))
+        .route("/artifacts", get(artifacts).post(upload_artifact).layer(axum::extract::DefaultBodyLimit::disable()))
+        .route("/artifacts/{reference}", get(artifact))
+        .route("/artifacts/{reference}/blob", get(artifact_blob))
+        .route("/halts", get(halts))
+        .route("/halts/{id}/recover", post(recover))
+        .route("/sessions/{id}/recover", post(recover))
+        .route("/sessions/{id}/checkpoint", get(checkpoint))
+        .route("/harvests", get(harvests))
+        .route("/notifications", get(notifications))
+        .route("/notifications/read", post(notifications_read));
     Router::new()
         .nest("/api/v1", api)
         .route("/metrics", get(metrics))
@@ -258,7 +273,7 @@ async fn session(State(sup): S, Path(id): Path<String>) -> R<SessionInfo> {
 async fn spawn(State(sup): S, Extension(c): Extension<Caller>, Json(r): Json<SpawnRequest>) -> R<SessionInfo> {
     c.need(Scope::Operate)?;
     let s = sup
-        .spawn(&c.actor(), SpawnOpts { agent: r.agent, prompt: r.prompt, node: r.node, title: r.title, workspace: r.workspace, overrides: r.overrides, ..Default::default() })
+        .spawn(&c.actor(), SpawnOpts { agent: r.agent, prompt: r.prompt, node: r.node, title: r.title, workspace: r.workspace, overrides: r.overrides, role: r.role, ..Default::default() })
         .await?;
     Ok(Json(s))
 }
@@ -427,6 +442,178 @@ async fn revoke_token(State(sup): S, Extension(c): Extension<Caller>, Path(name)
     let ok = sup.db.revoke_token(&name)?;
     sup.audit(&c.actor(), "token.revoke", &name, json!({}), ok);
     Ok(Json(json!({"ok": ok})))
+}
+
+#[derive(Deserialize)]
+struct QuestionsQ {
+    #[serde(default)]
+    all: bool,
+    /// Only those waiting on the operator.
+    #[serde(default)]
+    mine: bool,
+}
+
+async fn questions(State(sup): S, Query(q): Query<QuestionsQ>) -> Json<Vec<Question>> {
+    Json(sup.questions_view(!q.all, q.mine))
+}
+
+async fn question(State(sup): S, Path(id): Path<String>) -> R<Question> {
+    sup.questions_view(false, false).into_iter().find(|q| q.id == id).map(Json).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no such question {id}")))
+}
+
+async fn answer_question(State(sup): S, Extension(c): Extension<Caller>, Path(id): Path<String>, Json(r): Json<AnswerRequest>) -> R<Question> {
+    c.need(Scope::Operate)?;
+    Ok(Json(sup.answer(&c.actor(), &id, r).await?))
+}
+
+async fn question_mode(State(sup): S) -> Json<Value> {
+    let tasks: Vec<Value> = sup.db.tasks().into_iter().filter_map(|t| t.question_mode.map(|m| json!({"task": t.id, "mode": m}))).collect();
+    Json(json!({"mode": sup.cluster_question_mode(), "tasks": tasks}))
+}
+
+async fn set_question_mode(State(sup): S, Extension(c): Extension<Caller>, Json(r): Json<ModeRequest>) -> R<Value> {
+    c.need(Scope::Operate)?;
+    sup.set_question_mode(&c.actor(), r.mode, r.task)?;
+    Ok(Json(json!({"ok": true, "mode": r.mode, "task": r.task})))
+}
+
+#[derive(Deserialize)]
+struct TaskQ {
+    #[serde(default)]
+    task: Option<i64>,
+}
+
+async fn assumptions(State(sup): S, Query(q): Query<TaskQ>) -> Json<Vec<Assumption>> {
+    Json(sup.db.assumptions(q.task))
+}
+
+#[derive(Deserialize)]
+struct ArtQ {
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    task: Option<i64>,
+    #[serde(default = "default_limit")]
+    limit: i64,
+}
+
+async fn artifacts(State(sup): S, Query(q): Query<ArtQ>) -> Json<Vec<ArtifactMeta>> {
+    Json(sup.db.artifacts(q.q.as_deref(), q.task, q.limit.clamp(1, 5000)))
+}
+
+async fn artifact(State(sup): S, Path(r): Path<String>) -> R<Value> {
+    Ok(Json(sup.artifact_view(&r)?))
+}
+
+#[derive(Deserialize, Default)]
+struct UploadQ {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    media_type: String,
+    /// `file` or `tree` (tar.zst made by `ocl artifact put <dir>`).
+    #[serde(default)]
+    kind: String,
+    /// Comma-separated.
+    #[serde(default)]
+    tags: String,
+    #[serde(default)]
+    parents: String,
+}
+
+async fn upload_artifact(State(sup): S, Extension(c): Extension<Caller>, Query(q): Query<UploadQ>, body: axum::body::Body) -> R<ArtifactMeta> {
+    c.need(Scope::Operate)?;
+    let stream = tokio_stream::StreamExt::map(body.into_data_stream(), |r: Result<axum::body::Bytes, axum::Error>| r.map(|b| b.to_vec()));
+    let (hash, size) = sup.blobs.write(Box::pin(stream), sup.max_artifact()).await?;
+    let split = |s: &str| s.split(',').map(str::trim).filter(|x| !x.is_empty()).map(String::from).collect::<Vec<_>>();
+    let h = crate::artifacts::PutHeader { name: q.name, media_type: q.media_type, kind: q.kind, tags: split(&q.tags), parents: split(&q.parents), ..Default::default() };
+    let meta = sup.register_artifact(&hash, size, &h, None)?;
+    sup.audit(&c.actor(), "artifact.put", &meta.reference, json!({"name": meta.name, "size": size}), true);
+    Ok(Json(meta))
+}
+
+async fn artifact_blob(State(sup): S, Path(r): Path<String>) -> Result<Response, ApiError> {
+    let meta = sup.artifact_meta(&r)?;
+    let f = tokio::fs::File::open(sup.blobs.path(&meta.hash)).await.map_err(|e| ApiError(StatusCode::NOT_FOUND, format!("blob missing: {e}")))?;
+    let body = axum::body::Body::from_stream(tokio_util_stream(f));
+    Ok((
+        [
+            ("content-type", meta.media_type.clone()),
+            ("x-ocl-kind", meta.kind.clone()),
+            ("x-ocl-name", meta.name.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').collect::<String>()),
+            ("content-length", meta.size.to_string()),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+/// File -> byte stream without pulling in tokio-util.
+fn tokio_util_stream(f: tokio::fs::File) -> impl tokio_stream::Stream<Item = std::io::Result<Vec<u8>>> {
+    futures::stream::unfold(f, |mut f| async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 256 * 1024];
+        match f.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok(buf), f))
+            }
+            Err(e) => Some((Err(e), f)),
+        }
+    })
+}
+
+#[derive(Deserialize)]
+struct HaltQ {
+    #[serde(default)]
+    all: bool,
+}
+
+async fn halts(State(sup): S, Query(q): Query<HaltQ>) -> Json<Vec<Halt>> {
+    Json(sup.db.halts(!q.all))
+}
+
+async fn recover(State(sup): S, Extension(c): Extension<Caller>, Path(id): Path<String>, Json(r): Json<RecoverRequest>) -> R<Value> {
+    c.need(Scope::Operate)?;
+    Ok(Json(sup.resolve(&c.actor(), &id, &r.option, r.node).await?))
+}
+
+async fn checkpoint(State(sup): S, Path(id): Path<String>) -> R<Value> {
+    let s = sup.session(&id)?;
+    Ok(Json(json!({"checkpoint": sup.db.checkpoint(&id), "recovery_options": sup.recovery_options(&s), "harvests": sup.db.harvests(Some(&id))})))
+}
+
+#[derive(Deserialize)]
+struct HarvestQ {
+    #[serde(default)]
+    session: Option<String>,
+}
+
+async fn harvests(State(sup): S, Query(q): Query<HarvestQ>) -> Json<Vec<Harvest>> {
+    Json(sup.db.harvests(q.session.as_deref()))
+}
+
+#[derive(Deserialize)]
+struct NotifQ {
+    #[serde(default)]
+    unread: bool,
+    #[serde(default = "default_limit")]
+    limit: i64,
+}
+
+async fn notifications(State(sup): S, Query(q): Query<NotifQ>) -> Json<Vec<Notification>> {
+    Json(sup.db.notifications(q.unread, q.limit.clamp(1, 5000)))
+}
+
+#[derive(Deserialize)]
+struct ReadReq {
+    upto: i64,
+}
+
+async fn notifications_read(State(sup): S, Extension(c): Extension<Caller>, Json(r): Json<ReadReq>) -> R<Value> {
+    c.need(Scope::Operate)?;
+    Ok(Json(json!({"marked": sup.db.mark_notifications_read(r.upto)?})))
 }
 
 /// Prometheus text exposition.

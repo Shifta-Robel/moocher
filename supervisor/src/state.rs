@@ -31,6 +31,9 @@ pub struct Sup {
     /// for as long as it runs, which should not flood the audit log.
     pub rejections: std::sync::Mutex<std::collections::HashMap<String, Ts>>,
     pub stats: std::sync::Mutex<crate::resources::StatsMem>,
+    pub blobs: crate::artifacts::BlobStore,
+    /// Serialises death handling and halt resolution.
+    pub recovery_lock: tokio::sync::Mutex<()>,
 }
 
 /// Who performed an action, for the audit log.
@@ -66,12 +69,27 @@ pub struct SpawnOpts {
     pub role: SessionRole,
     pub extra_instructions: Option<String>,
     pub overrides: ocl_protocol::config::SpawnOverrides,
+    /// Resume elsewhere: the dead session this one replaces.
+    pub replaces: Option<String>,
 }
 
 impl Sup {
     pub fn new(db: Db, cfg: SupervisorConfig, config_dir: PathBuf) -> Arc<Sup> {
         let (stream, _) = broadcast::channel(1024);
-        Arc::new(Sup { db, cfg, config_dir, nodes: Registry::default(), stream, orch_lock: tokio::sync::Mutex::new(()), ca: std::sync::OnceLock::new(), rejections: Default::default(), stats: Default::default() })
+        let data = cfg.data_dir.clone().unwrap_or_else(|| config_dir.join("supervisor"));
+        Arc::new(Sup {
+            db,
+            cfg,
+            config_dir,
+            nodes: Registry::default(),
+            stream,
+            orch_lock: tokio::sync::Mutex::new(()),
+            ca: std::sync::OnceLock::new(),
+            rejections: Default::default(),
+            stats: Default::default(),
+            blobs: crate::artifacts::BlobStore::new(data.join("artifacts")),
+            recovery_lock: tokio::sync::Mutex::new(()),
+        })
     }
 
     pub fn audit(&self, actor: &Actor, action: &str, target: &str, detail: Value, ok: bool) {
@@ -131,6 +149,10 @@ impl Sup {
                 verdict: None,
                 role: SessionRole::Worker,
                 placement: None,
+                waiting_on: vec![],
+                deaths: 0,
+                replaces: None,
+                prompt: None,
             },
         };
         self.save_session(&info);
@@ -184,6 +206,14 @@ impl Sup {
             }
         }
         let (node, why) = self.place(&o.agent, o.node.as_deref(), &near)?;
+        // A shared workspace that lives on other machines: bring this node's copy up to date.
+        let mut why = why;
+        if let Some(name) = o.workspace.as_ref().filter(|w| w.mode == WorkspaceMode::Shared).and_then(|w| w.name.clone()) {
+            let notes = self.ws_prepare(&name, &node).await;
+            if !notes.is_empty() {
+                why.push_str(&format!("; workspace {name}: {}", notes.join(", ")));
+            }
+        }
         let id = ocl_protocol::new_id("s");
         let now = now_ms();
         let info = SessionInfo {
@@ -202,6 +232,9 @@ impl Sup {
                 workspace: None,
                 started_at: now,
                 updated_at: now,
+                context_tokens: 0,
+                dead_reason: None,
+                turns: 0,
             },
             title: o.title.clone(),
             task_id: o.task_id,
@@ -211,6 +244,10 @@ impl Sup {
             verdict: None,
             role: o.role,
             placement: Some(why),
+            waiting_on: vec![],
+            deaths: 0,
+            replaces: o.replaces.clone(),
+            prompt: o.prompt.as_deref().map(|p| truncate(p, 8000)),
         };
         self.save_session(&info);
         let spec = SpawnSpec {
@@ -224,6 +261,7 @@ impl Sup {
             overrides: o.overrides.clone(),
             parent: o.parent.clone(),
             task: o.task_id,
+            question_mode: Some(self.question_mode(o.task_id)),
         };
         if let Err(e) = self.nodes.call(&node, NodeCommand::Spawn(spec), CMD_TIMEOUT).await {
             let mut s = self.db.session(&id).unwrap_or(info);
@@ -268,9 +306,18 @@ impl Sup {
     }
 
     pub async fn stop(&self, actor: &Actor, id: &str, remove_workspace: bool) -> Result<()> {
+        self.stop_with(actor, id, remove_workspace, "stop").await
+    }
+
+    /// Stop (and harvest) a session; `trigger` is recorded in the harvest.
+    pub async fn stop_with(&self, actor: &Actor, id: &str, remove_workspace: bool, trigger: &str) -> Result<()> {
         let mut s = self.session(id)?;
         let res = if self.nodes.connected(&s.report.node) {
-            self.nodes.call(&s.report.node, NodeCommand::Stop { session: id.into(), remove_workspace }, CMD_TIMEOUT).await.map(|_| ())
+            // Harvesting may upload outputs: allow more than a plain command.
+            self.nodes
+                .call(&s.report.node, NodeCommand::Stop { session: id.into(), remove_workspace, trigger: Some(trigger.into()) }, Duration::from_secs(300))
+                .await
+                .map(|_| ())
         } else if s.report.state.is_live() || s.report.state == SessionState::Unreachable {
             Err(anyhow!("node {} is not connected", s.report.node))
         } else {
@@ -296,6 +343,18 @@ impl Sup {
             .await
             .map(|_| ());
         self.audit(actor, "session.permission", id, json!({"request": request, "reply": reply}), res.is_ok());
+        if res.is_ok() {
+            if let Some(mut q) = self.db.question_by_request(id, request) {
+                if q.status == QuestionStatus::Open {
+                    q.status = if reply == "reject" { QuestionStatus::Rejected } else { QuestionStatus::Answered };
+                    q.answer = Some(reply.into());
+                    q.answered_by = Some(actor.to_string());
+                    q.updated_at = now_ms();
+                    let _ = self.db.put_question(&q);
+                    let _ = self.stream.send(StreamEvent::Question(q));
+                }
+            }
+        }
         res
     }
 
@@ -344,6 +403,58 @@ impl Sup {
             NodeEvent::Quotas { buckets } => {
                 let _ = self.db.put_quotas(node, &buckets);
                 let _ = self.stream.send(StreamEvent::Quotas { node: node.into() });
+            }
+            NodeEvent::QuestionAsked { session, request, kind, text, options, multiple, detail } => {
+                let me = self.clone();
+                let node = node.to_string();
+                tokio::spawn(async move {
+                    let Ok(asker) = me.session(&session) else { return };
+                    let context = match kind {
+                        QuestionKind::Permission => Some(format!("OpenCode permission request {request}: {}", truncate(&detail.to_string(), 600))),
+                        _ => None,
+                    };
+                    if let Err(e) = me.ask(&asker, kind, text, options, multiple, Importance::Normal, context, Some(request)).await {
+                        tracing::warn!(node, session, error = %e, "could not route question");
+                    }
+                });
+            }
+            NodeEvent::QuestionGone { session, request } => self.question_gone(&session, &request),
+            NodeEvent::BudgetExhausted { session, budget_usd, spent_usd } => {
+                let me = self.clone();
+                tokio::spawn(async move {
+                    let Ok(asker) = me.session(&session) else { return };
+                    let open = me.db.questions(true).into_iter().any(|q| q.asker == session && q.kind == QuestionKind::Budget);
+                    if open {
+                        return;
+                    }
+                    let text = format!("Session {session} ({}) used its whole budget (${spent_usd:.4} of ${budget_usd:.2}). Raise the budget (e.g. `raise 2.00`) or stop it?", asker.report.agent);
+                    let options = vec![
+                        QuestionOption { label: format!("raise {:.2}", budget_usd * 2.0), description: "double the budget and continue".into() },
+                        QuestionOption { label: "stop".into(), description: "stop the session (its outputs are harvested)".into() },
+                    ];
+                    let _ = me.ask(&asker, QuestionKind::Budget, text, options, false, Importance::Vital, Some(format!("budget={budget_usd}")), None).await;
+                });
+            }
+            NodeEvent::Died { session, reason, detail } => {
+                let me = self.clone();
+                tokio::spawn(async move { me.on_died(&session, &reason, &detail).await });
+            }
+            NodeEvent::Checkpoint(c) => {
+                if let Some(name) = self.db.session(&c.session).and_then(|s| s.report.workspace).and_then(|w| w.strip_prefix("shared:").map(String::from)) {
+                    if let Some(r) = &c.workspace_ref {
+                        let mut info = self.db.workspace(&name).unwrap_or_else(|| json!({"name": name, "version": 0, "nodes": [node]}));
+                        info["latest_ref"] = json!(r);
+                        info["latest_node"] = json!(node);
+                        info["updated_at"] = json!(now_ms());
+                        let _ = self.db.put_workspace(&name, &info);
+                    }
+                }
+                self.log("checkpoint", Some(node), Some(&c.session), json!({"turn": c.turn, "workspace": c.workspace_ref, "transcript": c.transcript_ref}));
+                let _ = self.db.put_checkpoint(&c);
+            }
+            NodeEvent::Harvested(h) => {
+                let me = self.clone();
+                tokio::spawn(async move { me.on_harvested(h).await });
             }
             NodeEvent::TurnEnded { session, last_text, todos, error } => {
                 self.log(
@@ -408,12 +519,13 @@ impl Sup {
             }
             AgentCall::Spawn { agent, prompt, node: hint, title, share_workspace, overrides } => {
                 let (workspace, node_hint) = if share_workspace {
-                    let ws = caller.report.workspace.as_deref().and_then(|w| w.strip_prefix("shared:")).map(|n| WorkspaceSpec { mode: WorkspaceMode::Shared, name: Some(n.into()) });
+                    let ws = caller.report.workspace.as_deref().and_then(|w| w.strip_prefix("shared:")).map(|n| WorkspaceSpec { mode: WorkspaceMode::Shared, name: Some(n.into()), seed: None });
                     if ws.is_none() {
                         bail!("your workspace is not shareable");
                     }
-                    // A shared workspace exists on one node only (cross-node sync: Phase 3).
-                    (ws, Some(caller.report.node.clone()))
+                    // Placement prefers the node that holds the workspace; on
+                    // another node it is synced through the artifact store.
+                    (ws, hint)
                 } else {
                     (None, hint)
                 };
@@ -464,6 +576,80 @@ impl Sup {
                 self.finish_task(&actor, id, TaskStatus::Failed, reason).await?;
                 Ok(json!("task marked failed; your session will be stopped"))
             }
+            AgentCall::Ask { question, options, importance, context } => {
+                if question.trim().is_empty() {
+                    bail!("question must not be empty");
+                }
+                let opts = options.into_iter().map(|o| QuestionOption { label: o, description: String::new() }).collect();
+                let q = self.ask(&caller, QuestionKind::Ask, question, opts, false, importance.unwrap_or_default(), context, None).await?;
+                let note = match q.status {
+                    QuestionStatus::Decided => format!("Nobody will answer it (mode {}, importance {}): decide yourself and state your assumption.", q.mode.as_str(), q.importance.as_str()),
+                    _ if q.holder == crate::questions::OPERATOR => "It went to the operator. Continue with other work if you can; the answer arrives as a message.".to_string(),
+                    _ => format!("It went to {} (the agent that started you). Continue with other work if you can; the answer arrives as a message.", q.holder),
+                };
+                Ok(json!({"question": q.id, "importance": q.importance, "raised_because": q.raised_because, "holder": q.holder, "note": note}))
+            }
+            AgentCall::Answer { id, answer } => {
+                let q = self.answer(&actor, &id, ocl_protocol::api::AnswerRequest { answer: Some(answer), choice: None, let_agent_decide: false, reject: false }).await?;
+                Ok(json!({"question": q.id, "status": q.status, "delivered_to": q.asker}))
+            }
+            AgentCall::Escalate { id, note } => {
+                let q = self.db.question(&id).ok_or_else(|| anyhow!("no such question {id}"))?;
+                if q.holder != from {
+                    bail!("question {id} is held by {}, not by you", q.holder);
+                }
+                let q = self.escalate(&id, from, note).await?;
+                Ok(json!({"question": q.id, "status": q.status, "now_held_by": q.holder}))
+            }
+            AgentCall::Questions => Ok(Value::Array(self.questions_held(from))),
+            AgentCall::ReportUp { message } => {
+                let text = format!("[report from session {from} ({})]\n{message}", caller.report.agent);
+                match caller.parent.as_deref().and_then(|p| self.db.session(p)).filter(|p| p.report.state.is_live()) {
+                    Some(p) => {
+                        self.message(&actor, &p.report.id, &text, Delivery::Queue).await?;
+                        Ok(json!(format!("reported to {}", p.report.id)))
+                    }
+                    None => {
+                        // Top of the chain: the operator reads it (task note + notification).
+                        if let Some(mut t) = caller.task_id.and_then(|t| self.db.task(t)) {
+                            t.notes.push(format!("[report {from}] {}", truncate(&message, 2000)));
+                            t.updated_at = now_ms();
+                            self.save_task(&t);
+                        }
+                        self.notify("agent.report", "info", format!("report from {} ({from})", caller.report.agent), truncate(&message, 1000), Some(from.into()));
+                        self.log("agent.report", Some(node), Some(from), json!({"message": truncate(&message, 2000)}));
+                        Ok(json!("reported to the operator"))
+                    }
+                }
+            }
+            AgentCall::LogAssumption { text } => {
+                let a = Assumption {
+                    id: 0,
+                    ts: now_ms(),
+                    task_id: caller.task_id,
+                    run_id: caller.run_id.clone(),
+                    session: from.into(),
+                    question: None,
+                    decided_by: from.into(),
+                    text: truncate(&text, 4000),
+                    mode: self.question_mode(caller.task_id),
+                };
+                let id = self.db.add_assumption(&a)?;
+                self.log("assumption.logged", Some(node), Some(from), json!({"id": id}));
+                Ok(json!(format!("assumption #{id} logged for the operator to review")))
+            }
+            AgentCall::ArtifactList { query, task_only } => {
+                let task = if task_only { caller.task_id } else { None };
+                let v: Vec<Value> = self
+                    .db
+                    .artifacts(query.as_deref(), task, 100)
+                    .into_iter()
+                    .map(|a| json!({"ref": a.reference, "name": a.name, "kind": a.kind, "size": a.size, "producer": a.producer, "task": a.task_id, "tags": a.tags}))
+                    .collect();
+                Ok(Value::Array(v))
+            }
+            AgentCall::ArtifactInfo { reference } => self.artifact_view(&reference),
+            AgentCall::SyncWorkspace => self.ws_sync_for(&caller).await,
         }
     }
 
@@ -487,16 +673,22 @@ impl Sup {
         Overview { nodes: self.node_views(), sessions, tasks: self.db.tasks(), totals }
     }
 
-    /// Housekeeping: sessions on long-disconnected nodes become `lost`.
-    pub fn expire_unreachable(&self) {
+    /// Housekeeping: sessions on long-disconnected nodes become `lost`, which
+    /// counts as a death (`node_lost`) for the recovery policy.
+    pub fn expire_unreachable(self: &Arc<Self>) {
         let grace = self.cfg.disconnect_grace_secs as i64 * 1000;
         for n in self.db.nodes().into_iter().filter(|n| !n.connected && now_ms() - n.last_seen > grace) {
             for mut s in self.db.sessions_on(&n.name) {
                 if s.report.state == SessionState::Unreachable {
                     s.report.state = SessionState::Lost;
+                    s.report.dead_reason = Some("node_lost".into());
                     s.report.error = Some(format!("node {} unreachable for more than {}s", n.name, self.cfg.disconnect_grace_secs));
                     s.report.updated_at = now_ms();
                     self.save_session(&s);
+                    let me = self.clone();
+                    let id = s.report.id.clone();
+                    let detail = format!("node {} unreachable for more than {}s", n.name, self.cfg.disconnect_grace_secs);
+                    tokio::spawn(async move { me.on_died(&id, "node_lost", &detail).await });
                 }
             }
         }
@@ -515,6 +707,7 @@ pub fn session_brief(s: &SessionInfo) -> Value {
         "tokens": s.report.tokens.total(),
         "cost_usd": s.report.tokens.cost_usd,
         "parent": s.parent,
+        "waiting_on": s.waiting_on,
     })
 }
 
@@ -546,6 +739,9 @@ mod tests {
             workspace: None,
             started_at: 0,
             updated_at: 0,
+            context_tokens: 0,
+            dead_reason: None,
+            turns: 0,
         }
     }
 

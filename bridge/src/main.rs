@@ -154,7 +154,10 @@ async fn main() -> ExitCode {
     loop {
         tokio::select! {
             status = child.wait() => {
-                let code = status.ok().and_then(|s| s.code()).unwrap_or(1);
+                // Killed by a signal: 128 + signal, as shells and Podman report it
+                // (an OOM kill shows as 137).
+                use std::os::unix::process::ExitStatusExt;
+                let code = status.ok().map(|s| s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(1))).unwrap_or(1);
                 return ExitCode::from(code.clamp(0, 255) as u8);
             }
             _ = term.recv() => forward(pid, "TERM"),

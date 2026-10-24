@@ -1,21 +1,26 @@
 //! ocl-supervisor — the hub's control plane. See docs/ARCHITECTURE.md.
 
 mod api;
+mod artifacts;
 mod db;
 mod link;
 mod nodes;
 mod orch;
 mod pki;
 mod placement;
+mod questions;
 mod quotas;
+mod recovery;
 mod resources;
 mod state;
 mod templates;
 mod tlslink;
+mod workspaces;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use ocl_protocol::config::{load_yaml, SupervisorConfig};
+use ocl_protocol::proto::blobs_server::BlobsServer;
 use ocl_protocol::proto::node_link_server::NodeLinkServer;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -182,6 +187,7 @@ async fn run(dir: PathBuf, cfg: SupervisorConfig) -> Result<()> {
     }
     let link = tonic::transport::Server::builder()
         .add_service(NodeLinkServer::new(link::LinkService { sup: sup.clone() }))
+        .add_service(BlobsServer::new(artifacts::BlobService { sup: sup.clone() }))
         .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(uds));
 
     // Remote nodes: mTLS on TCP.
@@ -201,6 +207,7 @@ async fn run(dir: PathBuf, cfg: SupervisorConfig) -> Result<()> {
                     .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
                     .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
                     .add_service(NodeLinkServer::new(link::LinkService { sup: sup.clone() }))
+                    .add_service(BlobsServer::new(artifacts::BlobService { sup: sup.clone() }))
                     .serve_with_incoming(incoming),
             )
         }

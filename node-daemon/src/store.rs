@@ -36,7 +36,9 @@ impl Store {
                role TEXT NOT NULL DEFAULT 'worker', last_seq INTEGER NOT NULL DEFAULT 0, spec TEXT NOT NULL DEFAULT '{}');
              CREATE TABLE IF NOT EXISTS outbox(seq INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS quota(provider TEXT NOT NULL, scope_id TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL,
-               PRIMARY KEY(provider, scope_id, kind));",
+               PRIMARY KEY(provider, scope_id, kind));
+             CREATE TABLE IF NOT EXISTS ws_base(label TEXT PRIMARY KEY, manifest TEXT NOT NULL, reference TEXT NOT NULL, digest TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS reap(id TEXT PRIMARY KEY, at INTEGER NOT NULL, paths TEXT NOT NULL);",
         )?;
         #[cfg(unix)]
         {
@@ -100,6 +102,56 @@ impl Store {
             )?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// The last state of a workspace both this node and the hub agree on:
+    /// (manifest, artifact reference, manifest digest).
+    pub fn ws_base(&self, label: &str) -> Option<(ocl_protocol::archive::Manifest, String, String)> {
+        let row: Option<(String, String, String)> = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT manifest, reference, digest FROM ws_base WHERE label=?1", params![label], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()
+            .ok()
+            .flatten();
+        row.and_then(|(m, r, d)| Some((serde_json::from_str(&m).ok()?, r, d)))
+    }
+
+    pub fn set_ws_base(&self, label: &str, m: &ocl_protocol::archive::Manifest, reference: &str, digest: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO ws_base(label,manifest,reference,digest) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(label) DO UPDATE SET manifest=excluded.manifest, reference=excluded.reference, digest=excluded.digest",
+            params![label, serde_json::to_string(m)?, reference, digest],
+        )?;
+        Ok(())
+    }
+
+    pub fn drop_ws_base(&self, label: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute("DELETE FROM ws_base WHERE label=?1", params![label])?;
+        Ok(())
+    }
+
+    /// Remove `paths` of instance `id` at `at` (retention of stopped instances).
+    pub fn schedule_reap(&self, id: &str, at: i64, paths: &[String]) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO reap(id,at,paths) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET at=excluded.at, paths=excluded.paths",
+            params![id, at, serde_json::to_string(paths)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn due_reaps(&self, now: i64) -> Vec<(String, Vec<String>)> {
+        let c = self.conn.lock().unwrap();
+        let Ok(mut st) = c.prepare("SELECT id, paths FROM reap WHERE at <= ?1") else { return vec![] };
+        st.query_map(params![now], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map(|it| it.filter_map(|r| r.ok()).map(|(id, p)| (id, serde_json::from_str(&p).unwrap_or_default())).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn done_reap(&self, id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute("DELETE FROM reap WHERE id=?1", params![id])?;
         Ok(())
     }
 

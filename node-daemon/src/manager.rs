@@ -6,6 +6,13 @@
 //! session's full message history whenever that stream (re)connects, so a lost
 //! event never leaves tokens or todos wrong for long. Reports are persisted so
 //! a node restart can re-attach to still-running containers.
+//!
+//! Lifecycle (PHASE1_5 §9): `running → stopping → harvesting → stopped → reaped`.
+//! Stopping harvests the template's `outputs:` (and the transcript) into the
+//! artifact store, then stops the container; its volumes are removed later
+//! according to `retain:`. An instance whose container dies is `dead` and
+//! keeps its volumes; `halted` ones are stopped with the container kept.
+//! Both can be restarted in place with their history.
 
 use crate::cfgstore::{ConfigStore, LoadedAgent, Snapshot};
 use crate::gateway::Gateway;
@@ -21,7 +28,7 @@ use rand::Rng;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -60,7 +67,16 @@ pub struct Instance {
     /// Set by the gateway while every route's allowance is used up.
     parked: crate::gateway::Parked,
     gateway: Mutex<Option<Gateway>>,
-    overrides: Mutex<SpawnOverrides>,
+    overrides: Arc<Mutex<SpawnOverrides>>,
+    cap: String,
+    password: String,
+    /// OpenCode question/permission requests already reported (id -> number of questions).
+    seen_requests: Mutex<HashMap<String, usize>>,
+    turns: AtomicU32,
+    /// The container/process ended without being stopped.
+    dead: AtomicBool,
+    harvested: AtomicBool,
+    checkpointing: AtomicBool,
     /// Disk limit state: the agent was warned (90%) / it is over the limit.
     disk_warned: AtomicBool,
     disk_over: AtomicBool,
@@ -162,9 +178,53 @@ impl Manager {
                 inst.oc.abort(&oc_id).await?;
                 Ok(json!({"ok": true}))
             }
-            NodeCommand::Stop { session, remove_workspace } => {
-                self.stop(&session, remove_workspace).await?;
+            NodeCommand::Stop { session, remove_workspace, trigger } => {
+                self.stop(&session, remove_workspace, trigger.as_deref().unwrap_or("stop")).await?;
                 Ok(json!({"ok": true}))
+            }
+            NodeCommand::QuestionReply { session, request, answers } => {
+                let inst = self.get(&session)?;
+                // One answer list per question in the request.
+                let n = inst.seen_requests.lock().unwrap().get(&request).copied().unwrap_or(1).max(1);
+                let answers: Vec<Vec<String>> = if answers.len() == n { answers } else { (0..n).map(|i| answers.get(i).or(answers.first()).cloned().unwrap_or_default()).collect() };
+                inst.oc.reply_question(&request, &answers).await?;
+                Ok(json!({"ok": true}))
+            }
+            NodeCommand::QuestionReject { session, request } => {
+                self.get(&session)?.oc.reject_question(&request).await?;
+                Ok(json!({"ok": true}))
+            }
+            NodeCommand::SetBudget { session, budget_usd } => {
+                if budget_usd.is_nan() || budget_usd <= 0.0 {
+                    bail!("budget must be positive");
+                }
+                let inst = self.get(&session)?;
+                inst.overrides.lock().unwrap().budget_usd = Some(budget_usd);
+                if let Some(g) = inst.gateway.lock().unwrap().as_ref() {
+                    g.budget_changed();
+                }
+                tracing::info!(session, budget_usd, "budget changed");
+                Ok(json!({"ok": true, "budget_usd": budget_usd}))
+            }
+            NodeCommand::SnapshotWorkspace { workspace, session, reason } => self.gw.files.snapshot(&workspace, session.as_deref(), if reason.is_empty() { "snapshot" } else { &reason }).await,
+            NodeCommand::ApplyWorkspace { workspace, reference, from_node } => {
+                let r = self.gw.files.apply(&workspace, &reference).await?;
+                tracing::info!(workspace, reference, from = ?from_node, applied = %r["applied"], conflicts = %r["conflicts"], "workspace merged");
+                Ok(r)
+            }
+            NodeCommand::PlaceArtifact { workspace, reference, dest } => self.gw.files.place(&workspace, &reference, &dest).await,
+            NodeCommand::Restart { session, prompt } => {
+                self.restart(&session, &prompt).await?;
+                Ok(json!({"ok": true}))
+            }
+            NodeCommand::Halt { session } => {
+                self.halt(&session).await?;
+                Ok(json!({"ok": true}))
+            }
+            NodeCommand::Harvest { session, trigger } => {
+                let inst = self.get(&session)?;
+                let h = self.harvest(&inst, &trigger).await;
+                Ok(serde_json::to_value(h)?)
             }
             NodeCommand::PermissionReply { session, request, reply } => {
                 let inst = self.get(&session)?;
@@ -273,7 +333,8 @@ impl Manager {
         }
     }
 
-    fn new_instance(&self, id: &str, agent: &str, role: SessionRole, paths: InstancePaths, password: &str, report: SessionReport) -> Arc<Instance> {
+    #[allow(clippy::too_many_arguments)]
+    fn new_instance(&self, id: &str, agent: &str, role: SessionRole, paths: InstancePaths, cap: &str, password: &str, report: SessionReport) -> Arc<Instance> {
         let snap = self.cfg.get();
         // report.model is "<provider>/<model>" (the model id itself may contain '/').
         let (prov, model) = report.model.as_deref().and_then(|m| m.split_once('/')).map(|(p, m)| (p.to_string(), m.to_string())).unwrap_or_default();
@@ -292,7 +353,14 @@ impl Manager {
             usage: Arc::new(Mutex::new(report.tokens)),
             parked: Arc::new(Mutex::new(None)),
             gateway: Mutex::new(None),
-            overrides: Mutex::new(SpawnOverrides::default()),
+            overrides: Arc::new(Mutex::new(SpawnOverrides::default())),
+            cap: cap.into(),
+            password: password.into(),
+            seen_requests: Mutex::new(HashMap::new()),
+            turns: AtomicU32::new(report.turns),
+            dead: AtomicBool::new(report.state == SessionState::Dead),
+            harvested: AtomicBool::new(false),
+            checkpointing: AtomicBool::new(false),
             disk_warned: AtomicBool::new(false),
             disk_over: AtomicBool::new(false),
             turn_open: AtomicBool::new(matches!(report.state, SessionState::Running | SessionState::Blocked | SessionState::Parked)),
@@ -345,7 +413,18 @@ impl Manager {
         let paths = InstancePaths { run: self.run_root.join(&spec.id), etc: inst_dir.join("etc"), home: inst_dir.join("home"), workspace };
         let cap = random_token("ocl_cap_");
         let password = random_token("");
+        let fresh = std::fs::read_dir(&paths.workspace).map(|mut d| d.next().is_none()).unwrap_or(true);
         self.rt.prepare_dirs(&paths)?;
+        // A new workspace may start from an artifact (a tree or a single file).
+        if let Some(seed) = ws_spec.seed.as_deref().filter(|_| fresh) {
+            let (blob, meta) = self.gw.files.cas.get(seed).await.with_context(|| format!("fetching workspace seed {seed}"))?;
+            let root = std::fs::canonicalize(&paths.workspace)?;
+            let n = self.gw.files.place_at(&root, &blob, &meta, "").await?.len();
+            if let Some(uid) = self.rt.chown_target() {
+                crate::runtime::chown_r(&paths.workspace, uid)?;
+            }
+            tracing::info!(session = %spec.id, seed, files = n, "workspace seeded");
+        }
         let gw_port = self.rt.gateway_port(&spec.id)?;
         write_opencode_config(&snap, &agent, &spec, &paths, gw_port, &cap, self.rt.kind)?;
 
@@ -365,8 +444,11 @@ impl Manager {
             workspace: Some(ws_label),
             started_at: now,
             updated_at: now,
+            context_tokens: 0,
+            dead_reason: None,
+            turns: 0,
         };
-        let inst = self.new_instance(&spec.id, &spec.agent, spec.role, paths.clone(), &password, report.clone());
+        let inst = self.new_instance(&spec.id, &spec.agent, spec.role, paths.clone(), &cap, &password, report.clone());
         *inst.overrides.lock().unwrap() = spec.overrides.clone();
         self.store.put_instance(&InstanceRow {
             id: spec.id.clone(),
@@ -407,8 +489,11 @@ impl Manager {
     }
 
     fn start_gateway(&self, inst: &Arc<Instance>, cap: &str) -> Result<()> {
-        let ov = inst.overrides.lock().unwrap().clone();
-        let gw = Gateway::new(&inst.id, &inst.agent, inst.role, cap, inst.usage.clone(), inst.parked.clone(), ov, &self.gw);
+        let ws = crate::gateway::WsRef {
+            root: inst.paths.workspace.clone(),
+            runtime_path: self.rt.workspace_in_runtime(&inst.paths),
+        };
+        let gw = Gateway::new(&inst.id, &inst.agent, inst.role, cap, inst.usage.clone(), inst.parked.clone(), inst.overrides.clone(), ws, &self.gw);
         *inst.gateway.lock().unwrap() = Some(gw.clone());
         let h = gw.serve(inst.paths.node_sock())?;
         inst.tasks.lock().unwrap().push(h);
@@ -479,7 +564,8 @@ impl Manager {
             let mut r = inst.report.lock().unwrap();
             let before = r.state;
             f(&mut r);
-            if inst.stopping.load(Ordering::Relaxed) && r.state != SessionState::Stopped {
+            let settled = matches!(r.state, SessionState::Stopped | SessionState::Halted | SessionState::Dead);
+            if inst.stopping.load(Ordering::Relaxed) && !settled {
                 r.state = before;
             }
             r.tokens = *inst.usage.lock().unwrap();
@@ -548,13 +634,18 @@ impl Manager {
         let mut map = HashMap::new();
         let mut last_text = None;
         let mut last_error = None;
+        let mut context = None;
         for m in msgs {
             let info = &m["info"];
             if info["role"] != "assistant" {
                 continue;
             }
             if let Some(id) = info["id"].as_str() {
-                map.insert(id.to_string(), self.priced(&inst.agent, oc::message_usage(info)));
+                let u = oc::message_usage(info);
+                if u.input + u.cache_read > 0 {
+                    context = Some(u.input + u.cache_read);
+                }
+                map.insert(id.to_string(), self.priced(&inst.agent, u));
             }
             let text: Vec<&str> = m["parts"].as_array().into_iter().flatten().filter(|p| p["type"] == "text").filter_map(|p| p["text"].as_str()).collect();
             if !text.is_empty() {
@@ -574,6 +665,9 @@ impl Manager {
             }
             if r.state != SessionState::Running {
                 r.error = last_error;
+            }
+            if let Some(c) = context {
+                r.context_tokens = c;
             }
         });
     }
@@ -699,6 +793,7 @@ impl Manager {
                     r.current_task = Some(format!("{what} (request {req})"));
                 });
                 self.link.emit(NodeEvent::Activity { session: inst.id.clone(), kind: "permission.asked".into(), detail: p.clone() });
+                self.report_permission(inst, p);
             }
             "permission.replied" => {
                 self.update(inst, |r| {
@@ -707,6 +802,27 @@ impl Manager {
                     }
                     r.current_task = current_task(&r.todos);
                 });
+                if let Some(req) = p["requestID"].as_str().or(p["id"].as_str()) {
+                    self.link.emit(NodeEvent::QuestionGone { session: inst.id.clone(), request: req.into() });
+                }
+            }
+            "question.asked" => {
+                self.update(inst, |r| {
+                    r.state = SessionState::Blocked;
+                    r.current_task = Some(format!("question: {}", p["questions"][0]["question"].as_str().unwrap_or("?").chars().take(200).collect::<String>()));
+                });
+                self.report_question(inst, p);
+            }
+            "question.replied" | "question.rejected" => {
+                self.update(inst, |r| {
+                    if r.state == SessionState::Blocked {
+                        r.state = SessionState::Running;
+                    }
+                    r.current_task = current_task(&r.todos);
+                });
+                if let Some(req) = p["requestID"].as_str() {
+                    self.link.emit(NodeEvent::QuestionGone { session: inst.id.clone(), request: req.into() });
+                }
             }
             "session.error" => {
                 let msg = error_message(&p["error"]).unwrap_or_else(|| "unknown error".into());
@@ -714,6 +830,50 @@ impl Manager {
             }
             _ => {}
         }
+    }
+
+    /// Hand an OpenCode `question` request to the cluster (once per request).
+    fn report_question(&self, inst: &Arc<Instance>, q: &Value) {
+        let Some(req) = q["id"].as_str() else { return };
+        let qs = q["questions"].as_array().cloned().unwrap_or_default();
+        if inst.seen_requests.lock().unwrap().insert(req.to_string(), qs.len().max(1)).is_some() {
+            return;
+        }
+        let text = if qs.len() <= 1 {
+            qs.first().and_then(|x| x["question"].as_str()).unwrap_or("(empty question)").to_string()
+        } else {
+            qs.iter().enumerate().map(|(i, x)| format!("{}. {}", i + 1, x["question"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n")
+        };
+        let first = qs.first().cloned().unwrap_or(Value::Null);
+        let options = first["options"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|o| QuestionOption { label: o["label"].as_str().unwrap_or("").into(), description: o["description"].as_str().unwrap_or("").into() })
+            .collect();
+        self.link.emit(NodeEvent::QuestionAsked {
+            session: inst.id.clone(),
+            request: req.into(),
+            kind: QuestionKind::Opencode,
+            text,
+            options,
+            multiple: first["multiple"].as_bool().unwrap_or(false),
+            detail: json!({"header": first["header"]}),
+        });
+    }
+
+    /// Hand an `ask` permission to the cluster (once per request).
+    fn report_permission(&self, inst: &Arc<Instance>, p: &Value) {
+        let Some(req) = p["id"].as_str() else { return };
+        if inst.seen_requests.lock().unwrap().insert(req.to_string(), 1).is_some() {
+            return;
+        }
+        let patterns: Vec<&str> = p["patterns"].as_array().into_iter().flatten().filter_map(|x| x.as_str()).collect();
+        let text = format!("{} wants permission for `{}`: {}. Allow it?", inst.agent, p["permission"].as_str().unwrap_or("?"), if patterns.is_empty() { "-".into() } else { patterns.join(", ") });
+        let options = [("once", "allow this time"), ("always", "allow this pattern for the rest of the session"), ("reject", "refuse")]
+            .map(|(l, d)| QuestionOption { label: l.into(), description: d.into() })
+            .to_vec();
+        self.link.emit(NodeEvent::QuestionAsked { session: inst.id.clone(), request: req.into(), kind: QuestionKind::Permission, text, options, multiple: false, detail: p.clone() });
     }
 
     fn check_turn_end(self: &Arc<Self>, inst: &Arc<Instance>) {
@@ -753,27 +913,105 @@ impl Manager {
             let r = inst.report.lock().unwrap();
             (r.last_text.clone(), r.todos.clone(), r.error.clone())
         };
+        let turns = inst.turns.fetch_add(1, Ordering::Relaxed) + 1;
         self.update(inst, |r| {
             r.state = if r.error.is_some() { SessionState::Error } else { SessionState::Idle };
             r.current_task = current_task(&r.todos);
+            r.turns = turns;
         });
         self.link.emit(NodeEvent::TurnEnded { session: inst.id.clone(), last_text, todos, error });
+        let every = self.cfg.get().node.checkpoint_every_turns;
+        if every > 0 && turns % every == 0 {
+            let me = self.clone();
+            let inst = inst.clone();
+            tokio::spawn(async move { me.checkpoint(&inst).await });
+        }
     }
 
-    pub async fn stop(&self, id: &str, remove_workspace: bool) -> Result<()> {
+    /// Workspace snapshot + transcript to the hub, for "resume elsewhere".
+    async fn checkpoint(self: &Arc<Self>, inst: &Arc<Instance>) {
+        if inst.checkpointing.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let (label, todos, turn) = {
+            let r = inst.report.lock().unwrap();
+            (r.workspace.clone().unwrap_or_default(), r.todos.clone(), r.turns)
+        };
+        let ws = self.gw.files.snapshot(&label, Some(&inst.id), "checkpoint").await;
+        let transcript = self.put_transcript(inst, "checkpoint").await;
+        match &ws {
+            Ok(_) => {}
+            Err(e) => tracing::warn!(session = %inst.id, error = %e, "checkpoint snapshot failed"),
+        }
+        let c = Checkpoint {
+            session: inst.id.clone(),
+            node: self.node.clone(),
+            turn,
+            workspace_ref: ws.ok().and_then(|v| v["reference"].as_str().map(String::from)),
+            transcript_ref: transcript,
+            todos,
+            at: now_ms(),
+        };
+        if c.workspace_ref.is_some() || c.transcript_ref.is_some() {
+            self.link.emit(NodeEvent::Checkpoint(c));
+        }
+        inst.checkpointing.store(false, Ordering::Relaxed);
+    }
+
+    /// The conversation as a JSON artifact (needs OpenCode running).
+    async fn put_transcript(&self, inst: &Arc<Instance>, why: &str) -> Option<String> {
+        let oc_id = inst.oc_id.lock().unwrap().clone()?;
+        let msgs = inst.oc.messages(&oc_id).await.ok()?;
+        let tmp = self.gw.files.cas.tmp_path("tr");
+        std::fs::write(&tmp, serde_json::to_vec(&json!({"session": inst.id, "agent": inst.agent, "node": self.node, "messages": msgs})).ok()?).ok()?;
+        let info = crate::cas::PutInfo {
+            name: format!("transcript-{}.json", inst.id),
+            kind: "file".into(),
+            media_type: "application/json".into(),
+            session: Some(inst.id.clone()),
+            tags: vec!["transcript".into(), why.into()],
+            ..Default::default()
+        };
+        match self.gw.files.cas.put(&tmp, info).await {
+            Ok(m) => Some(m.reference),
+            Err(e) => {
+                tracing::warn!(session = %inst.id, error = %e, "transcript upload failed");
+                None
+            }
+        }
+    }
+
+    /// Stop an instance: harvest its outputs, stop the container, and keep
+    /// its volumes for `retain` (removed by `reap`).
+    pub async fn stop(self: &Arc<Self>, id: &str, remove_workspace: bool, trigger: &str) -> Result<()> {
         let inst = self.get(id)?;
+        let state = inst.report.lock().unwrap().state;
         inst.stopping.store(true, Ordering::Relaxed);
+        if state.is_live() || state == SessionState::Dead {
+            self.update(&inst, |r| r.current_task = Some("harvesting".into()));
+            self.harvest(&inst, trigger).await;
+        }
         for t in inst.tasks.lock().unwrap().drain(..) {
             t.abort();
         }
         let _ = self.rt.stop(id).await;
-        let _ = self.rt.remove(id).await;
         let _ = std::fs::remove_dir_all(&inst.paths.run);
-        let ws_isolated = inst.report.lock().unwrap().workspace.as_deref().is_some_and(|w| w.starts_with("isolated:"));
-        if remove_workspace && ws_isolated {
-            let _ = std::fs::remove_dir_all(&inst.paths.workspace);
+        let snap = self.cfg.get();
+        let retain = snap.agents.get(&inst.agent).and_then(|a| Retain::parse(&a.cfg.retain)).unwrap_or(Retain::For(86_400_000));
+        let (failed, label) = {
+            let r = inst.report.lock().unwrap();
+            (r.error.is_some() || r.dead_reason.is_some() || state == SessionState::Error, r.workspace.clone().unwrap_or_default())
+        };
+        let mut paths = vec![self.data_root.join("instances").join(id).display().to_string()];
+        if label.starts_with("isolated:") {
+            paths.push(inst.paths.workspace.display().to_string());
         }
-        let _ = std::fs::remove_dir_all(self.data_root.join("instances").join(id));
+        match retain.keep_ms(failed) {
+            _ if remove_workspace => self.reap(id, &paths).await,
+            Some(0) => self.reap(id, &paths).await,
+            Some(ms) => self.store.schedule_reap(id, now_ms() + ms, &paths)?,
+            None => self.store.schedule_reap(id, i64::MAX, &paths)?,
+        }
         self.update(&inst, |r| {
             r.state = SessionState::Stopped;
             r.current_task = None;
@@ -781,6 +1019,204 @@ impl Manager {
         self.instances.lock().unwrap().remove(id);
         self.stats.forget(id);
         self.store.delete_instance(id)?;
+        Ok(())
+    }
+
+    /// Remove a stopped instance's container and volumes.
+    async fn reap(&self, id: &str, paths: &[String]) {
+        let _ = self.rt.remove(id).await;
+        self.rt.forget(id);
+        for p in paths {
+            let _ = std::fs::remove_dir_all(p);
+        }
+        let _ = self.store.drop_ws_base(&format!("isolated:{id}"));
+        let _ = self.store.done_reap(id);
+        tracing::info!(session = id, "reaped");
+    }
+
+    /// Collect the template's `outputs:` (and the transcript) into the
+    /// artifact store and report where they should go. Works on a dead
+    /// instance too: the node reads the volumes host-side.
+    pub async fn harvest(self: &Arc<Self>, inst: &Arc<Instance>, trigger: &str) -> Harvest {
+        let alive = !inst.dead.load(Ordering::Relaxed) && inst.oc.healthy().await;
+        if alive {
+            // Tokens and todos one last time.
+            let oc_id = inst.oc_id.lock().unwrap().clone();
+            if let Some(oc_id) = oc_id {
+                if let Ok(msgs) = inst.oc.messages(&oc_id).await {
+                    self.absorb_history(inst, &msgs);
+                }
+                if let Ok(t) = inst.oc.todos(&oc_id).await {
+                    self.update(inst, |r| r.todos = t);
+                }
+            }
+            if let Some(gw) = inst.gateway.lock().unwrap().clone() {
+                gw.settle_tokens();
+            }
+        }
+        let mut h = Harvest {
+            session: inst.id.clone(),
+            node: self.node.clone(),
+            at: now_ms(),
+            trigger: trigger.into(),
+            outputs: vec![],
+            transcript_ref: None,
+            missing: vec![],
+            from_checkpoint: false,
+            checkpoint_at: None,
+            notes: vec![],
+        };
+        let snap = self.cfg.get();
+        let Some(agent) = snap.agents.get(&inst.agent) else {
+            h.notes.push("agent profile no longer configured; nothing to collect".into());
+            return h;
+        };
+        if inst.harvested.swap(true, Ordering::Relaxed) {
+            h.notes.push("already harvested".into());
+            return h;
+        }
+        let parents = inst.gateway.lock().unwrap().as_ref().map(|g| g.fetched()).unwrap_or_default();
+        if let Ok(root) = std::fs::canonicalize(&inst.paths.workspace) {
+            for o in &agent.cfg.outputs {
+                let info = crate::cas::PutInfo {
+                    name: o.name.clone().unwrap_or_default(),
+                    session: Some(inst.id.clone()),
+                    parents: parents.clone(),
+                    tags: vec!["output".into(), trigger.into()],
+                    ..Default::default()
+                };
+                let globby = o.path.contains(['*', '?', '[', '{']);
+                let res = if globby {
+                    self.gw.files.put_glob(&root, &o.path, info).await.map(|r| r.map(|(m, _)| m))
+                } else if root.join(o.path.trim_end_matches('/')).exists() {
+                    self.gw.files.put_path(&root, o.path.trim_end_matches('/'), info).await.map(Some)
+                } else {
+                    Ok(None)
+                };
+                match res {
+                    Ok(Some(m)) => h.outputs.push(HarvestedOutput {
+                        pattern: o.path.clone(),
+                        path: o.path.trim_end_matches('/').to_string(),
+                        reference: m.reference,
+                        size: m.size,
+                        kind: m.kind,
+                        to: o.to.clone(),
+                        dest: o.dest.clone(),
+                        delivered: None,
+                    }),
+                    Ok(None) => h.missing.push(o.path.clone()),
+                    Err(e) => h.notes.push(format!("{}: {e:#}", o.path)),
+                }
+            }
+        }
+        if agent.cfg.transcript {
+            match alive {
+                true => h.transcript_ref = self.put_transcript(inst, trigger).await,
+                false => h.notes.push("transcript: OpenCode is not running; see the latest checkpoint".into()),
+            }
+        }
+        tracing::info!(session = %inst.id, trigger, outputs = h.outputs.len(), missing = h.missing.len(), "harvested");
+        self.link.emit(NodeEvent::Harvested(h.clone()));
+        h
+    }
+
+    /// Interrupt, harvest, stop the container and keep it (`halted`).
+    async fn halt(self: &Arc<Self>, id: &str) -> Result<()> {
+        let inst = self.get(id)?;
+        inst.stopping.store(true, Ordering::Relaxed);
+        let oc_id = inst.oc_id.lock().unwrap().clone();
+        if let Some(oc_id) = oc_id {
+            let _ = inst.oc.abort(&oc_id).await;
+        }
+        self.harvest(&inst, "halt").await;
+        for t in inst.tasks.lock().unwrap().drain(..) {
+            t.abort();
+        }
+        let _ = self.rt.stop(id).await;
+        self.update(&inst, |r| {
+            r.state = SessionState::Halted;
+            r.current_task = Some("halted: waiting for the operator".into());
+        });
+        Ok(())
+    }
+
+    /// The container/process ended by itself: keep everything, report it.
+    async fn mark_dead(self: &Arc<Self>, inst: &Arc<Instance>, reason: String, detail: String) {
+        if inst.dead.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        inst.stopping.store(true, Ordering::Relaxed);
+        for t in inst.tasks.lock().unwrap().drain(..) {
+            t.abort();
+        }
+        tracing::warn!(session = %inst.id, reason, detail, "instance died");
+        self.update(inst, |r| {
+            r.state = SessionState::Dead;
+            r.dead_reason = Some(reason.clone());
+            r.error = Some(format!("instance died: {reason}{}", if detail.is_empty() { String::new() } else { format!(" ({detail})") }));
+            r.current_task = None;
+        });
+        self.link.emit(NodeEvent::Died { session: inst.id.clone(), reason, detail });
+    }
+
+    /// Start a dead or halted instance again from its kept volumes (same
+    /// OpenCode home, so its history is intact), then prompt it.
+    async fn restart(self: &Arc<Self>, id: &str, prompt: &str) -> Result<()> {
+        let inst = self.get(id)?;
+        let state = inst.report.lock().unwrap().state;
+        if !matches!(state, SessionState::Dead | SessionState::Halted) {
+            bail!("session {id} is {}, not dead or halted", state.as_str());
+        }
+        let snap = self.cfg.get();
+        let agent = snap.agents.get(&inst.agent).cloned().ok_or_else(|| anyhow!("agent {} is no longer configured on {}", inst.agent, self.node))?;
+        let _ = self.rt.stop(id).await;
+        for t in inst.tasks.lock().unwrap().drain(..) {
+            t.abort();
+        }
+        std::fs::create_dir_all(&inst.paths.run)?;
+        self.rt.prepare_dirs(&inst.paths)?;
+        let wall_clock = inst.report.lock().unwrap().dead_reason.as_deref() == Some("wall_clock");
+        inst.dead.store(false, Ordering::Relaxed);
+        inst.harvested.store(false, Ordering::Relaxed);
+        inst.stopping.store(false, Ordering::Relaxed);
+        inst.turn_open.store(false, Ordering::Relaxed);
+        self.update(&inst, |r| {
+            r.state = SessionState::Starting;
+            r.current_task = Some("restarting".into());
+            r.dead_reason = None;
+            r.error = None;
+            if wall_clock {
+                r.started_at = now_ms(); // the operator chose to give it more time
+            }
+        });
+        self.start_gateway(&inst, &inst.cap)?;
+        let image = agent.cfg.container.image.clone().unwrap_or_else(|| snap.node.runtime.image.clone());
+        match self.rt.kind {
+            RuntimeKind::Podman => self.rt.start_existing(id).await?,
+            RuntimeKind::Process => {
+                let launch = LaunchSpec { node: &self.node, id, agent: &inst.agent, image: &image, container: &agent.cfg.container, paths: &inst.paths, password: &inst.password };
+                self.rt.launch(&launch).await?;
+            }
+        }
+        let me = self.clone();
+        let (inst2, prompt) = (inst.clone(), prompt.to_string());
+        tokio::spawn(async move {
+            let res: Result<()> = async {
+                inst2.oc.wait_healthy(Duration::from_secs(120)).await?;
+                inst2.oc.wait_model(&inst2.oc_provider, &inst2.oc_model, Duration::from_secs(60)).await?;
+                me.update(&inst2, |r| {
+                    r.state = SessionState::Idle;
+                    r.current_task = None;
+                });
+                me.start_tail(&inst2);
+                me.prompt(&inst2, &prompt, Delivery::Queue).await
+            }
+            .await;
+            if let Err(e) = res {
+                me.fail(&inst2, format!("restart: {e:#}"));
+            }
+        });
+        tracing::info!(session = id, "restarting from kept volumes");
         Ok(())
     }
 
@@ -797,11 +1233,16 @@ impl Manager {
             };
             let paths = InstancePaths { run: self.run_root.join(&row.id), etc: inst_dir.join("etc"), home: inst_dir.join("home"), workspace: ws };
             let role = if row.role == "coordinator" { SessionRole::Coordinator } else { SessionRole::Worker };
-            let inst = self.new_instance(&row.id, &row.report.agent, role, paths, &row.password, row.report.clone());
+            let inst = self.new_instance(&row.id, &row.report.agent, role, paths, &row.cap, &row.password, row.report.clone());
             if let Ok(spec) = serde_json::from_str::<SpawnSpec>(&row.spec_json) {
                 *inst.overrides.lock().unwrap() = spec.overrides;
             }
             self.instances.lock().unwrap().insert(row.id.clone(), inst.clone());
+            if matches!(row.report.state, SessionState::Dead | SessionState::Halted) {
+                // Kept for a restart; nothing runs.
+                inst.stopping.store(true, Ordering::Relaxed);
+                continue;
+            }
             let Some(f) = f else {
                 tracing::warn!(session = %row.id, "container gone; marking lost");
                 self.update(&inst, |r| {
@@ -900,13 +1341,34 @@ impl Manager {
         }
     }
 
-    /// Periodic housekeeping: idle/blocked safety net and wall-clock limits.
+    /// Periodic housekeeping: dead containers, retention, the idle/blocked
+    /// safety net, pending questions and wall-clock limits.
     pub async fn tick(self: &Arc<Self>) {
+        for (id, paths) in self.store.due_reaps(now_ms()) {
+            self.reap(&id, &paths).await;
+        }
         let snap = self.cfg.get();
         let insts: Vec<_> = self.instances.lock().unwrap().values().cloned().collect();
+        // Containers/processes that ended without being stopped.
+        let watch: Vec<String> = insts
+            .iter()
+            .filter(|i| !i.stopping.load(Ordering::Relaxed) && !i.dead.load(Ordering::Relaxed) && i.report.lock().unwrap().state.is_live())
+            .map(|i| i.id.clone())
+            .collect();
+        if !watch.is_empty() {
+            for (id, exit) in self.rt.ended(&self.node, &watch).await {
+                let Some(inst) = insts.iter().find(|i| i.id == id) else { continue };
+                if inst.stopping.load(Ordering::Relaxed) {
+                    continue; // stopped by us in the meantime
+                }
+                let reason = if exit.oom { "oom".to_string() } else { format!("exit:{}", exit.code) };
+                let detail = if exit.oom { "killed by the kernel: out of memory (container.memory)".to_string() } else { String::new() };
+                self.mark_dead(inst, reason, detail).await;
+            }
+        }
         for inst in &insts {
             let state = inst.report.lock().unwrap().state;
-            if !matches!(state, SessionState::Running | SessionState::Blocked | SessionState::Parked) {
+            if !matches!(state, SessionState::Running | SessionState::Blocked | SessionState::Parked) || inst.dead.load(Ordering::Relaxed) {
                 continue;
             }
             // Parked: show the countdown; leave once a request goes through again.
@@ -927,28 +1389,41 @@ impl Manager {
                 None => {}
             }
             let perms = inst.oc.pending_permissions().await.unwrap_or_default();
-            if !perms.is_empty() && state != SessionState::Blocked {
-                let what = perms[0]["permission"].as_str().unwrap_or("?").to_string();
-                let req = perms[0]["id"].as_str().unwrap_or("").to_string();
+            let oc_id = inst.oc_id.lock().unwrap().clone();
+            let questions: Vec<Value> = inst.oc.pending_questions().await.unwrap_or_default().into_iter().filter(|q| q["sessionID"].as_str() == oc_id.as_deref()).collect();
+            // Requests whose event we missed (e.g. while the stream reconnected).
+            for p in &perms {
+                self.report_permission(inst, p);
+            }
+            for q in &questions {
+                self.report_question(inst, q);
+            }
+            let waiting = !perms.is_empty() || !questions.is_empty();
+            if waiting && state != SessionState::Blocked {
+                let what = match perms.first() {
+                    Some(p) => format!("permission: {} (request {})", p["permission"].as_str().unwrap_or("?"), p["id"].as_str().unwrap_or("")),
+                    None => format!("question: {}", questions[0]["questions"][0]["question"].as_str().unwrap_or("?").chars().take(200).collect::<String>()),
+                };
                 self.update(inst, |r| {
                     r.state = SessionState::Blocked;
-                    r.current_task = Some(format!("permission: {what} (request {req})"));
+                    r.current_task = Some(what);
                 });
-                self.link.emit(NodeEvent::Activity { session: inst.id.clone(), kind: "permission.asked".into(), detail: perms[0].clone() });
-            } else if perms.is_empty() && state == SessionState::Blocked {
+            } else if !waiting && state == SessionState::Blocked {
                 self.update(inst, |r| r.state = SessionState::Running);
             }
-            if perms.is_empty() && inst.turn_open.load(Ordering::Relaxed) {
+            if !waiting && inst.turn_open.load(Ordering::Relaxed) {
                 self.turn_ended(inst).await;
             }
             let started = inst.report.lock().unwrap().started_at;
             if let Some(limit) = snap.agents.get(&inst.agent).and_then(|a| a.cfg.limits.wall_clock_secs) {
                 if now_ms() - started > (limit as i64) * 1000 {
-                    let oc_id = inst.oc_id.lock().unwrap().clone();
                     if let Some(oc_id) = oc_id {
                         let _ = inst.oc.abort(&oc_id).await;
                     }
-                    self.update(inst, |r| r.error = Some(format!("wall-clock limit of {limit}s exceeded")));
+                    self.harvest(inst, "wall_clock").await;
+                    inst.stopping.store(true, Ordering::Relaxed);
+                    let _ = self.rt.stop(&inst.id).await;
+                    self.mark_dead(inst, "wall_clock".into(), format!("ran longer than limits.wall_clock_secs ({limit}s)")).await;
                 }
             }
         }
@@ -1009,7 +1484,7 @@ fn perm_json(p: &PermRule) -> Value {
 
 /// Built-in cluster preamble, used unless the hub ships `preambles/cluster.md`.
 /// Variables: {{instance.id}} {{template}} {{node}} {{parent}} {{task}}
-/// {{budget}} {{model}} {{tools}} {{question_mode}}.
+/// {{budget}} {{model}} {{tools}} {{question_mode}} {{outputs}}.
 pub const DEFAULT_PREAMBLE: &str = r#"## Operating in opencode-cluster
 
 You are instance `{{instance.id}}` of the `{{template}}` agent, running on node
@@ -1022,10 +1497,17 @@ You are instance `{{instance.id}}` of the `{{template}}` agent, running on node
   Messages from other agents and the operator may arrive between turns.
 - Budget: {{budget}}. If a provider allowance runs out you may be paused until it
   resets; that is expected, just continue when you are resumed.
-- Questions: the operator's mode is `{{question_mode}}`. Decide what you can
-  yourself; ask (or tell whoever started you) only about what you cannot.
-- Your workspace is the current directory. Other agents only see files you
-  share explicitly or that live in a shared workspace.
+- Questions (mode `{{question_mode}}`): decide what you can yourself. If you
+  cannot, use `cluster_ask` with an importance: `low` (a preference), `normal`
+  (it changes the result), `vital` (money, credentials, deleting data,
+  irreversible or external actions). It goes to whoever started you, then up
+  the chain; the answer arrives as a message. When an agent you started asks
+  you, answer with `cluster_answer` or pass it up with `cluster_escalate`.
+  Record decisions you made without asking with `cluster_log_assumption`.
+- Use `cluster_report_up` for progress worth knowing about; it is not a question.
+- Your workspace is the current directory. Share files with other agents as
+  artifacts: `cluster_artifact_put` returns a reference (art://b3/…) to put in a
+  message, `cluster_artifact_get` fetches one. {{outputs}}
 - Never try to read or print credentials; you do not have any.
 "#;
 
@@ -1050,7 +1532,13 @@ fn write_opencode_config(
     // orchestration briefing (e.g. coordinator), the spawner's additions.
     let budget = spec.overrides.budget_usd.or(a.limits.budget_usd).map(|b| format!("${b:.2} for this session")).unwrap_or_else(|| "no fixed limit".into());
     let tools = crate::gateway::tool_names(spec.role, a.tools.cluster.as_deref()).join(", ");
-    let vars: [(&str, String); 9] = [
+    let outputs = if a.outputs.is_empty() {
+        String::new()
+    } else {
+        let list: Vec<String> = a.outputs.iter().map(|o| format!("`{}` → {}", o.path, o.to.replace('_', " "))).collect();
+        format!("When you finish, these are collected from your workspace: {}.", list.join(", "))
+    };
+    let vars: [(&str, String); 10] = [
         ("{{instance.id}}", spec.id.clone()),
         ("{{template}}", a.name.clone()),
         ("{{node}}", snap.node.name.clone()),
@@ -1059,7 +1547,8 @@ fn write_opencode_config(
         ("{{budget}}", budget),
         ("{{model}}", format!("{}/{}", a.provider.id, a.provider.model)),
         ("{{tools}}", tools),
-        ("{{question_mode}}", "important_and_vital".into()),
+        ("{{question_mode}}", spec.question_mode.unwrap_or_default().as_str().into()),
+        ("{{outputs}}", outputs),
     ];
     let render = |s: &str| vars.iter().fold(s.to_string(), |acc, (k, v)| acc.replace(k, v));
     let mut role = String::new();

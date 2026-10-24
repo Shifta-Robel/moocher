@@ -95,6 +95,9 @@ enum Cmd {
         /// Preferred egress route (one of the template's overridable.routes).
         #[arg(long)]
         route: Option<String>,
+        /// Give it the coordinator tools (it may start and stop other agents).
+        #[arg(long)]
+        coordinator: bool,
     },
     /// Send a message to a session (default: picked up at its next step).
     Send {
@@ -143,6 +146,106 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TokenCmd,
     },
+    /// Questions from agents (open ones: importance, then how many wait, then age).
+    Questions {
+        /// Include answered/decided ones.
+        #[arg(long)]
+        all: bool,
+        #[command(subcommand)]
+        cmd: Option<QuestionsCmd>,
+    },
+    /// Answer a question: free text, `--choice N`, `--decide` (let the agent decide) or `--reject`.
+    Answer {
+        id: String,
+        text: Option<String>,
+        #[arg(long)]
+        choice: Option<usize>,
+        #[arg(long)]
+        decide: bool,
+        #[arg(long)]
+        reject: bool,
+    },
+    /// Decisions agents made without you (for review).
+    Assumptions {
+        #[arg(long)]
+        task: Option<i64>,
+    },
+    /// The artifact store (content-addressed files and trees, with lineage).
+    Artifact {
+        #[command(subcommand)]
+        cmd: ArtifactCmd,
+    },
+    /// Halted tasks/runs waiting for a recovery decision.
+    Halts {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Resume after a death: restart | resume_elsewhere | handoff | abandon.
+    Recover {
+        /// A halt id (h-…) or a dead session id.
+        target: String,
+        option: String,
+        /// resume_elsewhere: preferred node.
+        #[arg(long)]
+        node: Option<String>,
+    },
+    /// What was collected from instances when they ended.
+    Harvests {
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// The notification centre (newest first).
+    Notifications {
+        #[arg(long)]
+        unread: bool,
+        /// Mark everything shown as read.
+        #[arg(long)]
+        read: bool,
+        #[arg(long, default_value_t = 30)]
+        limit: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum QuestionsCmd {
+    /// Show or set the question mode: ask_me_everything | important_and_vital | vital_only | autonomous.
+    Mode {
+        mode: Option<String>,
+        /// Only for this task.
+        #[arg(long)]
+        task: Option<i64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ArtifactCmd {
+    /// Upload a file, or a directory (packed as a tree).
+    Put {
+        path: std::path::PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+        /// Repeatable.
+        #[arg(long)]
+        tag: Vec<String>,
+        /// Lineage: artifacts this one was made from (repeatable).
+        #[arg(long)]
+        parent: Vec<String>,
+    },
+    /// Download: a file to `-o` (default: its name), a tree unpacked into the directory `-o`.
+    Get {
+        reference: String,
+        #[arg(short, long)]
+        out: Option<std::path::PathBuf>,
+    },
+    Ls {
+        query: Option<String>,
+        #[arg(long)]
+        task: Option<i64>,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
+    /// Metadata and lineage (parents and children).
+    Show { reference: String },
 }
 
 #[derive(Subcommand)]
@@ -157,6 +260,9 @@ enum TaskCmd {
         /// Repeatable. `workflow:<name>` runs that workflow instead of a coordinator.
         #[arg(short, long)]
         tag: Vec<String>,
+        /// Question mode for this task's agents (default: the cluster's).
+        #[arg(long)]
+        question_mode: Option<String>,
     },
     Ls,
     Show { id: i64 },
@@ -168,6 +274,8 @@ enum TaskCmd {
         body: Option<String>,
         #[arg(long)]
         label: Option<String>,
+        #[arg(long)]
+        question_mode: Option<String>,
     },
     /// Put these task ids first, in this order.
     Order { ids: Vec<i64> },
@@ -725,6 +833,12 @@ async fn run(cli: Cli) -> Result<()> {
             if let Some(e) = &r.error {
                 println!("ERROR {e}");
             }
+            if !s.waiting_on.is_empty() {
+                println!("waiting on question(s): {}", s.waiting_on.join(", "));
+            }
+            if s.deaths > 0 || s.replaces.is_some() {
+                println!("deaths recovered {}{}", s.deaths, s.replaces.as_deref().map(|r| format!(" · replaces {r}")).unwrap_or_default());
+            }
             println!("todos:");
             for t in &r.todos {
                 let mark = match t.status.as_str() {
@@ -739,7 +853,7 @@ async fn run(cli: Cli) -> Result<()> {
                 println!("last output:\n{t}");
             }
         }
-        Cmd::Spawn { agent, prompt, node, title, shared, append, budget, route } => {
+        Cmd::Spawn { agent, prompt, node, title, shared, append, budget, route, coordinator } => {
             let ws = shared.map(|n| json!({"mode": "shared", "name": n}));
             let mut ov = serde_json::Map::new();
             if let Some(a) = append {
@@ -751,7 +865,8 @@ async fn run(cli: Cli) -> Result<()> {
             if let Some(r) = route {
                 ov.insert("route".into(), json!(r));
             }
-            let v = api.post("/sessions", json!({"agent": agent, "prompt": prompt, "node": node, "title": title, "workspace": ws, "overrides": ov})).await?;
+            let role = if coordinator { "coordinator" } else { "worker" };
+            let v = api.post("/sessions", json!({"agent": agent, "prompt": prompt, "node": node, "title": title, "workspace": ws, "overrides": ov, "role": role})).await?;
             if raw {
                 return Ok(out(&v));
             }
@@ -781,9 +896,10 @@ async fn run(cli: Cli) -> Result<()> {
             println!("ok");
         }
         Cmd::Task { cmd } => match cmd {
-            TaskCmd::Add { title, body, label, tag } => {
+            TaskCmd::Add { title, body, label, tag, question_mode } => {
                 let l = TaskLabel::parse(&label).context("label must be urgent, when_free or on_demand")?;
-                let v = api.post("/tasks", json!({"title": title, "body": body, "label": l, "tags": tag})).await?;
+                let qm = question_mode.as_deref().map(|m| QuestionMode::parse(m).context("question mode must be ask_me_everything, important_and_vital, vital_only or autonomous")).transpose()?;
+                let v = api.post("/tasks", json!({"title": title, "body": body, "label": l, "tags": tag, "question_mode": qm})).await?;
                 if raw {
                     return Ok(out(&v));
                 }
@@ -797,12 +913,13 @@ async fn run(cli: Cli) -> Result<()> {
                 print_tasks(&serde_json::from_value::<Vec<Task>>(v)?);
             }
             TaskCmd::Show { id } => out(&api.get(&format!("/tasks/{id}")).await?),
-            TaskCmd::Edit { id, title, body, label } => {
+            TaskCmd::Edit { id, title, body, label, question_mode } => {
                 let label = match label {
                     Some(l) => Some(TaskLabel::parse(&l).context("bad label")?),
                     None => None,
                 };
-                let v = api.req(reqwest::Method::PATCH, &format!("/tasks/{id}"), Some(json!({"title": title, "body": body, "label": label}))).await?;
+                let qm = question_mode.as_deref().map(|m| QuestionMode::parse(m).context("bad question mode")).transpose()?;
+                let v = api.req(reqwest::Method::PATCH, &format!("/tasks/{id}"), Some(json!({"title": title, "body": body, "label": label, "question_mode": qm}))).await?;
                 out(&v);
             }
             TaskCmd::Order { ids } => {
@@ -906,6 +1023,158 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Cmd::Questions { all, cmd: Some(QuestionsCmd::Mode { mode, task }) } => {
+            let _ = all;
+            match mode {
+                Some(m) => {
+                    let m = QuestionMode::parse(&m).context("mode must be ask_me_everything, important_and_vital, vital_only or autonomous")?;
+                    api.post("/questions/mode", json!({"mode": m, "task": task})).await?;
+                    println!("question mode {}{}", m.as_str(), task.map(|t| format!(" for task #{t}")).unwrap_or_else(|| " for the cluster".into()));
+                }
+                None => {
+                    let v = api.get("/questions/mode").await?;
+                    if raw {
+                        return Ok(out(&v));
+                    }
+                    println!("cluster: {}", v["mode"].as_str().unwrap_or("?"));
+                    for t in v["tasks"].as_array().into_iter().flatten() {
+                        println!("task #{}: {}", t["task"], t["mode"].as_str().unwrap_or("?"));
+                    }
+                }
+            }
+        }
+        Cmd::Questions { all, cmd: None } => {
+            let v = api.get(&format!("/questions?all={all}")).await?;
+            if raw {
+                return Ok(out(&v));
+            }
+            let qs: Vec<Question> = serde_json::from_value(v)?;
+            if qs.is_empty() {
+                println!("no {}questions", if all { "" } else { "open " });
+            }
+            for q in &qs {
+                let chain: Vec<String> = std::iter::once(format!("{} {}", q.asker_agent, q.asker)).chain(q.chain.iter().map(|h| format!("{} ({})", h.holder, h.why))).collect();
+                println!(
+                    "{}  {:<6} {:<10} {:<9} blocked {}  {}  on {}{}",
+                    q.id,
+                    q.importance.as_str(),
+                    format!("{:?}", q.status).to_lowercase(),
+                    format!("{:?}", q.kind).to_lowercase(),
+                    q.blocked,
+                    ago(q.created_at),
+                    q.node,
+                    q.task_id.map(|t| format!(" task #{t}")).unwrap_or_default()
+                );
+                println!("    {}", q.text.lines().collect::<Vec<_>>().join("\n    "));
+                for (i, o) in q.options.iter().enumerate() {
+                    println!("      {}) {}{}", i + 1, o.label, if o.description.is_empty() { String::new() } else { format!(" — {}", o.description) });
+                }
+                println!("    chain: {}   held by {}{}", chain.join(" → "), q.holder, if q.top_decides { " (decides)" } else { "" });
+                for h in q.chain.iter().filter(|h| h.note.is_some()) {
+                    println!("    note ({}): {}", h.holder, h.note.as_deref().unwrap_or(""));
+                }
+                if !q.raised_because.is_empty() {
+                    println!("    raised to {}: {}", q.importance.as_str(), q.raised_because.join(", "));
+                }
+                if let Some(a) = &q.answer {
+                    println!("    answer ({}): {}", q.answered_by.as_deref().unwrap_or("?"), a.chars().take(300).collect::<String>());
+                }
+            }
+        }
+        Cmd::Answer { id, text, choice, decide, reject } => {
+            let v = api.post(&format!("/questions/{id}/answer"), json!({"answer": text, "choice": choice, "let_agent_decide": decide, "reject": reject})).await?;
+            if raw {
+                return Ok(out(&v));
+            }
+            println!("{} {} → delivered to {}", id, v["status"].as_str().unwrap_or("?"), v["asker"].as_str().unwrap_or("?"));
+        }
+        Cmd::Assumptions { task } => {
+            let v = api.get(&format!("/assumptions{}", task.map(|t| format!("?task={t}")).unwrap_or_default())).await?;
+            if raw {
+                return Ok(out(&v));
+            }
+            for a in serde_json::from_value::<Vec<Assumption>>(v)? {
+                println!(
+                    "#{:<4} {} {:<14} by {:<14} {}{}",
+                    a.id,
+                    fmt_ts(a.ts),
+                    a.session,
+                    a.decided_by,
+                    a.mode.as_str(),
+                    a.task_id.map(|t| format!(" task #{t}")).unwrap_or_default()
+                );
+                println!("      {}", a.text.lines().collect::<Vec<_>>().join("\n      "));
+            }
+        }
+        Cmd::Artifact { cmd } => artifact_cmd(&api, cmd, raw).await?,
+        Cmd::Halts { all } => {
+            let v = api.get(&format!("/halts?all={all}")).await?;
+            if raw {
+                return Ok(out(&v));
+            }
+            let hs: Vec<Halt> = serde_json::from_value(v)?;
+            if hs.is_empty() {
+                println!("no {}halts", if all { "" } else { "open " });
+            }
+            for h in hs {
+                println!("{}  {}  {}  {} died ({})  spent ${:.4}  {}", h.id, h.status, h.scope, h.dead_session, h.reason, h.spent_usd, ago(h.at));
+                if let Some(t) = &h.current_todo {
+                    println!("    was doing: {t}");
+                }
+                if !h.sessions.is_empty() {
+                    println!("    halted: {}", h.sessions.join(", "));
+                }
+                for o in &h.options {
+                    println!("    {} {:<17} ~${:<8.4} {}", if o.available { "*" } else { " " }, o.kind, o.est_cost_usd, o.note);
+                }
+                if let Some(r) = &h.resolution {
+                    println!("    resolved: {r}");
+                }
+            }
+        }
+        Cmd::Recover { target, option, node } => {
+            let v = api.post(&if target.starts_with("h-") { format!("/halts/{target}/recover") } else { format!("/sessions/{target}/recover") }, json!({"option": option, "node": node})).await?;
+            out(&v);
+        }
+        Cmd::Harvests { session } => {
+            let v = api.get(&format!("/harvests{}", session.map(|s| format!("?session={s}")).unwrap_or_default())).await?;
+            if raw {
+                return Ok(out(&v));
+            }
+            for h in serde_json::from_value::<Vec<Harvest>>(v)? {
+                println!("{} {} on {} ({}){}", fmt_ts(h.at), h.session, h.node, h.trigger, if h.from_checkpoint { " FROM CHECKPOINT" } else { "" });
+                for o in &h.outputs {
+                    println!("    {:<24} {} {:>8}B → {} {}", o.path, o.reference, o.size, o.to, o.delivered.as_deref().unwrap_or(""));
+                }
+                for m in &h.missing {
+                    println!("    {m:<24} (matched nothing)");
+                }
+                if let Some(t) = &h.transcript_ref {
+                    println!("    transcript {t}");
+                }
+                for n in &h.notes {
+                    println!("    note: {n}");
+                }
+            }
+        }
+        Cmd::Notifications { unread, read, limit } => {
+            let v = api.get(&format!("/notifications?unread={unread}&limit={limit}")).await?;
+            let ns: Vec<Notification> = serde_json::from_value(v.clone())?;
+            if read {
+                if let Some(max) = ns.iter().map(|n| n.id).max() {
+                    api.post("/notifications/read", json!({"upto": max})).await?;
+                }
+            }
+            if raw {
+                return Ok(out(&v));
+            }
+            for n in ns {
+                println!("{}{:>4} {} {:<7} {:<18} {}", if n.read { " " } else { "●" }, n.id, fmt_ts(n.ts), n.severity, n.kind, n.title);
+                if !n.body.is_empty() {
+                    println!("       {}", n.body);
+                }
+            }
+        }
         Cmd::Token { cmd } => match cmd {
             TokenCmd::Create { name, scope } => out(&api.post("/tokens", json!({"name": name, "scope": scope})).await?),
             TokenCmd::Ls => out(&api.get("/tokens").await?),
@@ -913,6 +1182,145 @@ async fn run(cli: Cli) -> Result<()> {
         },
     }
     Ok(())
+}
+
+async fn artifact_cmd(api: &Api, cmd: ArtifactCmd, raw: bool) -> Result<()> {
+    use ocl_protocol::archive;
+    match cmd {
+        ArtifactCmd::Put { path, name, tag, parent } => {
+            let meta = std::fs::metadata(&path).with_context(|| format!("{}", path.display()))?;
+            let (file, kind, cleanup) = if meta.is_dir() {
+                let root = std::fs::canonicalize(&path)?;
+                let (m, skipped) = archive::manifest(&root, "", &|_| false)?;
+                if !skipped.is_empty() {
+                    eprintln!("note: skipped {} link(s)/special file(s)", skipped.len());
+                }
+                let tmp = std::env::temp_dir().join(format!("ocl-put-{}.tar.zst", std::process::id()));
+                archive::pack(&root, &m, &tmp)?;
+                (tmp, "tree", true)
+            } else {
+                (path.clone(), "file", false)
+            };
+            let default_name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "artifact".into());
+            let q = format!(
+                "name={}&kind={kind}&tags={}&parents={}",
+                enc(&name.unwrap_or(default_name)),
+                enc(&tag.join(",")),
+                enc(&parent.join(","))
+            );
+            // Stream the file: artifacts can be large.
+            let f = tokio::fs::File::open(&file).await?;
+            let chunks = futures::stream::unfold(f, |mut f| async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = vec![0u8; 256 * 1024];
+                match f.read(&mut buf).await {
+                    Ok(0) => None,
+                    Ok(n) => {
+                        buf.truncate(n);
+                        Some((Ok::<Vec<u8>, std::io::Error>(buf), f))
+                    }
+                    Err(e) => Some((Err(e), f)),
+                }
+            });
+            let sent = api.http.post(format!("{}/api/v1/artifacts?{q}", api.base)).bearer_auth(&api.token).body(reqwest::Body::wrap_stream(chunks)).send().await;
+            if cleanup {
+                let _ = std::fs::remove_file(&file);
+            }
+            let resp = sent?;
+            let status = resp.status();
+            let v: Value = resp.json().await.unwrap_or(Value::Null);
+            if !status.is_success() {
+                bail!("{status}: {}", v["error"].as_str().unwrap_or("upload failed"));
+            }
+            if raw {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                println!("{}  {} ({}, {} bytes)", v["reference"].as_str().unwrap_or(""), v["name"].as_str().unwrap_or(""), kind, v["size"]);
+            }
+        }
+        ArtifactCmd::Get { reference, out } => {
+            let info = api.get(&format!("/artifacts/{}", enc(&reference))).await?;
+            let a: ArtifactMeta = serde_json::from_value(info["artifact"].clone())?;
+            let resp = api.http.get(format!("{}/api/v1/artifacts/{}/blob", api.base, a.hash)).bearer_auth(&api.token).send().await?;
+            if !resp.status().is_success() {
+                bail!("{}: download failed", resp.status());
+            }
+            // Stream to a temporary file next to the destination, verify, then move it in place.
+            let to = match (&out, a.kind.as_str()) {
+                (_, "tree") => std::env::temp_dir().join(format!("ocl-get-{}.tar.zst", std::process::id())),
+                (Some(o), _) => o.clone(),
+                (None, _) => std::path::PathBuf::from(std::path::Path::new(&a.name).file_name().unwrap_or_default()),
+            };
+            let part = to.with_extension("ocl-part");
+            let mut f = tokio::fs::File::create(&part).await?;
+            let mut h = blake3::Hasher::new();
+            let mut n = 0u64;
+            let mut body = resp.bytes_stream();
+            while let Some(c) = body.next().await {
+                let c = c?;
+                h.update(&c);
+                n += c.len() as u64;
+                tokio::io::AsyncWriteExt::write_all(&mut f, &c).await?;
+            }
+            tokio::io::AsyncWriteExt::flush(&mut f).await?;
+            let got = h.finalize().to_hex().to_string();
+            if got != a.hash {
+                let _ = std::fs::remove_file(&part);
+                bail!("download corrupted (hash {got}, expected {})", a.hash);
+            }
+            std::fs::rename(&part, &to)?;
+            if a.kind == "tree" {
+                let dir = out.unwrap_or_else(|| std::path::PathBuf::from(a.name.replace(['/', ' ', '(', ')', ':'], "_")));
+                let m = archive::unpack(&to, &dir, u64::MAX);
+                let _ = std::fs::remove_file(&to);
+                println!("{} files into {}", m?.len(), dir.display());
+            } else {
+                println!("{n} bytes to {}", to.display());
+            }
+        }
+        ArtifactCmd::Ls { query, task, limit } => {
+            let mut q = format!("?limit={limit}");
+            if let Some(x) = query {
+                q.push_str(&format!("&q={}", enc(&x)));
+            }
+            if let Some(t) = task {
+                q.push_str(&format!("&task={t}"));
+            }
+            let v = api.get(&format!("/artifacts{q}")).await?;
+            if raw {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                return Ok(());
+            }
+            println!("{:<22} {:<5} {:>10} {:<14} {:>5}  {}", "REF", "KIND", "SIZE", "PRODUCER", "AGE", "NAME");
+            for a in serde_json::from_value::<Vec<ArtifactMeta>>(v)? {
+                println!("{:<22} {:<5} {:>10} {:<14} {:>5}  {}", format!("art://b3/{}", &a.hash[..12]), a.kind, a.size, a.producer.as_deref().unwrap_or("operator"), ago(a.created_at), a.name);
+            }
+        }
+        ArtifactCmd::Show { reference } => {
+            let v = api.get(&format!("/artifacts/{}", enc(&reference))).await?;
+            if raw {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                return Ok(());
+            }
+            let a: ArtifactMeta = serde_json::from_value(v["artifact"].clone())?;
+            println!("{}\n  name {}  kind {}  size {}  type {}", a.reference, a.name, a.kind, a.size, a.media_type);
+            println!("  made by {} on {}{}  {}", a.producer.as_deref().unwrap_or("operator"), a.node.as_deref().unwrap_or("-"), a.task_id.map(|t| format!(" (task #{t})")).unwrap_or_default(), fmt_ts(a.created_at));
+            if !a.tags.is_empty() {
+                println!("  tags {}", a.tags.join(", "));
+            }
+            for p in v["parents"].as_array().into_iter().flatten() {
+                println!("  from    {} {}", p["reference"].as_str().unwrap_or(""), p["name"].as_str().unwrap_or(""));
+            }
+            for c in v["children"].as_array().into_iter().flatten() {
+                println!("  used by {} {}", c["reference"].as_str().unwrap_or(""), c["name"].as_str().unwrap_or(""));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
 fn fmt_ts(ms: i64) -> String {

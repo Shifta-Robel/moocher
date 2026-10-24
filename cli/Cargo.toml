@@ -16,3 +16,4 @@ clap.workspace = true
 reqwest.workspace = true
 chrono.workspace = true
 libc = "0.2"
+blake3.workspace = true

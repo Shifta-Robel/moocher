@@ -15,7 +15,9 @@ the first phase whose ``match`` occurs in the latest user message is used (a
 phase without ``match`` is the default). This lets one model react to the
 cluster's follow-up messages (e.g. "Session X (builder) finished a turn").
 
-String values may contain ``{{last_user}}`` (the last user message text).
+String values may contain ``{{last_user}}`` (the last user message text) and
+``{{match:REGEX}}`` (the first match of REGEX in it, e.g. ``{{match:q-[0-9a-f]+}}``
+to answer a question by id).
 Usage is reported with simple len/4 token estimates so metering can be tested.
 
 Rate limits like a keyless gateway: ``--ip-quota N --ip-window SECS`` allows N
@@ -28,6 +30,7 @@ Usage: mock_llm.py --port 8099 [--scripts DIR] [--require-key KEY] [--ip-quota N
 import argparse
 import json
 import os
+import re
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -56,7 +59,10 @@ def render(value, ctx):
     if isinstance(value, str):
         for k, v in ctx.items():
             value = value.replace("{{" + k + "}}", v)
-        return value
+        def sub(m):
+            found = re.search(m.group(1), ctx.get("last_user", ""))
+            return found.group(0) if found else ""
+        return re.sub(r"\{\{match:(.+?)\}\}", sub, value)
     if isinstance(value, dict):
         return {k: render(v, ctx) for k, v in value.items()}
     if isinstance(value, list):

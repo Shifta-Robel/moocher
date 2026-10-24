@@ -53,3 +53,30 @@ message TunnelFrame {
   // Half-close: no more data from this side.
   bool eof = 3;
 }
+
+// Artifact blobs (content-addressed, BLAKE3). Uploads and downloads run on
+// their own streams so a large transfer never delays the Attach link.
+service Blobs {
+  // First chunk carries `header` (JSON: name, media_type, kind, hash, size,
+  // session, parents, tags, from); later chunks carry data.
+  rpc PutBlob(stream BlobChunk) returns (BlobPut);
+  // First chunk carries `header` (JSON artifact metadata), then data.
+  rpc GetBlob(BlobGet) returns (stream BlobChunk);
+}
+
+message BlobChunk {
+  bytes header = 1;
+  bytes data = 2;
+}
+
+message BlobPut {
+  // JSON artifact metadata (`ocl_protocol::model::ArtifactMeta`).
+  bytes meta = 1;
+}
+
+message BlobGet {
+  // `art://b3/<hex>` or the bare hex hash.
+  string reference = 1;
+  // Unix-socket callers name themselves; TLS callers are their certificate.
+  string from = 2;
+}

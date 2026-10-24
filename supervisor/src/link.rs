@@ -357,7 +357,7 @@ impl NodeLink for LinkService {
 
 impl Sup {
     /// Reconcile the supervisor's view with a node's full inventory.
-    pub fn on_hello(&self, h: &Hello, adm: &Admission) {
+    pub fn on_hello(self: &Arc<Self>, h: &Hello, adm: &Admission) {
         let info = NodeInfo {
             name: h.node.clone(),
             connected: true,
@@ -377,7 +377,21 @@ impl Sup {
         let _ = self.db.put_node(&info);
         self.publish_node(info);
         let reported: std::collections::HashSet<&str> = h.sessions.iter().map(|s| s.id.as_str()).collect();
+        let all = self.db.sessions(true);
         for s in &h.sessions {
+            // A node that comes back after its session was replaced elsewhere
+            // must not keep working on the same thing twice.
+            if let Some(new) = all.iter().find(|n| n.replaces.as_deref() == Some(s.id.as_str())) {
+                if s.state.is_live() {
+                    tracing::warn!(session = s.id, replacement = new.report.id, "node came back with a replaced session; stopping it");
+                    let me = self.clone();
+                    let id = s.id.clone();
+                    tokio::spawn(async move {
+                        let _ = me.stop_with(&crate::state::Actor::System, &id, false, "replaced").await;
+                    });
+                }
+                continue;
+            }
             self.merge_report(s.clone());
         }
         // Sessions we believed were on this node but it no longer has.
@@ -385,9 +399,13 @@ impl Sup {
             let missing = !reported.contains(s.report.id.as_str());
             if missing && (s.report.state.is_live() || s.report.state == SessionState::Unreachable) {
                 s.report.state = SessionState::Lost;
+                s.report.dead_reason = Some("container_gone".into());
                 s.report.error = Some("node reconnected without this session".into());
                 s.report.updated_at = now_ms();
                 self.save_session(&s);
+                let me = self.clone();
+                let id = s.report.id.clone();
+                tokio::spawn(async move { me.on_died(&id, "container_gone", "the node reconnected without this session").await });
             }
         }
         let _ = self.db.log(

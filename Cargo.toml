@@ -47,3 +47,8 @@ rustls-pki-types = { version = "1", features = ["std"] }
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem", "x509-parser"] }
 time = "0.3"
 ipnet = { version = "2", features = ["serde"] }
+blake3 = "1.5"
+tar = { version = "0.4", default-features = false }
+zstd = { version = "0.13", default-features = false }
+globset = { version = "0.4", default-features = false }
+walkdir = "2"

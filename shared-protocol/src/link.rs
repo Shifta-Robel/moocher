@@ -57,6 +57,34 @@ pub enum NodeEvent {
     Quotas { buckets: Vec<QuotaBucket> },
     /// Provider latency per route (full snapshot, at most once a minute).
     RouteStats { stats: Vec<RouteStat> },
+    /// OpenCode is waiting on someone: its `question` tool or an `ask` permission.
+    QuestionAsked {
+        session: String,
+        /// OpenCode request id (`que_…` / `per_…`).
+        request: String,
+        kind: QuestionKind,
+        text: String,
+        #[serde(default)]
+        options: Vec<QuestionOption>,
+        #[serde(default)]
+        multiple: bool,
+        #[serde(default)]
+        detail: serde_json::Value,
+    },
+    /// The request was answered or dropped inside OpenCode (e.g. the turn was aborted).
+    QuestionGone { session: String, request: String },
+    /// keyproxy refused a request: the session's budget is used up.
+    BudgetExhausted { session: String, budget_usd: f64, spent_usd: f64 },
+    /// The container/process is gone without being stopped.
+    Died {
+        session: String,
+        /// `oom`, `exit:<code>`, `crashloop`, `wall_clock`.
+        reason: String,
+        #[serde(default)]
+        detail: String,
+    },
+    Checkpoint(Checkpoint),
+    Harvested(Harvest),
 }
 
 /// Supervisor -> node.
@@ -103,6 +131,9 @@ pub struct SpawnSpec {
     pub parent: Option<String>,
     #[serde(default)]
     pub task: Option<i64>,
+    /// For the preamble.
+    #[serde(default)]
+    pub question_mode: Option<QuestionMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,7 +142,14 @@ pub enum NodeCommand {
     Spawn(SpawnSpec),
     Prompt { session: String, text: String, delivery: Delivery },
     Interrupt { session: String },
-    Stop { session: String, #[serde(default)] remove_workspace: bool },
+    /// Stop and harvest; `trigger` (`stop`, `task_end`) goes into the harvest record.
+    Stop {
+        session: String,
+        #[serde(default)]
+        remove_workspace: bool,
+        #[serde(default)]
+        trigger: Option<String>,
+    },
     PermissionReply { session: String, request: String, reply: String },
     /// Run a command in the session's container (success checks).
     Exec { session: String, command: String, timeout_secs: u64 },
@@ -137,6 +175,31 @@ pub enum NodeCommand {
     },
     /// The rendered instructions a session was started with.
     ReadPreamble { session: String },
+    /// Answer OpenCode's `question` tool (one answer list per question).
+    QuestionReply { session: String, request: String, answers: Vec<Vec<String>> },
+    QuestionReject { session: String, request: String },
+    /// Raise (or lower) a live session's budget.
+    SetBudget { session: String, budget_usd: f64 },
+    /// Pack a workspace (`shared:<name>` / `isolated:<session>`) into the
+    /// artifact store; replies `{reference, files, bytes, unchanged}`.
+    SnapshotWorkspace {
+        workspace: String,
+        #[serde(default)]
+        session: Option<String>,
+        #[serde(default)]
+        reason: String,
+    },
+    /// Merge a snapshot into this node's copy of a workspace (three-way, by
+    /// file, against the last state both sides saw). Replies `{applied, conflicts}`.
+    ApplyWorkspace { workspace: String, reference: String, #[serde(default)] from_node: Option<String> },
+    /// Put an artifact into a workspace at `dest` (a file path, or a directory for trees).
+    PlaceArtifact { workspace: String, reference: String, dest: String },
+    /// Start a dead or halted instance again from its kept volumes, then send `prompt`.
+    Restart { session: String, prompt: String },
+    /// Interrupt, harvest, and stop the container but keep it (state `halted`).
+    Halt { session: String },
+    /// Harvest a stopped/dead instance whose volumes are still here.
+    Harvest { session: String, trigger: String },
 }
 
 /// Cluster tools available to agents over MCP. `from_session` is added by the node.
@@ -168,6 +231,33 @@ pub enum AgentCall {
     TaskNote { note: String },
     TaskComplete { summary: String },
     TaskFail { reason: String },
+    // Questions and upward communication (PHASE1_5 §6).
+    Ask {
+        question: String,
+        #[serde(default)]
+        options: Vec<String>,
+        #[serde(default)]
+        importance: Option<Importance>,
+        #[serde(default)]
+        context: Option<String>,
+    },
+    Answer { id: String, answer: String },
+    Escalate { id: String, #[serde(default)] note: Option<String> },
+    /// Questions you hold (asked of you by agents you started).
+    Questions,
+    ReportUp { message: String },
+    LogAssumption { text: String },
+    // Artifacts. Upload/download of bytes runs over the Blobs RPC on the node;
+    // these are the metadata calls.
+    ArtifactList {
+        #[serde(default)]
+        query: Option<String>,
+        #[serde(default)]
+        task_only: bool,
+    },
+    ArtifactInfo { reference: String },
+    /// Exchange changes with the other machines that hold your shared workspace.
+    SyncWorkspace,
 }
 
 impl AgentCall {

@@ -1,5 +1,6 @@
 //! opencode-node — one per machine. See docs/ARCHITECTURE.md §2.
 
+mod cas;
 mod cfgstore;
 mod egress;
 mod gateway;
@@ -13,6 +14,7 @@ mod runtime;
 mod secrets;
 mod stats;
 mod store;
+mod wsops;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -184,7 +186,10 @@ async fn run(dir: PathBuf) -> Result<()> {
     let dialer = relay::Dialer::start(node_name.clone(), link.clone()).await?;
     let egress = Arc::new(egress::Egress::new(cfg.clone(), Some(dialer), link.clone()));
     let quotas = Arc::new(quota::Quotas::new(&node_name, store.clone()));
-    let deps = gateway::GatewayDeps { cfg: cfg.clone(), link: link.clone(), egress: egress.clone(), quotas: quotas.clone() };
+    let cache_max = ocl_protocol::model::parse_size(&cfg.get().node.artifact_cache).unwrap_or(2 << 30);
+    let cas = Arc::new(cas::Cas::new(data_dir.join("cas"), link.clone(), &node_name, cache_max)?);
+    let files = Arc::new(wsops::WsOps::new(cas, store.clone(), data_dir.clone(), rt.chown_target()));
+    let deps = gateway::GatewayDeps { cfg: cfg.clone(), link: link.clone(), egress: egress.clone(), quotas: quotas.clone(), files };
     let mgr = manager::Manager::new(cfg.clone(), store, rt, link.clone(), deps)?;
     tracing::info!(node = %node_name, supervisor = %supervisor, data = %mgr.data_root().display(), "starting");
 
