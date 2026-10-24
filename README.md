@@ -7,7 +7,7 @@ Run [OpenCode](https://opencode.ai) agents across several Linux machines as one 
 - **Dashboard**: a mobile-first web UI served by the supervisor (password login, HTTPS on your domain via Let's Encrypt, phone push), plus `ocl` (CLI) and `ocl tui`.
 - **Remote machines** join with a one-time token (`ocl node invite`, then `opencode-node join`). Relay-only machines lend their IP to other nodes' LLM calls.
 
-Status: **Phase 4 complete**:
+Status: **Phase 5 complete** (Phases 1–4 plus hardening):
 - remote workers and IP-lending relays over mTLS, with join tokens, approval, revocation and a source allowlist;
 - per-IP / key / account quotas with reset countdowns, and automatic failover to another IP;
 - scored placement, a hub template library and resource stats;
@@ -29,6 +29,7 @@ Docs:
 - [Usage guide](docs/USAGE.md) (extensive examples)
 - [Config reference](docs/CONFIG.md)
 - [Runbook](docs/RUNBOOK.md) (enroll machines, rotate credentials, debug)
+- [Phase 5 report](docs/PHASE5.md)
 - [Phase 4 report](docs/PHASE4.md)
 - [Phase 3 report](docs/PHASE3.md)
 - [Phase 2 report](docs/PHASE2.md)
