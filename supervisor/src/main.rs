@@ -2,9 +2,12 @@
 
 mod api;
 mod artifacts;
+mod attach;
+mod auth;
 mod db;
 mod link;
 mod nodes;
+mod notify;
 mod orch;
 mod pki;
 mod placement;
@@ -15,6 +18,7 @@ mod resources;
 mod state;
 mod templates;
 mod tlslink;
+mod web;
 mod workspaces;
 
 use anyhow::{Context, Result};
@@ -48,6 +52,31 @@ enum Cmd {
     },
     /// Verify the audit log hash chain.
     AuditVerify,
+    /// Web UI logins (work while the supervisor is stopped).
+    User {
+        #[command(subcommand)]
+        cmd: UserCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum UserCmd {
+    /// Create a user or set its password (read from stdin, or prompted).
+    Set {
+        name: String,
+        #[arg(long, default_value = "admin")]
+        scope: String,
+    },
+    List,
+    Rm {
+        name: String,
+    },
+    /// Turn TOTP on (prints the secret and an otpauth:// URI for your app) or off.
+    Totp {
+        name: String,
+        #[arg(long)]
+        off: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -139,6 +168,47 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::User { cmd } => {
+            let db = open_db(&dir, &cfg)?;
+            match cmd {
+                UserCmd::Set { name, scope } => {
+                    if !ocl_protocol::config::valid_name(&name) {
+                        anyhow::bail!("user names are [a-z0-9-]{{1,48}}");
+                    }
+                    let s = db::Scope::parse(&scope).context("scope must be read, operate or admin")?;
+                    let pw = read_password()?;
+                    db.put_user(&name, &auth::hash_password(&pw)?, s)?;
+                    db.delete_user_sessions(&name)?;
+                    db.audit("cli", "user.set", &name, &serde_json::json!({"scope": scope}), true)?;
+                    println!("user {name} ({scope}) saved; log in at the dashboard");
+                }
+                UserCmd::List => {
+                    for (n, s, t, l) in db.users() {
+                        println!("{n}\t{s}\t{}{}", if t { "totp" } else { "password" }, if l > ocl_protocol::model::now_ms() { "\tLOCKED" } else { "" });
+                    }
+                }
+                UserCmd::Rm { name } => {
+                    let ok = db.delete_user(&name)?;
+                    db.audit("cli", "user.delete", &name, &serde_json::json!({}), ok)?;
+                    println!("{}", if ok { "removed" } else { "no such user" });
+                }
+                UserCmd::Totp { name, off } => {
+                    if off {
+                        db.set_totp(&name, None)?;
+                        db.audit("cli", "user.totp", &name, &serde_json::json!({"enabled": false}), true)?;
+                        println!("TOTP off for {name}");
+                    } else {
+                        let secret = auth::base32(&rand::random::<[u8; 20]>());
+                        if !db.set_totp(&name, Some(&secret))? {
+                            anyhow::bail!("no such user {name}");
+                        }
+                        db.audit("cli", "user.totp", &name, &serde_json::json!({"enabled": true}), true)?;
+                        println!("TOTP on for {name}. Add it to your authenticator app:\n  secret: {secret}\n  {}", auth::otpauth_uri(&name, &secret));
+                    }
+                }
+            }
+            Ok(())
+        }
         Cmd::AuditVerify => {
             let db = open_db(&dir, &cfg)?;
             let n = db.audit_verify()?;
@@ -147,6 +217,33 @@ async fn main() -> Result<()> {
         }
         Cmd::Run => run(dir, cfg).await,
     }
+}
+
+/// One line from stdin, or a hidden prompt on a terminal.
+fn read_password() -> Result<String> {
+    use std::io::{BufRead, IsTerminal, Write};
+    let stdin = std::io::stdin();
+    let tty = stdin.is_terminal();
+    let read = |prompt: &str| -> Result<String> {
+        if tty {
+            eprint!("{prompt}");
+            std::io::stderr().flush()?;
+            // Hide what is typed.
+            let _ = std::process::Command::new("stty").arg("-echo").stdin(std::process::Stdio::inherit()).status();
+        }
+        let mut line = String::new();
+        stdin.lock().read_line(&mut line)?;
+        if tty {
+            let _ = std::process::Command::new("stty").arg("echo").stdin(std::process::Stdio::inherit()).status();
+            eprintln!();
+        }
+        Ok(line.trim_end_matches(['\n', '\r']).to_string())
+    };
+    let pw = read("password: ")?;
+    if tty && read("again: ")? != pw {
+        anyhow::bail!("the passwords differ");
+    }
+    Ok(pw)
 }
 
 async fn run(dir: PathBuf, cfg: SupervisorConfig) -> Result<()> {
@@ -220,10 +317,27 @@ async fn run(dir: PathBuf, cfg: SupervisorConfig) -> Result<()> {
     };
 
     let listener = tokio::net::TcpListener::bind(&api_listen).await.with_context(|| format!("binding {api_listen}"))?;
-    if !api_listen.starts_with("127.") && !api_listen.starts_with("localhost") && !api_listen.starts_with("[::1]") {
-        tracing::warn!(api_listen, "API is listening beyond loopback without TLS; put a TLS reverse proxy in front (built-in TLS: Phase 4)");
+    let loopback = api_listen.starts_with("127.") || api_listen.starts_with("localhost") || api_listen.starts_with("[::1]");
+    let tls = match sup.cfg.tls.clone() {
+        Some(t) => Some(web::start_tls(&sup, &t, &data).await?),
+        None => {
+            if !loopback && sup.cfg.trusted_proxies.is_empty() {
+                tracing::warn!(api_listen, "the dashboard/API is served over plain HTTP beyond loopback; configure `tls:` (files or ACME) or a TLS proxy (`trusted_proxies:`)");
+            }
+            None
+        }
+    };
+    let api_tls = tls.clone().map(|st| web::server_config(st, &[b"h2", b"http/1.1"])).transpose()?;
+    if let Some(attach_listen) = sup.cfg.attach_listen.clone() {
+        let l = tokio::net::TcpListener::bind(&attach_listen).await.with_context(|| format!("binding attach_listen {attach_listen}"))?;
+        let attach_tls = tls.clone().map(|st| web::server_config(st, &[b"http/1.1"])).transpose()?;
+        tracing::info!(listen = %attach_listen, tls = attach_tls.is_some(), "Open in OpenCode listener");
+        tokio::spawn(attach::serve(sup.clone(), l, attach_tls));
     }
-    let api = axum::serve(listener, api::router(sup.clone()));
+    if sup.db.users().is_empty() {
+        tracing::warn!("no web UI user yet: create one with `ocl-supervisor user set <name>`");
+    }
+    let api = web::serve(listener, api::router(sup.clone()), api_tls);
 
     {
         let sup = sup.clone();

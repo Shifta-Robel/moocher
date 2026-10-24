@@ -276,6 +276,8 @@ impl Sup {
             run.updated_at = now_ms();
             self.save_run(&run);
             self.log("run.finished", None, None, json!({"run": run.id, "status": status}));
+            let passed = status == RunStatus::Passed;
+            self.notify(if passed { "run.passed" } else { "run.failed" }, if passed { "info" } else { "warning" }, format!("workflow {} {}", run.workflow, if passed { "passed" } else { "failed" }), truncate(&run.input, 200), Some(run.id.clone()));
             self.end_run_sessions(&run).await;
             if let Some(tid) = run.task_id {
                 let summary = format!("workflow {} {:?}: {}", run.workflow, status, run.steps.last().and_then(|s| s.output.as_deref()).map(|t| truncate(t, 1000)).unwrap_or_default());
@@ -493,6 +495,8 @@ impl Sup {
         self.save_task(&t);
         self.audit(actor, &format!("task.{}", status.as_str()), &id.to_string(), json!({}), true);
         self.log("task.finished", None, t.coordinator_session.as_deref(), json!({"task": id, "status": status}));
+        let sev = if status == TaskStatus::Failed { "warning" } else { "info" };
+        self.notify(&format!("task.{}", status.as_str()), sev, format!("task #{id} {}: {}", status.as_str(), truncate(&t.title, 80)), truncate(t.result.as_deref().unwrap_or(""), 400), Some(format!("task:{id}")));
         // Stop everything that belongs to the task, after the caller's MCP reply is out.
         let sessions: Vec<String> = self.db.sessions(true).into_iter().filter(|s| s.task_id == Some(id) && s.report.state.is_live()).map(|s| s.report.id).collect();
         let runs: Vec<String> = self.db.runs().into_iter().filter(|r| r.task_id == Some(id) && r.status == RunStatus::Running).map(|r| r.id).collect();

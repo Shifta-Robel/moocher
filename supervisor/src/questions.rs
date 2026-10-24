@@ -98,6 +98,9 @@ impl Sup {
     pub fn notify(&self, kind: &str, severity: &str, title: String, body: String, target: Option<String>) {
         let n = Notification { id: 0, ts: now_ms(), kind: kind.into(), severity: severity.into(), title, body, target, read: false };
         if let Ok(n) = self.db.add_notification(&n) {
+            if let Some(me) = self.me.upgrade() {
+                self.notifier.dispatch(&me, &n);
+            }
             let _ = self.stream.send(StreamEvent::Notification(n));
         }
     }

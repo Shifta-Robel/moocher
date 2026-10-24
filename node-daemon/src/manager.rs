@@ -221,6 +221,16 @@ impl Manager {
                 self.halt(&session).await?;
                 Ok(json!({"ok": true}))
             }
+            NodeCommand::OpenAttach { id, session, cookie_sha256, expires_at } => {
+                let inst = self.get(&session)?;
+                if !inst.report.lock().unwrap().state.is_live() {
+                    bail!("session {session} is not running");
+                }
+                let guard = crate::attach::Guard { cookie_sha256: cookie_sha256.ok_or_else(|| anyhow!("attach without a cookie hash"))?, expires_at: expires_at.unwrap_or(i64::MAX) };
+                crate::attach::serve(&self.link, &self.node, &id, inst.paths.oc_sock(), &inst.password, guard).await?;
+                Ok(json!({"ok": true}))
+            }
+            NodeCommand::PromoteRoute { agent, by } => self.promote_route(&agent, &by),
             NodeCommand::Harvest { session, trigger } => {
                 let inst = self.get(&session)?;
                 let h = self.harvest(&inst, &trigger).await;
@@ -301,6 +311,56 @@ impl Manager {
                 Ok(json!({"code": code, "output": output}))
             }
         }
+    }
+
+    /// Make a live route override permanent: write it as `route:` into the
+    /// agent's YAML (keeping the rest of the file as it is) and drop the override.
+    fn promote_route(&self, agent: &str, by: &str) -> Result<Value> {
+        let snap = self.cfg.get();
+        let route = snap.overrides.routes.get(agent).cloned().ok_or_else(|| anyhow!("no live route override for {agent} on {}", self.node))?;
+        let a = snap.agents.get(agent).ok_or_else(|| anyhow!("no agent {agent} on {}", self.node))?;
+        if a.source != "local" {
+            bail!("{agent} is a hub template; change its route in the hub's templates/ (the override stays until then)");
+        }
+        let path = snap.dir.join("agents").join(format!("{agent}.yaml"));
+        let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let line = format!("route: {}", serde_json::to_string(&route)?);
+        let mut out: Vec<String> = vec![];
+        let mut skipping = false;
+        let mut replaced = false;
+        for l in text.lines() {
+            if skipping {
+                // Continuation lines of the old block-style `route:`.
+                if l.starts_with(' ') || l.starts_with('\t') || l.trim().is_empty() {
+                    continue;
+                }
+                skipping = false;
+            }
+            if l.starts_with("route:") {
+                out.push(format!("{line}   # promoted from a live override by {by}"));
+                replaced = true;
+                skipping = l.trim_end() == "route:";
+                continue;
+            }
+            out.push(l.to_string());
+        }
+        if !replaced {
+            out.push(format!("{line}   # promoted from a live override by {by}"));
+        }
+        let new = out.join("\n") + "\n";
+        // Validate before writing.
+        let parsed: AgentConfig = serde_yaml::from_str(&new).context("the promoted file would not parse")?;
+        if parsed.route.as_ref() != Some(&route) {
+            bail!("could not place the route in {} safely; edit it by hand", path.display());
+        }
+        let tmp = path.with_extension("yaml.tmp");
+        std::fs::write(&tmp, new)?;
+        std::fs::rename(&tmp, &path)?;
+        self.write_overrides(|o| {
+            o.routes.remove(agent);
+        })?;
+        tracing::info!(agent, by, "route override promoted to YAML");
+        Ok(json!({"ok": true, "file": path.display().to_string(), "route": route}))
     }
 
     /// Apply a change to overrides.yaml and reload the config now.

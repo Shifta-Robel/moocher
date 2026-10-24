@@ -3,6 +3,9 @@
 //! Auth: `OCL_TOKEN`, else `~/.opencode-cluster/cli-token`. Server: `OCL_URL`
 //! (default http://127.0.0.1:7700). Add `--json` to any command for raw output.
 
+mod attach;
+mod tui;
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
@@ -194,6 +197,18 @@ enum Cmd {
         #[arg(long)]
         session: Option<String>,
     },
+    /// OpenCode's terminal UI for an instance, through the hub (needs attach_listen).
+    Attach {
+        session: String,
+        /// Local port (default: any free one).
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Only print the local address; do not start `opencode attach`.
+        #[arg(long)]
+        no_launch: bool,
+    },
+    /// Dashboard in the terminal.
+    Tui,
     /// The notification centre (newest first).
     Notifications {
         #[arg(long)]
@@ -388,14 +403,14 @@ enum TokenCmd {
     Revoke { name: String },
 }
 
-struct Api {
-    base: String,
-    token: String,
-    http: reqwest::Client,
+pub struct Api {
+    pub base: String,
+    pub token: String,
+    pub http: reqwest::Client,
 }
 
 impl Api {
-    async fn req(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value> {
+    pub async fn req(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value> {
         let mut r = self.http.request(method, format!("{}/api/v1{path}", self.base)).bearer_auth(&self.token);
         if let Some(b) = body {
             r = r.json(&b);
@@ -408,10 +423,10 @@ impl Api {
         }
         Ok(v)
     }
-    async fn get(&self, p: &str) -> Result<Value> {
+    pub async fn get(&self, p: &str) -> Result<Value> {
         self.req(reqwest::Method::GET, p, None).await
     }
-    async fn post(&self, p: &str, b: Value) -> Result<Value> {
+    pub async fn post(&self, p: &str, b: Value) -> Result<Value> {
         self.req(reqwest::Method::POST, p, Some(b)).await
     }
 }
@@ -1107,6 +1122,12 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Cmd::Artifact { cmd } => artifact_cmd(&api, cmd, raw).await?,
+        Cmd::Attach { session, port, no_launch } => {
+            let v = api.post(&format!("/sessions/{session}/attach"), json!({})).await?;
+            let url = v["url"].as_str().context("no attach URL")?.to_string();
+            attach::run(&api.http, &url, port, !no_launch).await?;
+        }
+        Cmd::Tui => tui::run(&api).await?,
         Cmd::Halts { all } => {
             let v = api.get(&format!("/halts?all={all}")).await?;
             if raw {

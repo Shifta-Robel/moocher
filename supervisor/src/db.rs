@@ -94,7 +94,13 @@ impl Db {
              CREATE INDEX IF NOT EXISTS harvests_session ON harvests(session);
              CREATE TABLE IF NOT EXISTS halts(id TEXT PRIMARY KEY, status TEXT NOT NULL, scope TEXT NOT NULL, info TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, read INTEGER NOT NULL DEFAULT 0, info TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS workspaces(name TEXT PRIMARY KEY, info TEXT NOT NULL);",
+             CREATE TABLE IF NOT EXISTS workspaces(name TEXT PRIMARY KEY, info TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS users(name TEXT PRIMARY KEY, pw_hash TEXT NOT NULL, scope TEXT NOT NULL, totp TEXT,
+                totp_last INTEGER NOT NULL DEFAULT -1, lockouts INTEGER NOT NULL DEFAULT 0, locked_until INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS web_sessions(hash TEXT PRIMARY KEY, user TEXT NOT NULL, csrf TEXT NOT NULL, created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL, ip TEXT NOT NULL, agent TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS push_subscriptions(endpoint TEXT PRIMARY KEY, p256dh TEXT NOT NULL, auth TEXT NOT NULL, user TEXT NOT NULL,
+                created_at INTEGER NOT NULL, last_ok INTEGER, failures INTEGER NOT NULL DEFAULT 0);",
         )?;
         {
             use std::os::unix::fs::PermissionsExt;
@@ -735,6 +741,146 @@ impl Db {
 
     pub fn workspace(&self, name: &str) -> Option<serde_json::Value> {
         self.json_rows("SELECT info FROM workspaces WHERE name=?1", params![name]).into_iter().next()
+    }
+
+    // ------------------------------------------------------------- users
+
+    pub fn put_user(&self, name: &str, pw_hash: &str, scope: Scope) -> Result<()> {
+        self.c.lock().unwrap().execute(
+            "INSERT INTO users(name,pw_hash,scope,created_at) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(name) DO UPDATE SET pw_hash=excluded.pw_hash, scope=excluded.scope, lockouts=0, locked_until=0",
+            params![name, pw_hash, scope.as_str(), now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn user(&self, name: &str) -> Option<crate::auth::UserRow> {
+        self.c
+            .lock()
+            .unwrap()
+            .query_row("SELECT name,pw_hash,scope,totp,totp_last,lockouts,locked_until FROM users WHERE name=?1", params![name], |r| {
+                Ok(crate::auth::UserRow {
+                    name: r.get(0)?,
+                    pw_hash: r.get(1)?,
+                    totp: r.get(3)?,
+                    totp_last: r.get(4)?,
+                    lockouts: r.get::<_, i64>(5)? as u32,
+                    locked_until: r.get(6)?,
+                })
+            })
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// (name, scope, totp enabled, locked until)
+    pub fn users(&self) -> Vec<(String, String, bool, Ts)> {
+        let c = self.c.lock().unwrap();
+        let Ok(mut st) = c.prepare("SELECT name, scope, totp IS NOT NULL, locked_until FROM users ORDER BY name") else { return vec![] };
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map(|it| it.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    }
+
+    pub fn delete_user(&self, name: &str) -> Result<bool> {
+        self.delete_user_sessions(name)?;
+        Ok(self.c.lock().unwrap().execute("DELETE FROM users WHERE name=?1", params![name])? > 0)
+    }
+
+    pub fn set_password(&self, name: &str, pw_hash: &str) -> Result<()> {
+        self.c.lock().unwrap().execute("UPDATE users SET pw_hash=?2 WHERE name=?1", params![name, pw_hash])?;
+        Ok(())
+    }
+
+    pub fn set_totp(&self, name: &str, secret: Option<&str>) -> Result<bool> {
+        Ok(self.c.lock().unwrap().execute("UPDATE users SET totp=?2, totp_last=-1 WHERE name=?1", params![name, secret])? > 0)
+    }
+
+    pub fn set_totp_last(&self, name: &str, step: i64) -> Result<()> {
+        self.c.lock().unwrap().execute("UPDATE users SET totp_last=?2 WHERE name=?1", params![name, step])?;
+        Ok(())
+    }
+
+    pub fn lock_user(&self, name: &str, until: Ts) -> Result<()> {
+        self.c.lock().unwrap().execute("UPDATE users SET locked_until=?2, lockouts=lockouts+1 WHERE name=?1", params![name, until])?;
+        Ok(())
+    }
+
+    pub fn reset_lockouts(&self, name: &str) -> Result<()> {
+        self.c.lock().unwrap().execute("UPDATE users SET lockouts=0, locked_until=0 WHERE name=?1", params![name])?;
+        Ok(())
+    }
+
+    pub fn add_web_session(&self, hash: &str, user: &str, csrf: &str, expires_at: Ts, ip: &str, agent: &str) -> Result<()> {
+        let c = self.c.lock().unwrap();
+        c.execute("DELETE FROM web_sessions WHERE expires_at < ?1", params![now_ms()])?;
+        c.execute(
+            "INSERT INTO web_sessions(hash,user,csrf,created_at,expires_at,ip,agent) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![hash, user, csrf, now_ms(), expires_at, ip, agent],
+        )?;
+        Ok(())
+    }
+
+    pub fn web_session(&self, hash: &str) -> Option<crate::auth::WebSession> {
+        self.c
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT s.user, u.scope, s.csrf, s.expires_at FROM web_sessions s JOIN users u ON u.name = s.user WHERE s.hash=?1",
+                params![hash],
+                |r| {
+                    Ok(crate::auth::WebSession {
+                        user: r.get(0)?,
+                        scope: Scope::parse(&r.get::<_, String>(1)?).unwrap_or(Scope::Read),
+                        csrf: r.get(2)?,
+                        expires_at: r.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    pub fn delete_web_session(&self, hash: &str) -> Result<()> {
+        self.c.lock().unwrap().execute("DELETE FROM web_sessions WHERE hash=?1", params![hash])?;
+        Ok(())
+    }
+
+    pub fn delete_user_sessions(&self, user: &str) -> Result<()> {
+        self.c.lock().unwrap().execute("DELETE FROM web_sessions WHERE user=?1", params![user])?;
+        Ok(())
+    }
+
+    // -------------------------------------------------- push subscriptions
+
+    pub fn put_push_sub(&self, endpoint: &str, p256dh: &str, auth: &str, user: &str) -> Result<()> {
+        self.c.lock().unwrap().execute(
+            "INSERT INTO push_subscriptions(endpoint,p256dh,auth,user,created_at) VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(endpoint) DO UPDATE SET p256dh=excluded.p256dh, auth=excluded.auth, user=excluded.user, failures=0",
+            params![endpoint, p256dh, auth, user, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// (endpoint, p256dh, auth, user)
+    pub fn push_subs(&self) -> Vec<(String, String, String, String)> {
+        let c = self.c.lock().unwrap();
+        let Ok(mut st) = c.prepare("SELECT endpoint, p256dh, auth, user FROM push_subscriptions") else { return vec![] };
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map(|it| it.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    }
+
+    pub fn delete_push_sub(&self, endpoint: &str) -> Result<bool> {
+        Ok(self.c.lock().unwrap().execute("DELETE FROM push_subscriptions WHERE endpoint=?1", params![endpoint])? > 0)
+    }
+
+    pub fn push_result(&self, endpoint: &str, ok: bool) -> Result<()> {
+        let c = self.c.lock().unwrap();
+        if ok {
+            c.execute("UPDATE push_subscriptions SET last_ok=?2, failures=0 WHERE endpoint=?1", params![endpoint, now_ms()])?;
+        } else {
+            c.execute("UPDATE push_subscriptions SET failures=failures+1 WHERE endpoint=?1", params![endpoint])?;
+            c.execute("DELETE FROM push_subscriptions WHERE failures >= 10", [])?;
+        }
+        Ok(())
     }
 
     fn json_rows<T: serde::de::DeserializeOwned, P: rusqlite::Params>(&self, sql: &str, p: P) -> Vec<T> {

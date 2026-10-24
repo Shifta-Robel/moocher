@@ -65,6 +65,18 @@ impl From<anyhow::Error> for ApiError {
 
 type R<T> = Result<Json<T>, ApiError>;
 
+fn cookie(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .find_map(|kv| kv.trim().strip_prefix(&format!("{name}=")).map(String::from))
+}
+
+/// Bearer API token (CLI, scripts), or a browser session cookie. Cookie
+/// requests that change anything must echo the session's CSRF token in
+/// `X-CSRF-Token` (the UI reads it from the `ocl_csrf` cookie).
 async fn auth(State(sup): S, mut req: Request, next: Next) -> Result<Response, ApiError> {
     let token = req
         .headers()
@@ -81,14 +93,25 @@ async fn auth(State(sup): S, mut req: Request, next: Next) -> Result<Response, A
             }
         })
         .map(String::from);
-    let Some(token) = token else {
-        return Err(ApiError(StatusCode::UNAUTHORIZED, "missing bearer token".into()));
+    if let Some(token) = token {
+        let Some((name, scope)) = sup.db.token_lookup(&token) else {
+            tracing::warn!(path = %req.uri().path(), "rejected invalid API token");
+            return Err(ApiError(StatusCode::UNAUTHORIZED, "invalid token".into()));
+        };
+        req.extensions_mut().insert(Caller { name, scope });
+        return Ok(next.run(req).await);
+    }
+    let Some(ws) = cookie(req.headers(), "ocl_session").and_then(|c| sup.web_session(&c)) else {
+        return Err(ApiError(StatusCode::UNAUTHORIZED, "log in, or send an API token (Authorization: Bearer …)".into()));
     };
-    let Some((name, scope)) = sup.db.token_lookup(&token) else {
-        tracing::warn!(path = %req.uri().path(), "rejected invalid API token");
-        return Err(ApiError(StatusCode::UNAUTHORIZED, "invalid token".into()));
-    };
-    req.extensions_mut().insert(Caller { name, scope });
+    let safe = matches!(*req.method(), axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS);
+    if !safe {
+        let sent = req.headers().get("x-csrf-token").and_then(|v| v.to_str().ok()).unwrap_or("");
+        if sent.len() != ws.csrf.len() || !sent.bytes().zip(ws.csrf.bytes()).fold(true, |a, (x, y)| a & (x == y)) {
+            return Err(ApiError(StatusCode::FORBIDDEN, "missing or wrong CSRF token (X-CSRF-Token)".into()));
+        }
+    }
+    req.extensions_mut().insert(Caller { name: ws.user, scope: ws.scope });
     Ok(next.run(req).await)
 }
 
@@ -147,13 +170,26 @@ pub fn router(sup: Arc<Sup>) -> Router {
         .route("/sessions/{id}/checkpoint", get(checkpoint))
         .route("/harvests", get(harvests))
         .route("/notifications", get(notifications))
-        .route("/notifications/read", post(notifications_read));
+        .route("/notifications/read", post(notifications_read))
+        .route("/notifications/test", post(notifications_test))
+        .route("/sessions/{id}/attach", post(attach))
+        .route("/push/key", get(push_key))
+        .route("/push/subscribe", post(push_subscribe))
+        .route("/push/unsubscribe", post(push_unsubscribe))
+        .route("/users", get(users).post(add_user))
+        .route("/users/{name}", axum::routing::delete(delete_user))
+        .route("/nodes/{name}/routes/promote", post(promote_route))
+        .route("/info", get(info));
     Router::new()
         .nest("/api/v1", api)
         .route("/metrics", get(metrics))
         .layer(axum::middleware::from_fn_with_state(sup.clone(), auth))
         .route("/healthz", get(|| async { "ok" }))
-        .route("/", get(|| async { "opencode-cluster supervisor. API at /api/v1 (bearer token required). Web UI arrives in Phase 4." }))
+        .route("/auth/login", post(login))
+        .route("/auth/logout", post(logout))
+        .route("/auth/me", get(me))
+        .route("/auth/password", post(change_password))
+        .fallback(ui)
         .with_state(sup)
 }
 
@@ -614,6 +650,219 @@ struct ReadReq {
 async fn notifications_read(State(sup): S, Extension(c): Extension<Caller>, Json(r): Json<ReadReq>) -> R<Value> {
     c.need(Scope::Operate)?;
     Ok(Json(json!({"marked": sup.db.mark_notifications_read(r.upto)?})))
+}
+
+// ------------------------------------------------------------ web login
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    user: String,
+    password: String,
+    #[serde(default)]
+    totp: Option<String>,
+}
+
+fn session_cookies(token: &str, csrf: &str, max_age_s: i64, secure: bool) -> [(axum::http::HeaderName, String); 2] {
+    let sec = if secure { "; Secure" } else { "" };
+    [
+        (axum::http::header::SET_COOKIE, format!("ocl_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age_s}{sec}")),
+        (axum::http::header::SET_COOKIE, format!("ocl_csrf={csrf}; SameSite=Strict; Path=/; Max-Age={max_age_s}{sec}")),
+    ]
+}
+
+async fn login(State(sup): S, conn: Option<Extension<crate::web::ConnInfo>>, headers: axum::http::HeaderMap, Json(r): Json<LoginRequest>) -> Response {
+    let (ip, https) = crate::web::client(&sup, conn.as_ref().map(|c| &c.0), &headers);
+    let agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("");
+    match sup.login(r.user.trim(), &r.password, r.totp.as_deref(), ip, agent) {
+        Ok((token, csrf, expires)) => {
+            let max_age = (expires - now_ms()) / 1000;
+            let [a, b] = session_cookies(&token, &csrf, max_age, https);
+            let mut resp = Json(json!({"user": r.user.trim(), "csrf": csrf, "expires_at": expires})).into_response();
+            resp.headers_mut().append(a.0, a.1.parse().unwrap());
+            resp.headers_mut().append(b.0, b.1.parse().unwrap());
+            resp
+        }
+        Err(e) => {
+            use crate::auth::LoginError;
+            // A little friction for guessing; the lockout does the rest.
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            let (code, totp) = match &e {
+                LoginError::NeedTotp => (StatusCode::UNAUTHORIZED, true),
+                LoginError::Locked(_) => (StatusCode::TOO_MANY_REQUESTS, false),
+                LoginError::Invalid => (StatusCode::UNAUTHORIZED, false),
+            };
+            (code, Json(json!({"error": e.to_string(), "totp_required": totp}))).into_response()
+        }
+    }
+}
+
+async fn logout(State(sup): S, headers: axum::http::HeaderMap) -> Response {
+    if let Some(c) = cookie(&headers, "ocl_session") {
+        if let Some(ws) = sup.web_session(&c) {
+            let sent = headers.get("x-csrf-token").and_then(|v| v.to_str().ok()).unwrap_or("");
+            if sent != ws.csrf {
+                return ApiError(StatusCode::FORBIDDEN, "missing or wrong CSRF token".into()).into_response();
+            }
+        }
+        sup.logout(&c);
+    }
+    let [a, b] = session_cookies("", "", 0, false);
+    let mut resp = Json(json!({"ok": true})).into_response();
+    resp.headers_mut().append(a.0, a.1.parse().unwrap());
+    resp.headers_mut().append(b.0, b.1.parse().unwrap());
+    resp
+}
+
+async fn me(State(sup): S, headers: axum::http::HeaderMap) -> R<Value> {
+    match cookie(&headers, "ocl_session").and_then(|c| sup.web_session(&c)) {
+        Some(s) => Ok(Json(json!({"user": s.user, "scope": s.scope.as_str(), "expires_at": s.expires_at, "csrf": s.csrf}))),
+        None => Err(ApiError(StatusCode::UNAUTHORIZED, "not logged in".into())),
+    }
+}
+
+#[derive(Deserialize)]
+struct PasswordChange {
+    old: String,
+    new: String,
+}
+
+async fn change_password(State(sup): S, headers: axum::http::HeaderMap, Json(r): Json<PasswordChange>) -> R<Value> {
+    let ws = cookie(&headers, "ocl_session").and_then(|c| sup.web_session(&c)).ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "not logged in".into()))?;
+    if headers.get("x-csrf-token").and_then(|v| v.to_str().ok()) != Some(ws.csrf.as_str()) {
+        return Err(ApiError(StatusCode::FORBIDDEN, "missing or wrong CSRF token".into()));
+    }
+    sup.change_password(&ws.user, &r.old, &r.new)?;
+    Ok(Json(json!({"ok": true, "note": "password changed; other sessions were logged out"})))
+}
+
+/// The embedded UI. Pages need a session (else `/login`); assets do not.
+async fn ui(State(sup): S, req: Request) -> Response {
+    let path = req.uri().path().to_string();
+    if path.starts_with("/api/") {
+        return ApiError(StatusCode::NOT_FOUND, "no such endpoint".into()).into_response();
+    }
+    let is_page = !path.contains('.') || path.ends_with(".html");
+    let public = path == "/login" || !is_page;
+    if !public && cookie(req.headers(), "ocl_session").and_then(|c| sup.web_session(&c)).is_none() {
+        let next = if path == "/" { String::new() } else { format!("?next={}", path.chars().filter(|c| c.is_ascii_alphanumeric() || "/-_".contains(*c)).collect::<String>()) };
+        return (StatusCode::FOUND, [(axum::http::header::LOCATION, format!("/login{next}"))]).into_response();
+    }
+    crate::web::ui_asset(&path).unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+}
+
+// ------------------------------------------------------------- attach, push
+
+async fn attach(State(sup): S, Extension(c): Extension<Caller>, conn: Option<Extension<crate::web::ConnInfo>>, headers: axum::http::HeaderMap, Path(id): Path<String>) -> R<Value> {
+    c.need(Scope::Operate)?;
+    let (_, https) = crate::web::client(&sup, conn.as_ref().map(|c| &c.0), &headers);
+    let host = headers.get("x-forwarded-host").or(headers.get(axum::http::header::HOST)).and_then(|h| h.to_str().ok());
+    Ok(Json(sup.attach_ticket(&c.actor(), &id, host, https)?))
+}
+
+async fn push_key(State(sup): S) -> Json<Value> {
+    Json(json!({"public_key": sup.notifier.vapid_public(), "enabled": sup.cfg.notifications.web_push.is_some()}))
+}
+
+#[derive(Deserialize)]
+struct PushKeys {
+    p256dh: String,
+    auth: String,
+}
+
+#[derive(Deserialize)]
+struct PushSub {
+    endpoint: String,
+    keys: PushKeys,
+}
+
+async fn push_subscribe(State(sup): S, Extension(c): Extension<Caller>, Json(r): Json<PushSub>) -> R<Value> {
+    c.need(Scope::Read)?;
+    if !r.endpoint.starts_with("https://") && !r.endpoint.starts_with("http://127.0.0.1") && !r.endpoint.starts_with("http://localhost") {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "push endpoints must be https".into()));
+    }
+    sup.db.put_push_sub(&r.endpoint, &r.keys.p256dh, &r.keys.auth, &c.name)?;
+    sup.audit(&c.actor(), "push.subscribe", &r.endpoint.chars().take(80).collect::<String>(), json!({}), true);
+    Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+struct PushUnsub {
+    endpoint: String,
+}
+
+async fn push_unsubscribe(State(sup): S, Extension(c): Extension<Caller>, Json(r): Json<PushUnsub>) -> R<Value> {
+    c.need(Scope::Read)?;
+    Ok(Json(json!({"ok": sup.db.delete_push_sub(&r.endpoint)?})))
+}
+
+async fn notifications_test(State(sup): S, Extension(c): Extension<Caller>) -> R<Value> {
+    c.need(Scope::Operate)?;
+    sup.notify("test", "warning", "Test notification".into(), format!("sent by {} from the dashboard", c.name), None);
+    Ok(Json(json!({"ok": true, "push_subscriptions": sup.db.push_subs().len(), "ntfy": sup.cfg.notifications.ntfy.is_some(), "webhook": sup.cfg.notifications.webhook.is_some()})))
+}
+
+// ------------------------------------------------------------------ users
+
+async fn users(State(sup): S, Extension(c): Extension<Caller>) -> R<Value> {
+    c.need(Scope::Admin)?;
+    let v: Vec<Value> = sup.db.users().into_iter().map(|(n, s, t, l)| json!({"name": n, "scope": s, "totp": t, "locked_until": if l > now_ms() { Some(l) } else { None }})).collect();
+    Ok(Json(Value::Array(v)))
+}
+
+#[derive(Deserialize)]
+struct NewUser {
+    name: String,
+    password: String,
+    #[serde(default = "default_scope")]
+    scope: String,
+}
+fn default_scope() -> String {
+    "admin".into()
+}
+
+async fn add_user(State(sup): S, Extension(c): Extension<Caller>, Json(r): Json<NewUser>) -> R<Value> {
+    c.need(Scope::Admin)?;
+    if !ocl_protocol::config::valid_name(&r.name) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "user names are [a-z0-9-]".into()));
+    }
+    let scope = Scope::parse(&r.scope).ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "scope must be read, operate or admin".into()))?;
+    sup.db.put_user(&r.name, &crate::auth::hash_password(&r.password)?, scope)?;
+    sup.audit(&c.actor(), "user.set", &r.name, json!({"scope": r.scope}), true);
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn delete_user(State(sup): S, Extension(c): Extension<Caller>, Path(name): Path<String>) -> R<Value> {
+    c.need(Scope::Admin)?;
+    let ok = sup.db.delete_user(&name)?;
+    sup.audit(&c.actor(), "user.delete", &name, json!({}), ok);
+    Ok(Json(json!({"ok": ok})))
+}
+
+#[derive(Deserialize)]
+struct Promote {
+    agent: String,
+}
+
+async fn promote_route(State(sup): S, Extension(c): Extension<Caller>, Path(node): Path<String>, Json(r): Json<Promote>) -> R<Value> {
+    c.need(Scope::Admin)?;
+    let res = sup.nodes.call(&node, ocl_protocol::link::NodeCommand::PromoteRoute { agent: r.agent.clone(), by: c.name.clone() }, crate::state::CMD_TIMEOUT).await;
+    sup.audit(&c.actor(), "route.promote", &format!("{node}/{}", r.agent), json!({"error": res.as_ref().err().map(|e| format!("{e:#}"))}), res.is_ok());
+    Ok(Json(res?))
+}
+
+/// What the UI needs to know about this hub.
+async fn info(State(sup): S, Extension(c): Extension<Caller>) -> Json<Value> {
+    Json(json!({
+        "version": ocl_protocol::VERSION,
+        "user": c.name,
+        "scope": c.scope.as_str(),
+        "attach": sup.cfg.attach_listen.is_some(),
+        "tls": sup.cfg.tls.is_some(),
+        "push": {"enabled": sup.cfg.notifications.web_push.is_some(), "public_key": sup.notifier.vapid_public()},
+        "question_mode": sup.cluster_question_mode(),
+        "ntfy": sup.cfg.notifications.ntfy.is_some(),
+        "webhook": sup.cfg.notifications.webhook.is_some(),
+    }))
 }
 
 /// Prometheus text exposition.

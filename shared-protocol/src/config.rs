@@ -221,6 +221,174 @@ pub struct SupervisorConfig {
     pub on_death: DeathPolicy,
     #[serde(default)]
     pub artifacts: ArtifactsConfig,
+    /// HTTPS for the web UI and API: certificate files, or ACME (Let's
+    /// Encrypt or any RFC 8555 CA). Without it the API is plain HTTP (keep it
+    /// on loopback or behind a TLS proxy).
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+    /// Reverse proxies (IPs/CIDRs) whose `X-Forwarded-For` / `X-Forwarded-Proto` are trusted.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+    /// Second listener for "Open in OpenCode" (its own origin: same host,
+    /// another port), e.g. `0.0.0.0:7444`. Off when unset.
+    #[serde(default)]
+    pub attach_listen: Option<String>,
+    /// Public base URL of the attach listener, e.g. `https://hub.example.org:7444`.
+    /// Default: the dashboard's host with the attach port.
+    #[serde(default)]
+    pub attach_url: Option<String>,
+    #[serde(default)]
+    pub login: LoginConfig,
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// PEM certificate chain and key (bring your own certificate).
+    #[serde(default)]
+    pub cert_file: Option<PathBuf>,
+    #[serde(default)]
+    pub key_file: Option<PathBuf>,
+    /// Get and renew the certificate automatically (HTTP-01).
+    #[serde(default)]
+    pub acme: Option<AcmeConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeConfig {
+    /// Names on the certificate; they must resolve to this machine.
+    pub domains: Vec<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    /// ACME directory. Default: Let's Encrypt production.
+    #[serde(default = "default_acme_directory")]
+    pub directory: String,
+    /// Where the CA connects for HTTP-01 challenges (port 80 on the public
+    /// address). It also redirects everything else to HTTPS.
+    #[serde(default = "default_http01")]
+    pub http01_listen: String,
+    /// Extra CA certificate (PEM) to trust for the ACME directory (test CAs such as Pebble).
+    #[serde(default)]
+    pub directory_ca: Option<PathBuf>,
+}
+
+fn default_acme_directory() -> String {
+    "https://acme-v02.api.letsencrypt.org/directory".into()
+}
+fn default_http01() -> String {
+    "0.0.0.0:80".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LoginConfig {
+    /// Lifetime of a browser session.
+    #[serde(default = "default_session_hours")]
+    pub session_hours: u64,
+    /// Failed logins for one account (or one IP: 4×) within 15 min before a lockout.
+    #[serde(default = "default_max_failures")]
+    pub max_failures: u32,
+    /// First lockout; it doubles with every further lockout (max 24 h).
+    #[serde(default = "default_lockout")]
+    pub lockout_secs: u64,
+}
+
+fn default_session_hours() -> u64 {
+    12
+}
+fn default_max_failures() -> u32 {
+    5
+}
+fn default_lockout() -> u64 {
+    900
+}
+
+impl Default for LoginConfig {
+    fn default() -> Self {
+        LoginConfig { session_hours: default_session_hours(), max_failures: default_max_failures(), lockout_secs: default_lockout() }
+    }
+}
+
+/// Who hears about what (PHASE1_5 §11). The in-app centre always gets
+/// everything; the rules pick which events also go to push, ntfy and webhooks.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationsConfig {
+    /// `{ from: "22:00", to: "07:00" }` local time: only `vital` goes out then.
+    #[serde(default)]
+    pub quiet_hours: Option<QuietHours>,
+    /// First matching rule wins. Default: warning and vital to every configured channel.
+    #[serde(default)]
+    pub rules: Vec<NotifyRule>,
+    /// Web Push (the UI is a PWA). The VAPID key pair is generated on first start.
+    #[serde(default)]
+    pub web_push: Option<WebPushConfig>,
+    /// e.g. `{ url: "https://ntfy.sh/my-topic", token: "env:NTFY_TOKEN" }`
+    #[serde(default)]
+    pub ntfy: Option<NtfyConfig>,
+    /// POST the notification as JSON; signed with HMAC-SHA256 when `secret` is set.
+    #[serde(default)]
+    pub webhook: Option<WebhookConfig>,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        NotificationsConfig { quiet_hours: None, rules: vec![], web_push: Some(WebPushConfig::default()), ntfy: None, webhook: None }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QuietHours {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NotifyRule {
+    /// Event kinds (`question.waiting`, `task.halted`, `node.offline`, …); `*` or empty = all.
+    #[serde(default)]
+    pub kinds: Vec<String>,
+    /// `info`, `warning` or `vital`.
+    #[serde(default = "default_min_severity")]
+    pub min_severity: String,
+    /// `push`, `ntfy`, `webhook`; empty = in-app only.
+    #[serde(default)]
+    pub channels: Vec<String>,
+}
+
+fn default_min_severity() -> String {
+    "warning".into()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WebPushConfig {
+    /// VAPID contact (`mailto:you@example.org` or an https URL).
+    #[serde(default)]
+    pub subject: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NtfyConfig {
+    pub url: String,
+    /// Access token reference (`env:NAME` or `file:/path`), optional.
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookConfig {
+    pub url: String,
+    /// HMAC secret reference (`env:NAME` or `file:/path`): adds `X-OCL-Signature: sha256=<hex>`.
+    #[serde(default)]
+    pub secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -357,6 +525,12 @@ impl Default for SupervisorConfig {
             questions: QuestionsConfig::default(),
             on_death: DeathPolicy::default(),
             artifacts: ArtifactsConfig::default(),
+            tls: None,
+            trusted_proxies: vec![],
+            attach_listen: None,
+            attach_url: None,
+            login: LoginConfig::default(),
+            notifications: NotificationsConfig::default(),
         }
     }
 }

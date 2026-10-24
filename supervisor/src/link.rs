@@ -179,6 +179,16 @@ impl NodeLink for LinkService {
                 });
                 Ok(Response::new(Box::pin(ReceiverStream::new(rx)) as Self::TunnelStream))
             }
+            TunnelOpen::Accept { id } if sup.attach.pending.lock().unwrap().contains_key(&id) => {
+                // "Open in OpenCode": the far end is the hub's attach listener.
+                let waiter = sup.attach.pending.lock().unwrap().remove(&id);
+                let (tx, rx) = mpsc::channel::<Result<TunnelFrame, Status>>(64);
+                let _ = tx.send(Ok(ready())).await;
+                if let Some(w) = waiter {
+                    let _ = w.send((inbound, tx));
+                }
+                Ok(Response::new(Box::pin(ReceiverStream::new(rx)) as Self::TunnelStream))
+            }
             TunnelOpen::Accept { id } => {
                 let p = {
                     let mut t = sup.nodes.tunnels.lock().unwrap();
@@ -376,6 +386,9 @@ impl Sup {
         };
         let _ = self.db.put_node(&info);
         self.publish_node(info);
+        if self.went_offline.lock().unwrap().remove(&h.node) {
+            self.notify("node.back", "info", format!("node {} is back", h.node), String::new(), Some(format!("node:{}", h.node)));
+        }
         let reported: std::collections::HashSet<&str> = h.sessions.iter().map(|s| s.id.as_str()).collect();
         let all = self.db.sessions(true);
         for s in &h.sessions {
@@ -417,6 +430,8 @@ impl Sup {
     }
 
     pub fn on_node_gone(&self, node: &str) {
+        self.went_offline.lock().unwrap().insert(node.to_string());
+        self.notify("node.offline", "warning", format!("node {node} disconnected"), "its sessions are unreachable until it is back".into(), Some(format!("node:{node}")));
         if let Some(mut n) = self.db.node(node) {
             n.connected = false;
             n.last_seen = now_ms();

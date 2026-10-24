@@ -1,5 +1,6 @@
 //! opencode-node — one per machine. See docs/ARCHITECTURE.md §2.
 
+mod attach;
 mod cas;
 mod cfgstore;
 mod egress;

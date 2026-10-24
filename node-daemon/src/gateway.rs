@@ -54,6 +54,10 @@ pub struct Gateway {
     overrides: Arc<Mutex<SpawnOverrides>>,
     /// The budget-exhausted question was raised (until the budget changes).
     budget_flagged: Arc<std::sync::atomic::AtomicBool>,
+    /// "80% of the budget" was reported (until the budget changes).
+    budget_warned: Arc<std::sync::atomic::AtomicBool>,
+    /// Last time a provider problem was reported (auth_failed / down), to report it once.
+    provider_alert: Arc<Mutex<Option<(String, Ts)>>>,
     ws: Arc<WsRef>,
     files: Arc<crate::wsops::WsOps>,
     /// Artifacts this session fetched: lineage parents of what it shares.
@@ -104,6 +108,8 @@ impl Gateway {
             last_route: Arc::new(Mutex::new(None)),
             overrides,
             budget_flagged: Default::default(),
+            budget_warned: Default::default(),
+            provider_alert: Default::default(),
             ws: Arc::new(ws),
             files: deps.files.clone(),
             fetched: Default::default(),
@@ -118,6 +124,18 @@ impl Gateway {
     /// The budget changed: a new exhaustion should ask again.
     pub fn budget_changed(&self) {
         self.budget_flagged.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.budget_warned.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Report a provider problem once per kind per 10 minutes.
+    fn provider_problem(&self, kind: &str, detail: Value) {
+        let now = now_ms();
+        let mut last = self.provider_alert.lock().unwrap();
+        if last.as_ref().is_some_and(|(k, t)| k == kind && now - t < 600_000) {
+            return;
+        }
+        *last = Some((kind.to_string(), now));
+        self.link.emit(NodeEvent::Activity { session: self.id.clone(), kind: kind.into(), detail });
     }
 
     /// Bind the socket and serve until the returned task is aborted.
@@ -215,6 +233,9 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
         let u = *g.usage.lock().unwrap();
         let budget = g.overrides.lock().unwrap().budget_usd.or(agent.cfg.limits.budget_usd);
         if let Some(b) = budget {
+            if u.cost_usd >= 0.8 * b && u.cost_usd < b && !g.budget_warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                g.link.emit(NodeEvent::Activity { session: g.id.clone(), kind: "budget.80".into(), detail: json!({"budget_usd": b, "spent_usd": u.cost_usd}) });
+            }
             if u.cost_usd >= b {
                 if !g.budget_flagged.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     // Spending past a budget is the operator's call (a vital question).
@@ -354,6 +375,9 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
             }
         };
         let status = upstream.status();
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            g.provider_problem("provider.auth_failed", json!({"provider": provider, "route": name, "status": status.as_u16()}));
+        }
         if status.as_u16() == 429 {
             let rh = upstream.headers().clone();
             let rb = upstream.bytes().await.unwrap_or_default();
@@ -398,7 +422,10 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
             r
         }
         (true, Some(_), OnExhausted::Fail) => llm_error(StatusCode::FORBIDDEN, &format!("every route's allowance for {provider} is used up (on_exhausted: fail): {detail}")),
-        _ => llm_error(StatusCode::BAD_GATEWAY, &format!("upstream unreachable: {detail}")),
+        _ => {
+            g.provider_problem("provider.down", json!({"provider": provider, "why": detail}));
+            llm_error(StatusCode::BAD_GATEWAY, &format!("upstream unreachable: {detail}"))
+        }
     }
 }
 

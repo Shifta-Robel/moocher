@@ -32,6 +32,22 @@ time.workspace = true
 ipnet.workspace = true
 blake3.workspace = true
 bytes.workspace = true
+argon2.workspace = true
+hmac.workspace = true
+sha1.workspace = true
+p256.workspace = true
+hkdf.workspace = true
+aes-gcm.workspace = true
+base64.workspace = true
+rust-embed.workspace = true
+instant-acme.workspace = true
+httparse.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+reqwest.workspace = true
+chrono.workspace = true
+x509-parser = "0.16.0"
 
 [dev-dependencies]
 tempfile = "3"

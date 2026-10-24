@@ -200,6 +200,20 @@ pub enum NodeCommand {
     Halt { session: String },
     /// Harvest a stopped/dead instance whose volumes are still here.
     Harvest { session: String, trigger: String },
+    /// "Open in OpenCode": open a Tunnel RPC with `Accept { id }` and serve
+    /// HTTP on it, forwarded to the session's OpenCode server with its password.
+    OpenAttach {
+        id: String,
+        session: String,
+        /// SHA-256 (hex) of the browser's attach cookie: the node checks it on
+        /// every request of the connection, not only the first.
+        #[serde(default)]
+        cookie_sha256: Option<String>,
+        #[serde(default)]
+        expires_at: Option<Ts>,
+    },
+    /// Write the live route override of `agent` into its YAML file and drop the override.
+    PromoteRoute { agent: String, by: String },
 }
 
 /// Cluster tools available to agents over MCP. `from_session` is added by the node.

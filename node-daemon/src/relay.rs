@@ -164,7 +164,7 @@ async fn reply(s: &mut TcpStream, code: u8) -> std::io::Result<()> {
 }
 
 /// Open a Tunnel RPC and wait for the hub's "ready" (the far end is connected).
-async fn open(link: &LinkHandle, open: TunnelOpen, me: &str) -> Result<(mpsc::Sender<TunnelFrame>, Streaming<TunnelFrame>)> {
+pub async fn open(link: &LinkHandle, open: TunnelOpen, me: &str) -> Result<(mpsc::Sender<TunnelFrame>, Streaming<TunnelFrame>)> {
     let ch = link.channel().ok_or_else(|| anyhow!("not connected to the hub"))?;
     let mut client = ocl_protocol::proto::node_link_client::NodeLinkClient::new(ch);
     let (tx, rx) = mpsc::channel::<TunnelFrame>(64);
@@ -183,9 +183,9 @@ async fn open(link: &LinkHandle, open: TunnelOpen, me: &str) -> Result<(mpsc::Se
     Ok((tx, inbound))
 }
 
-/// Copy bytes between a TCP stream and a tunnel until both directions end.
-pub async fn pump(tcp: TcpStream, tx: mpsc::Sender<TunnelFrame>, mut inbound: Streaming<TunnelFrame>) {
-    let (mut rd, mut wr) = tcp.into_split();
+/// Copy bytes between a stream and a tunnel until both directions end.
+pub async fn pump<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static>(tcp: S, tx: mpsc::Sender<TunnelFrame>, mut inbound: Streaming<TunnelFrame>) {
+    let (mut rd, mut wr) = tokio::io::split(tcp);
     let up = async move {
         let mut buf = vec![0u8; CHUNK];
         loop {

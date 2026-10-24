@@ -18,6 +18,8 @@ use tokio::sync::broadcast;
 pub const CMD_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct Sup {
+    /// Itself, for work that must outlive a `&self` call (notification sends).
+    pub me: std::sync::Weak<Sup>,
     pub db: Db,
     pub cfg: SupervisorConfig,
     pub config_dir: PathBuf,
@@ -34,6 +36,13 @@ pub struct Sup {
     pub blobs: crate::artifacts::BlobStore,
     /// Serialises death handling and halt resolution.
     pub recovery_lock: tokio::sync::Mutex<()>,
+    pub login_guard: crate::auth::LoginGuard,
+    /// "Open in OpenCode": one-time tickets and attach cookies.
+    pub attach: crate::attach::AttachState,
+    /// Outbound notification channels (push, ntfy, webhook).
+    pub notifier: crate::notify::Notifier,
+    /// Nodes that disconnected while this supervisor ran (for "node back").
+    pub went_offline: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Who performed an action, for the audit log.
@@ -77,7 +86,8 @@ impl Sup {
     pub fn new(db: Db, cfg: SupervisorConfig, config_dir: PathBuf) -> Arc<Sup> {
         let (stream, _) = broadcast::channel(1024);
         let data = cfg.data_dir.clone().unwrap_or_else(|| config_dir.join("supervisor"));
-        Arc::new(Sup {
+        Arc::new_cyclic(|me| Sup {
+            me: me.clone(),
             db,
             cfg,
             config_dir,
@@ -89,6 +99,10 @@ impl Sup {
             stats: Default::default(),
             blobs: crate::artifacts::BlobStore::new(data.join("artifacts")),
             recovery_lock: tokio::sync::Mutex::new(()),
+            login_guard: Default::default(),
+            attach: Default::default(),
+            notifier: crate::notify::Notifier::new(&data),
+            went_offline: Default::default(),
         })
     }
 
@@ -153,6 +167,8 @@ impl Sup {
                 deaths: 0,
                 replaces: None,
                 prompt: None,
+                attached_by: None,
+                attached_until: None,
             },
         };
         self.save_session(&info);
@@ -248,6 +264,8 @@ impl Sup {
             deaths: 0,
             replaces: o.replaces.clone(),
             prompt: o.prompt.as_deref().map(|p| truncate(p, 8000)),
+            attached_by: None,
+            attached_until: None,
         };
         self.save_session(&info);
         let spec = SpawnSpec {
@@ -389,6 +407,17 @@ impl Sup {
                 self.log("node.agents", Some(node), None, json!({}));
             }
             NodeEvent::Activity { session, kind, detail } => {
+                let who = self.db.session(&session).map(|s| format!("{} ({session})", s.report.agent)).unwrap_or(session.clone());
+                let alert = match kind.as_str() {
+                    "budget.80" => Some(("warning", format!("{who} used 80% of its budget"), format!("${:.4} of ${:.2}", detail["spent_usd"].as_f64().unwrap_or(0.0), detail["budget_usd"].as_f64().unwrap_or(0.0)))),
+                    "provider.auth_failed" => Some(("vital", format!("{} refuses the key on {node}", detail["provider"].as_str().unwrap_or("provider")), format!("HTTP {} via route {} (used by {who}); check the secret on {node}", detail["status"], detail["route"].as_str().unwrap_or("?")))),
+                    "provider.down" => Some(("warning", format!("{} unreachable from {node}", detail["provider"].as_str().unwrap_or("provider")), truncate(detail["why"].as_str().unwrap_or(""), 400))),
+                    "disk.warning" => Some(("warning", format!("{who} is at {}% of its disk limit", detail["pct"]), String::new())),
+                    _ => None,
+                };
+                if let Some((sev, title, body)) = alert {
+                    self.notify(&kind, sev, title, body, Some(session.clone()));
+                }
                 self.log(&kind, Some(node), Some(&session), detail);
             }
             NodeEvent::Egress { ips } => {
@@ -401,6 +430,18 @@ impl Sup {
                 let _ = self.db.put_route_stats(node, &stats);
             }
             NodeEvent::Quotas { buckets } => {
+                // An allowance used up, or back after its reset.
+                let before: std::collections::HashSet<(String, String)> =
+                    self.db.quotas().into_iter().filter(|q| q.node == node && q.exhausted && q.kind == "requests").map(|q| (q.provider, q.scope_id)).collect();
+                for q in buckets.iter().filter(|q| q.kind == "requests") {
+                    let key = (q.provider.clone(), q.scope_id.clone());
+                    if q.exhausted && !before.contains(&key) {
+                        let resets = q.resets_at.map(|t| format!(", resets in {}s", ((t - now_ms()) / 1000).max(0))).unwrap_or_default();
+                        self.notify("quota.exhausted", "warning", format!("{} allowance used up on {node}", q.provider), format!("{}{resets}", q.scope_id), Some(format!("{}:{}", q.provider, q.scope_id)));
+                    } else if !q.exhausted && before.contains(&key) {
+                        self.notify("quota.reset", "info", format!("{} allowance back on {node}", q.provider), q.scope_id.clone(), Some(format!("{}:{}", q.provider, q.scope_id)));
+                    }
+                }
                 let _ = self.db.put_quotas(node, &buckets);
                 let _ = self.stream.send(StreamEvent::Quotas { node: node.into() });
             }
@@ -716,6 +757,30 @@ pub fn truncate(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", s.chars().take(n).collect::<String>())
+    }
+}
+
+/// A minimal report for unit tests elsewhere in the crate.
+#[cfg(test)]
+pub fn tests_report(id: &str) -> SessionReport {
+    SessionReport {
+        id: id.into(),
+        node: "hub".into(),
+        agent: "builder".into(),
+        state: SessionState::Running,
+        opencode_id: None,
+        tokens: TokenUsage::default(),
+        todos: vec![],
+        current_task: None,
+        last_text: None,
+        error: None,
+        model: None,
+        workspace: None,
+        started_at: 0,
+        updated_at: 0,
+        context_tokens: 0,
+        dead_reason: None,
+        turns: 0,
     }
 }
 

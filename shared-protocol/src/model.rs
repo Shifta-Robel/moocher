@@ -189,6 +189,11 @@ pub struct SessionInfo {
     /// The first prompt (truncated), to brief a replacement if it dies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// "Open in OpenCode": who attached, and until when the attach cookie is valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attached_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attached_until: Option<Ts>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
