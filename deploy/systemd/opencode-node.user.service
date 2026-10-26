@@ -22,8 +22,8 @@ KillMode=process
 TimeoutStopSec=20s
 Environment=RUST_LOG=info
 #LoadCredentialEncrypted=openrouter:%E/ocl/creds/openrouter.cred
-NoNewPrivileges=yes
-PrivateTmp=yes
+# No NoNewPrivileges/PrivateTmp: rootless Podman needs the setuid newuidmap
+# and newgidmap helpers to set up its user namespace.
 LimitNOFILE=65536
 
 [Install]
