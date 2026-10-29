@@ -147,6 +147,7 @@ providers:
 **Built-in providers:**
 - **BYOK:** `openrouter`, `groq`, `openai`, `anthropic`, `gemini`.
 - **Keyless or best-effort:** `kilo-free` (Kilo gateway's free models, the endpoint OpenKilo uses), `pollinations` (key optional), `keylessai` (third-party worker, no SLA).
+- **`opencode-free`** (`api: opencode`): OpenCode Zen's free models (`big-pickle`, `*-free`) through OpenCode's own built-in provider, with no key. OpenCode calls opencode.ai itself, so this traffic skips the keyproxy: no quota tracking, budgets or `max_tokens` enforcement there (token counts still come from OpenCode). The agent needs `container: { egress: allowlist, allow_hosts: [opencode.ai] }`.
 
 An entry with the same id overrides a built-in.
 

@@ -423,7 +423,7 @@ impl Manager {
             role,
             oc: oc::Client::new(paths.oc_sock(), password, &dir),
             paths,
-            oc_provider: format!("ocl-{prov}"),
+            oc_provider: oc_provider_id(&snap, &prov),
             oc_model: model,
             oc_agent,
             oc_id: Mutex::new(report.opencode_id.clone()),
@@ -1639,6 +1639,15 @@ You are instance `{{instance.id}}` of the `{{template}}` agent, running on node
 - Never try to read or print credentials; you do not have any.
 "#;
 
+/// The provider id OpenCode knows the agent's provider by: the cluster's own
+/// entry (pointed at the keyproxy), or OpenCode's built-in one.
+fn oc_provider_id(snap: &Snapshot, provider: &str) -> String {
+    match snap.providers.get(provider) {
+        Some(p) if p.api == ApiKind::Opencode => "opencode".into(),
+        _ => format!("ocl-{provider}"),
+    }
+}
+
 fn write_opencode_config(
     snap: &Snapshot,
     agent: &LoadedAgent,
@@ -1650,7 +1659,7 @@ fn write_opencode_config(
 ) -> Result<()> {
     let a = &agent.cfg;
     let pdef = snap.providers.get(&a.provider.id).ok_or_else(|| anyhow!("unknown provider {}", a.provider.id))?;
-    let pid = format!("ocl-{}", a.provider.id);
+    let pid = oc_provider_id(snap, &a.provider.id);
     let gw = format!("http://127.0.0.1:{gw_port}");
     let etc_in_runtime = match kind {
         RuntimeKind::Podman => "/etc/ocl".to_string(),
@@ -1699,11 +1708,16 @@ fn write_opencode_config(
         role.push('\n');
     }
     std::fs::write(paths.etc.join("ROLE.md"), role)?;
-    let cfg = json!({
-        "$schema": "https://opencode.ai/config.json",
-        "autoupdate": false,
-        "share": "disabled",
-        "provider": {
+    let (provider, model) = if pdef.api == ApiKind::Opencode {
+        // OpenCode's built-in provider, from the catalog bundled in the binary:
+        // the empty cache written by prepare_dirs would hide it.
+        let cache = paths.home.join(".cache/opencode/models.json");
+        if std::fs::read(&cache).is_ok_and(|b| b == b"{}") {
+            std::fs::remove_file(&cache)?;
+        }
+        (json!({}), format!("{pid}/{}", a.provider.model))
+    } else {
+        let p = json!({
             pid.clone(): {
                 "npm": pdef.api.npm_package(),
                 "name": format!("{} via opencode-cluster", a.provider.id),
@@ -1716,9 +1730,16 @@ fn write_opencode_config(
                     }
                 }
             }
-        },
-        "model": format!("{pid}/{}", a.provider.model),
-        "small_model": format!("{pid}/{}", a.provider.model),
+        });
+        (p, format!("{pid}/{}", a.provider.model))
+    };
+    let cfg = json!({
+        "$schema": "https://opencode.ai/config.json",
+        "autoupdate": false,
+        "share": "disabled",
+        "provider": provider,
+        "model": model,
+        "small_model": model,
         "permission": {"edit": perm_json(&a.tools.edit), "bash": perm_json(&a.tools.bash), "webfetch": perm_json(&a.tools.webfetch)},
         "mcp": {"cluster": {"type": "remote", "url": format!("{gw}/mcp"), "headers": {"Authorization": format!("Bearer {cap}")}, "enabled": true}},
         "instructions": [format!("{etc_in_runtime}/ROLE.md")],

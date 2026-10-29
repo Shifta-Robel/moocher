@@ -140,6 +140,8 @@ impl Scanner {
                     self.seen = true;
                 }
             }
+            // Never proxied: OpenCode reports its usage itself.
+            ApiKind::Opencode => {}
         }
     }
 }

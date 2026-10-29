@@ -151,6 +151,31 @@ impl Sup {
         ranked.into_iter().filter(|s| !any_usable || !s.exhausted).map(|s| s.node).collect()
     }
 
+    /// Why no node can take `agent`, node by node.
+    pub fn why_not(&self, agent: &str) -> String {
+        let nodes = self.node_views();
+        let why: Vec<String> = nodes
+            .iter()
+            .filter(|n| !n.relay)
+            .map(|n| {
+                let reason = match n.agents.iter().find(|a| a.name == agent) {
+                    _ if !n.connected || !self.nodes.connected(&n.name) => "not connected".to_string(),
+                    None => "does not have this agent (check `ocl agents` and the node's config errors)".into(),
+                    Some(a) if !a.errors.is_empty() => format!("config errors: {}", a.errors.join("; ")),
+                    Some(a) if !a.secret_ok => format!("the {} key does not resolve (node.yaml `secrets:` alias or its env var; restart the node after editing node.env)", a.provider),
+                    Some(_) if n.running >= n.max_sessions => format!("at capacity ({}/{} sessions)", n.running, n.max_sessions),
+                    Some(_) => "unavailable".into(),
+                };
+                format!("{}: {reason}", n.name)
+            })
+            .collect();
+        if why.is_empty() {
+            "no worker nodes are enrolled".into()
+        } else {
+            why.join("; ")
+        }
+    }
+
     /// Pick a node; returns it with a one-line explanation.
     pub fn place(&self, agent: &str, hint: Option<&str>, near: &Near) -> Result<(String, String)> {
         let ranked = self.rank(agent, near);
@@ -159,7 +184,7 @@ impl Sup {
                 Some(s) => s.clone(),
                 None => bail!("node {h} cannot run agent {agent} right now (not connected, agent missing/misconfigured, or at capacity)"),
             },
-            None => ranked.first().cloned().ok_or_else(|| anyhow!("no connected node can run agent {agent:?} right now"))?,
+            None => ranked.first().cloned().ok_or_else(|| anyhow!("no connected node can run agent {agent:?} right now: {}", self.why_not(agent)))?,
         };
         let mut why = if hint.is_some() { format!("pinned to {}: {}", chosen.node, chosen.summary()) } else { chosen.summary() };
         if let Some(next) = ranked.iter().find(|s| s.node != chosen.node && !s.exhausted) {

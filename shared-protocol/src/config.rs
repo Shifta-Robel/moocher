@@ -900,12 +900,16 @@ pub enum ApiKind {
     Openai,
     Anthropic,
     Google,
+    /// OpenCode's own built-in `opencode` provider (Zen free models, no key):
+    /// OpenCode calls it itself, so traffic skips the keyproxy and the agent
+    /// needs `container.egress: allowlist` to opencode.ai.
+    Opencode,
 }
 
 impl ApiKind {
     pub fn npm_package(self) -> &'static str {
         match self {
-            ApiKind::Openai => "@ai-sdk/openai-compatible",
+            ApiKind::Openai | ApiKind::Opencode => "@ai-sdk/openai-compatible",
             ApiKind::Anthropic => "@ai-sdk/anthropic",
             ApiKind::Google => "@ai-sdk/google",
         }
@@ -982,6 +986,10 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderDef> {
     m.insert(
         "pollinations".into(),
         p("https://gen.pollinations.ai/v1", Openai, AuthStyle::Bearer, BestEffort, "Pollinations; key optional (omit `key` for anonymous tier)"),
+    );
+    m.insert(
+        "opencode-free".into(),
+        p("https://opencode.ai/zen/v1", Opencode, AuthStyle::None, BestEffort, "OpenCode Zen free models, called by OpenCode itself without a key"),
     );
     m.insert(
         "keylessai".into(),
@@ -1637,6 +1645,15 @@ impl AgentConfig {
                 if p.auth != AuthStyle::None && self.provider.key.is_none() && self.provider.id != "pollinations" {
                     errs.push(format!("provider {:?} needs provider.key (a secret ref)", self.provider.id));
                 }
+                if p.api == ApiKind::Opencode {
+                    if self.provider.key.is_some() {
+                        errs.push(format!("provider {:?} takes no provider.key: OpenCode uses its free tier", self.provider.id));
+                    }
+                    let reach = self.container.allow_hosts.iter().filter_map(|h| HostPattern::parse(h).ok()).any(|h| h.matches("opencode.ai", 443));
+                    if self.container.egress == Egress::None || (self.container.egress == Egress::Allowlist && !reach) {
+                        errs.push(format!("provider {:?} is called from inside the agent: set container: {{ egress: allowlist, allow_hosts: [opencode.ai] }}", self.provider.id));
+                    }
+                }
             }
         }
         match (self.container.egress, self.container.allow_hosts.is_empty()) {
@@ -1780,6 +1797,23 @@ success: { todos: ["write module"], checks: [ { exit_code: "pytest -q" } ] }
         assert!(a.validate(&builtin_providers()).is_empty());
         let b: AgentConfig = serde_yaml::from_str("name: paid\nprovider: { id: groq, model: x }").unwrap();
         assert_eq!(b.validate(&builtin_providers()).len(), 1);
+    }
+
+    #[test]
+    fn opencode_free_needs_egress_and_no_key() {
+        let p = builtin_providers();
+        let ok: AgentConfig = serde_yaml::from_str(
+            "name: zen\nprovider: { id: opencode-free, model: big-pickle }\ncontainer: { egress: allowlist, allow_hosts: [opencode.ai] }",
+        )
+        .unwrap();
+        assert!(ok.validate(&p).is_empty(), "{:?}", ok.validate(&p));
+        let offline: AgentConfig = serde_yaml::from_str("name: zen\nprovider: { id: opencode-free, model: big-pickle }").unwrap();
+        assert!(offline.validate(&p)[0].contains("egress"));
+        let keyed: AgentConfig = serde_yaml::from_str(
+            "name: zen\nprovider: { id: opencode-free, model: big-pickle, key: { secret: zen } }\ncontainer: { egress: full }",
+        )
+        .unwrap();
+        assert_eq!(keyed.validate(&p).len(), 1);
     }
 
     #[test]
