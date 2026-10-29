@@ -151,6 +151,10 @@ pub struct SessionReport {
     pub model: Option<String>,
     #[serde(default)]
     pub workspace: Option<String>,
+    /// OpenCode's working directory as OpenCode sees it (its web UI's session
+    /// URL contains it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory: Option<String>,
     pub started_at: Ts,
     pub updated_at: Ts,
     /// Context size of the latest assistant message (input + cache read): what

@@ -70,12 +70,13 @@ await step("sending a message queues it", async () => {
   await page.getByRole("button", { name: "Send" }).click();
   await page.getByText("Queued for its next step").waitFor();
 });
-await step("Open in OpenCode opens OpenCode's own web app for this instance", async () => {
+await step("Open in OpenCode opens this instance's conversation in OpenCode's web app", async () => {
   const [popup] = await Promise.all([ctx.waitForEvent("page"), page.getByRole("button", { name: "Open in OpenCode" }).click()]);
-  await popup.waitForURL(/:7444\/$/, { timeout: 20000 });
+  await popup.waitForURL(/:7444\/[A-Za-z0-9_-]+\/session\/ses_/, { timeout: 20000 });
   await popup.waitForLoadState("domcontentloaded");
   const html = await popup.content();
   if (!/\/assets\//.test(html)) throw new Error("no OpenCode app in the popup");
+  await popup.getByText("Write greet(name) in greet.py", { exact: false }).first().waitFor({ timeout: 30000 });
   await popup.screenshot({ path: `${shots}/opencode-attached.png` });
   await popup.close();
 });

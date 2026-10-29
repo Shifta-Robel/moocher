@@ -11,6 +11,10 @@ const set = r.headers.get("set-cookie") || "";
 const cookie = (set.match(/ocl_attach=[0-9a-f]+/) || [""])[0];
 check(r.status === 302 && cookie && /HttpOnly/i.test(set), `ticket redeemed for an HttpOnly cookie (${r.status})`);
 const H = { cookie };
+const loc = r.headers.get("location") || "";
+const m = loc.match(/^\/([A-Za-z0-9_-]+)\/session\/(ses_[A-Za-z0-9]+)$/);
+const dir = m ? Buffer.from(m[1], "base64url").toString() : "";
+check(!!m && dir.startsWith("/"), `redirected to the instance's session page (${loc} -> ${dir})`);
 
 const page = await fetch(base + "/", { headers: H });
 const html = await page.text();
@@ -23,6 +27,9 @@ const health = await fetch(base + "/api/health", { headers: H }).then((x) => x.j
 check(health.healthy === true, "OpenCode API answers (the node added its password)");
 const sessions = await fetch(base + "/session", { headers: H }).then((x) => x.json()).catch(() => null);
 check(Array.isArray(sessions) && sessions.length >= 1, `the instance's sessions are visible (${Array.isArray(sessions) ? sessions.length : "?"})`);
+check(Array.isArray(sessions) && sessions.some((x) => x.id === m?.[2] && x.directory === dir), "that session id and directory are OpenCode's own");
+const sp = await fetch(base + loc, { headers: H });
+check(sp.status === 200 && /<script[^>]+\/assets\//.test(await sp.text()), `the session page loads (${sp.status})`);
 
 const noCookie = await fetch(base + "/api/health");
 check(noCookie.status === 401, `without the cookie the hub refuses (${noCookie.status})`);

@@ -530,6 +530,7 @@ impl Manager {
             error: None,
             model: Some(format!("{}/{}", agent.cfg.provider.id, agent.cfg.provider.model)),
             workspace: Some(ws_label),
+            directory: Some(self.rt.workspace_in_runtime(&paths)),
             started_at: now,
             updated_at: now,
             context_tokens: 0,

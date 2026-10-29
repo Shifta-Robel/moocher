@@ -126,6 +126,17 @@ pub async fn serve(sup: Arc<Sup>, listener: tokio::net::TcpListener, tls: Option
     }
 }
 
+/// Where OpenCode's web UI shows this session live: `/<dir>/session/<id>`,
+/// the directory in unpadded URL-safe base64 as the UI encodes it. Without
+/// both (an older node, or OpenCode not started yet), its start page.
+fn session_path(r: &ocl_protocol::model::SessionReport) -> String {
+    use base64::Engine;
+    match (&r.directory, &r.opencode_id) {
+        (Some(dir), Some(id)) => format!("/{}/session/{id}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(dir)),
+        _ => "/".into(),
+    }
+}
+
 async fn respond<S: AsyncWrite + Unpin>(s: &mut S, status: &str, extra: &str, body: &str) -> Result<()> {
     let msg = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n{extra}\r\n{body}",
@@ -177,14 +188,16 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(sup: &Arc<Su
         };
         let token = crate::auth::random_hex(32);
         sup.attach.cookies.lock().unwrap().insert(crate::db::hash_token(&token), (session.clone(), who.clone(), now_ms() + COOKIE_MS));
+        let mut location = "/".to_string();
         if let Ok(mut si) = sup.session(&session) {
             si.attached_by = Some(who.clone());
             si.attached_until = Some(now_ms() + COOKIE_MS);
+            location = session_path(&si.report);
             sup.save_session(&si);
         }
         sup.log("session.attached", None, Some(&session), json!({"by": who}));
         let cookie = format!(
-            "Set-Cookie: {COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}\r\nLocation: /\r\n",
+            "Set-Cookie: {COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}\r\nLocation: {location}\r\n",
             COOKIE_MS / 1000,
             if secure { "; Secure" } else { "" }
         );
@@ -251,5 +264,14 @@ mod tests {
         let t = v["ticket"].as_str().unwrap();
         assert!(sup.redeem_ticket(t).is_some());
         assert!(sup.redeem_ticket(t).is_none(), "a ticket works once");
+    }
+
+    #[test]
+    fn opens_the_session_page() {
+        let mut r = crate::state::tests_report("s-1");
+        assert_eq!(super::session_path(&r), "/", "no OpenCode session yet");
+        r.directory = Some("/workspace".into());
+        r.opencode_id = Some("ses_abc".into());
+        assert_eq!(super::session_path(&r), "/L3dvcmtzcGFjZQ/session/ses_abc");
     }
 }
