@@ -8,8 +8,8 @@
 //! node on attach and whenever the files change.
 
 use crate::state::{Sup, CMD_TIMEOUT};
-use ocl_protocol::config::{load_dir, valid_name, AgentConfig, NodeRole};
-use ocl_protocol::link::NodeCommand;
+use moocher_protocol::config::{load_dir, valid_name, AgentConfig, NodeRole};
+use moocher_protocol::link::NodeCommand;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;

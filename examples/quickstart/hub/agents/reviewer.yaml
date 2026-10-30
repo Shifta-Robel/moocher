@@ -1,4 +1,4 @@
-apiVersion: ocl/v1
+apiVersion: moo/v1
 kind: Agent
 name: reviewer
 description: Reviews code for correctness and style; ends with VERDICT APPROVED or CHANGES_REQUESTED.

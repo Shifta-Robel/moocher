@@ -124,22 +124,24 @@ impl ServerCertVerifier for PinnedCa {
     }
 }
 
-/// `ocljoin.<secret>.<ca fingerprint>`
+/// `moojoin.<secret>.<ca fingerprint>`
 pub struct JoinToken {
     pub secret: String,
     pub ca_fingerprint: String,
 }
 
-pub const JOIN_PREFIX: &str = "ocljoin";
+pub const JOIN_PREFIX: &str = "moojoin";
+/// Tokens printed before the rename to moocher still redeem.
+const LEGACY_JOIN_PREFIX: &str = "ocljoin";
 
 impl JoinToken {
     pub fn parse(s: &str) -> Result<JoinToken> {
         let mut it = s.trim().split('.');
         match (it.next(), it.next(), it.next(), it.next()) {
-            (Some(JOIN_PREFIX), Some(secret), Some(fp), None) if !secret.is_empty() && fp.len() == 64 && fp.chars().all(|c| c.is_ascii_hexdigit()) => {
+            (Some(JOIN_PREFIX | LEGACY_JOIN_PREFIX), Some(secret), Some(fp), None) if !secret.is_empty() && fp.len() == 64 && fp.chars().all(|c| c.is_ascii_hexdigit()) => {
                 Ok(JoinToken { secret: secret.into(), ca_fingerprint: fp.to_lowercase() })
             }
-            _ => bail!("not a join token (expected ocljoin.<secret>.<64 hex chars>)"),
+            _ => bail!("not a join token (expected moojoin.<secret>.<64 hex chars>)"),
         }
     }
     pub fn render(&self) -> String {
@@ -174,11 +176,12 @@ mod tests {
     #[test]
     fn join_token_roundtrip() {
         let fp = "a".repeat(64);
-        let t = JoinToken::parse(&format!("ocljoin.s3cr3t.{fp}")).unwrap();
+        let t = JoinToken::parse(&format!("moojoin.s3cr3t.{fp}")).unwrap();
         assert_eq!(t.secret, "s3cr3t");
-        assert_eq!(t.render(), format!("ocljoin.s3cr3t.{fp}"));
-        assert!(JoinToken::parse("ocljoin.x.short").is_err());
-        assert!(JoinToken::parse(&format!("ocl_x.s.{fp}")).is_err());
+        assert_eq!(t.render(), format!("moojoin.s3cr3t.{fp}"));
+        assert!(JoinToken::parse("moojoin.x.short").is_err());
+        assert_eq!(JoinToken::parse(&format!("ocljoin.s3cr3t.{fp}")).unwrap().render(), format!("moojoin.s3cr3t.{fp}"));
+        assert!(JoinToken::parse(&format!("moo_x.s.{fp}")).is_err());
     }
 
     #[test]

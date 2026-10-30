@@ -1,6 +1,6 @@
-# opencode-cluster agent image: OpenCode + ocl-bridge, nothing else listens.
+# moocher agent image: OpenCode + moo-bridge, nothing else listens.
 #
-#   podman build -t localhost/ocl-agent:1.19.4 \
+#   podman build -t localhost/moocher-agent:1.19.4 \
 #     --build-arg OPENCODE_VERSION=1.19.4 -f images/agent/Containerfile .
 #
 # Behind a TLS-intercepting proxy, add: -v /path/ca.crt:/run/extra-ca.crt:ro
@@ -26,9 +26,9 @@ RUN if [ -f /run/extra-ca.crt ]; then \
  && (userdel -r ubuntu 2>/dev/null || true) \
  && useradd -m -u 1000 agent
 COPY --from=fetch /opencode /usr/local/bin/opencode
-COPY target/x86_64-unknown-linux-musl/release/ocl-bridge /usr/local/bin/ocl-bridge
+COPY target/x86_64-unknown-linux-musl/release/moo-bridge /usr/local/bin/moo-bridge
 ENV OPENCODE_DISABLE_AUTOUPDATE=1 \
     HOME=/home/agent
 USER agent
 WORKDIR /workspace
-ENTRYPOINT ["/usr/local/bin/ocl-bridge"]
+ENTRYPOINT ["/usr/local/bin/moo-bridge"]

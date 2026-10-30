@@ -1,4 +1,4 @@
-apiVersion: ocl/v1
+apiVersion: moo/v1
 kind: Agent
 name: coordinator
 description: Main agent. Takes tasks from the bucket and delegates to other agents.

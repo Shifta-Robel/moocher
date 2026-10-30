@@ -10,9 +10,9 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-WORK="${OCL_DEMO_DIR:-$REPO/target/demo}"
-RUN_DIR="${OCL_RUN_DIR:-${XDG_RUNTIME_DIR:-/run}/ocl}"
-IMAGE="localhost/ocl-agent:1.19.4"
+WORK="${MOO_DEMO_DIR:-$REPO/target/demo}"
+RUN_DIR="${MOO_RUN_DIR:-${XDG_RUNTIME_DIR:-/run}/moo}"
+IMAGE="localhost/moocher-agent:1.19.4"
 WITH_WORKER=0
 KEEP=0
 for a in "$@"; do
@@ -26,10 +26,10 @@ done
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
 say "building"
-cargo build --release --manifest-path "$REPO/Cargo.toml" -p ocl-supervisor -p opencode-node -p ocl
-cargo build --release --manifest-path "$REPO/Cargo.toml" -p ocl-bridge --target x86_64-unknown-linux-musl
+cargo build --release --manifest-path "$REPO/Cargo.toml" -p moocher-hub -p moocher-node -p moo
+cargo build --release --manifest-path "$REPO/Cargo.toml" -p moo-bridge --target x86_64-unknown-linux-musl
 BIN="$REPO/target/release"
-export OCL_BRIDGE="$REPO/target/x86_64-unknown-linux-musl/release/ocl-bridge"
+export MOO_BRIDGE="$REPO/target/x86_64-unknown-linux-musl/release/moo-bridge"
 if ! podman image exists "$IMAGE"; then
   say "building agent image $IMAGE"
   podman build -t "$IMAGE" -f "$REPO/images/agent/Containerfile" "$REPO"
@@ -38,7 +38,7 @@ fi
 say "preparing $WORK"
 rm -rf "$WORK"; mkdir -p "$WORK"
 cp -r "$REPO/examples/quickstart/hub" "$WORK/hub"
-sed -i "s#unix:///run/ocl/supervisor.sock#unix://$RUN_DIR/supervisor.sock#" "$WORK/hub/node.yaml"
+sed -i "s#unix:///run/moo/supervisor.sock#unix://$RUN_DIR/supervisor.sock#" "$WORK/hub/node.yaml"
 printf 'link_socket: %s/supervisor.sock\n' "$RUN_DIR" >> "$WORK/hub/supervisor.yaml"
 
 PIDS=()
@@ -46,7 +46,7 @@ cleanup() {
   [ "$KEEP" = 1 ] && { echo "left running (--keep): ${PIDS[*]}"; return; }
   say "stopping"
   for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
-  podman ps -a --filter label=ocl.session --format '{{.Names}}' | xargs -r podman rm -f >/dev/null
+  podman ps -a --filter label=moo.session --format '{{.Names}}' | xargs -r podman rm -f >/dev/null
 }
 trap cleanup EXIT
 
@@ -56,12 +56,12 @@ export MOCK_API_KEY="mock-provider-key-$RANDOM$RANDOM"
 python3 "$REPO/examples/mock-llm/mock_llm.py" --port 8099 --require-key "$MOCK_API_KEY" > "$WORK/mock.log" 2>&1 &
 PIDS+=($!)
 
-"$BIN/ocl-supervisor" --config-dir "$WORK/hub" init > "$WORK/init.txt"
-export OCL_TOKEN="$(cat "$WORK/hub/cli-token")"
-"$BIN/ocl-supervisor" --config-dir "$WORK/hub" run > "$WORK/supervisor.log" 2>&1 &
+"$BIN/moocher-hub" --config-dir "$WORK/hub" init > "$WORK/init.txt"
+export MOO_TOKEN="$(cat "$WORK/hub/cli-token")"
+"$BIN/moocher-hub" --config-dir "$WORK/hub" run > "$WORK/supervisor.log" 2>&1 &
 PIDS+=($!)
 sleep 1
-"$BIN/opencode-node" --config-dir "$WORK/hub" run > "$WORK/node-hub.log" 2>&1 &
+"$BIN/moocher-node" --config-dir "$WORK/hub" run > "$WORK/node-hub.log" 2>&1 &
 PIDS+=($!)
 
 if [ "$WITH_WORKER" = 1 ]; then
@@ -74,12 +74,12 @@ supervisor: unix://$RUN_DIR/supervisor.sock
 max_sessions: 4
 runtime: { kind: podman, run_dir: $RUN_DIR-worker-a }
 EOF
-  "$BIN/opencode-node" --config-dir "$WORK/worker-a" run > "$WORK/node-worker-a.log" 2>&1 &
+  "$BIN/moocher-node" --config-dir "$WORK/worker-a" run > "$WORK/node-worker-a.log" 2>&1 &
   PIDS+=($!)
 fi
 sleep 3
 
-O="$BIN/ocl"
+O="$BIN/moo"
 say "agents"
 $O agents
 

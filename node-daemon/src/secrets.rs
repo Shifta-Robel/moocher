@@ -2,7 +2,7 @@
 //! no restart) and only ever used inside keyproxy on this node.
 
 use anyhow::{bail, Context, Result};
-use ocl_protocol::config::SecretRef;
+use moocher_protocol::config::SecretRef;
 
 pub fn resolve(r: &SecretRef) -> Result<String> {
     let s = r.reference.as_str();
@@ -35,9 +35,9 @@ mod tests {
     use super::*;
     #[test]
     fn env_and_file() {
-        std::env::set_var("OCL_TEST_SECRET", " abc \n");
-        assert_eq!(resolve(&SecretRef { reference: "env:OCL_TEST_SECRET".into(), secret: None, account: None }).unwrap(), "abc");
-        let p = std::env::temp_dir().join("ocl-secret-test");
+        std::env::set_var("MOO_TEST_SECRET", " abc \n");
+        assert_eq!(resolve(&SecretRef { reference: "env:MOO_TEST_SECRET".into(), secret: None, account: None }).unwrap(), "abc");
+        let p = std::env::temp_dir().join("moo-secret-test");
         std::fs::write(&p, "xyz\n").unwrap();
         assert_eq!(resolve(&SecretRef { reference: format!("file:{}", p.display()), secret: None, account: None }).unwrap(), "xyz");
         assert!(resolve(&SecretRef { reference: "vault:x".into(), secret: None, account: None }).is_err());

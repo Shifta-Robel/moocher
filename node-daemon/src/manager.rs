@@ -21,9 +21,9 @@ use crate::oc;
 use crate::runtime::{InstancePaths, LaunchSpec, Runtime};
 use crate::store::{InstanceRow, Store};
 use anyhow::{anyhow, bail, Context, Result};
-use ocl_protocol::config::*;
-use ocl_protocol::link::{Hello, NodeCommand, NodeEvent, SpawnSpec, PROTOCOL_VERSION};
-use ocl_protocol::model::*;
+use moocher_protocol::config::*;
+use moocher_protocol::link::{Hello, NodeCommand, NodeEvent, SpawnSpec, PROTOCOL_VERSION};
+use moocher_protocol::model::*;
 use rand::Rng;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -56,7 +56,7 @@ pub struct Instance {
     role: SessionRole,
     paths: InstancePaths,
     oc: oc::Client,
-    /// OpenCode provider id (`ocl-<provider>`), model id and agent mode.
+    /// OpenCode provider id (`moo-<provider>`), model id and agent mode.
     oc_provider: String,
     oc_model: String,
     oc_agent: String,
@@ -111,7 +111,7 @@ impl Manager {
         let snap = cfg.get();
         let data_root = snap.node.runtime.data_dir.clone().unwrap_or_else(|| snap.dir.join("data"));
         let run_root = snap.node.runtime.run_dir.clone().unwrap_or_else(|| {
-            std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("ocl")).unwrap_or_else(|| PathBuf::from("/run/ocl"))
+            std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("moo")).unwrap_or_else(|| PathBuf::from("/run/moo"))
         });
         // Relay-only nodes run no sessions and need no socket dir.
         if snap.node.role != NodeRole::Relay {
@@ -120,7 +120,7 @@ impl Manager {
             let longest = run_root.join("s-0123456789").join("node.sock");
             if longest.as_os_str().len() > 107 {
                 bail!(
-                    "runtime.run_dir {} is too long for unix sockets ({} bytes with the session socket, max 107); use a shorter path such as /run/ocl",
+                    "runtime.run_dir {} is too long for unix sockets ({} bytes with the session socket, max 107); use a shorter path such as /run/moo",
                     run_root.display(),
                     longest.as_os_str().len()
                 );
@@ -129,7 +129,7 @@ impl Manager {
         }
         std::fs::create_dir_all(data_root.join("workspaces"))?;
         std::fs::create_dir_all(data_root.join("instances"))?;
-        let disk_fs = if snap.node.disk_enforce == ocl_protocol::config::DiskEnforce::Hard {
+        let disk_fs = if snap.node.disk_enforce == moocher_protocol::config::DiskEnforce::Hard {
             let fs = crate::disk_quota::detect(&data_root)?;
             let euid = std::fs::metadata("/proc/self").map(|m| std::os::unix::fs::MetadataExt::uid(&m)).unwrap_or(u32::MAX);
             crate::disk_quota::check(&fs, euid)?;
@@ -171,7 +171,7 @@ impl Manager {
         Hello {
             protocol: PROTOCOL_VERSION,
             node: self.node.clone(),
-            version: ocl_protocol::VERSION.into(),
+            version: moocher_protocol::VERSION.into(),
             max_sessions: if relay_only { 0 } else { snap.node.max_sessions },
             relay: snap.node.relay || relay_only,
             agents: if relay_only { vec![] } else { snap.agent_infos() },
@@ -387,7 +387,7 @@ impl Manager {
         f(&mut o);
         let path = snap.dir.join("overrides.yaml");
         let body = format!(
-            "# Live changes made from the opencode-cluster UI/CLI, written by opencode-node.\n# Kept apart from your version-controlled files; safe to edit or delete.\n{}",
+            "# Live changes made from the moocher UI/CLI, written by moocher-node.\n# Kept apart from your version-controlled files; safe to edit or delete.\n{}",
             serde_yaml::to_string(&o)?
         );
         let tmp = path.with_extension("yaml.tmp");
@@ -490,7 +490,7 @@ impl Manager {
         let (workspace, ws_label) = self.workspace_dir(&spec.id, &ws_spec)?;
         let inst_dir = self.data_root.join("instances").join(&spec.id);
         let paths = InstancePaths { run: self.run_root.join(&spec.id), etc: inst_dir.join("etc"), home: inst_dir.join("home"), workspace };
-        let cap = random_token("ocl_cap_");
+        let cap = random_token("moo_cap_");
         let password = random_token("");
         let fresh = std::fs::read_dir(&paths.workspace).map(|mut d| d.next().is_none()).unwrap_or(true);
         if let (Some(fs), Some(bytes)) = (&self.disk_fs, agent.cfg.container.disk.as_deref().and_then(parse_size)) {
@@ -596,7 +596,7 @@ impl Manager {
             })
         };
         inst.tasks.lock().unwrap().extend([h, watch]);
-        let allowlist = self.cfg.get().agents.get(&inst.agent).is_some_and(|a| a.cfg.container.egress == ocl_protocol::config::Egress::Allowlist);
+        let allowlist = self.cfg.get().agents.get(&inst.agent).is_some_and(|a| a.cfg.container.egress == moocher_protocol::config::Egress::Allowlist);
         if allowlist {
             let px = crate::egress_proxy::EgressProxy::new(&inst.id, &inst.agent, self.cfg.clone(), self.link.clone());
             inst.tasks.lock().unwrap().push(px.serve(inst.paths.proxy_sock())?);
@@ -1614,7 +1614,7 @@ fn perm_json(p: &PermRule) -> Value {
 /// Built-in cluster preamble, used unless the hub ships `preambles/cluster.md`.
 /// Variables: {{instance.id}} {{template}} {{node}} {{parent}} {{task}}
 /// {{budget}} {{model}} {{tools}} {{question_mode}} {{outputs}}.
-pub const DEFAULT_PREAMBLE: &str = r#"## Operating in opencode-cluster
+pub const DEFAULT_PREAMBLE: &str = r#"## Operating in moocher
 
 You are instance `{{instance.id}}` of the `{{template}}` agent, running on node
 `{{node}}` with model {{model}}. You answer to {{parent}}. Task: {{task}}.
@@ -1645,7 +1645,7 @@ You are instance `{{instance.id}}` of the `{{template}}` agent, running on node
 fn oc_provider_id(snap: &Snapshot, provider: &str) -> String {
     match snap.providers.get(provider) {
         Some(p) if p.api == ApiKind::Opencode => "opencode".into(),
-        _ => format!("ocl-{provider}"),
+        _ => format!("moo-{provider}"),
     }
 }
 
@@ -1663,7 +1663,7 @@ fn write_opencode_config(
     let pid = oc_provider_id(snap, &a.provider.id);
     let gw = format!("http://127.0.0.1:{gw_port}");
     let etc_in_runtime = match kind {
-        RuntimeKind::Podman => "/etc/ocl".to_string(),
+        RuntimeKind::Podman => "/etc/moo".to_string(),
         RuntimeKind::Process => paths.etc.display().to_string(),
     };
     // Layered instructions: cluster preamble, template preamble, role prompt,
@@ -1721,7 +1721,7 @@ fn write_opencode_config(
         let p = json!({
             pid.clone(): {
                 "npm": pdef.api.npm_package(),
-                "name": format!("{} via opencode-cluster", a.provider.id),
+                "name": format!("{} via moocher", a.provider.id),
                 "options": {"baseURL": format!("{gw}/llm/{}", a.provider.id), "apiKey": cap},
                 "models": {
                     a.provider.model.clone(): {

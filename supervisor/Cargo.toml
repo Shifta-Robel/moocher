@@ -1,13 +1,13 @@
 [package]
-name = "ocl-supervisor"
+name = "moocher-hub"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "opencode-cluster control plane: registry, orchestration, task bucket, operator API"
+description = "moocher control plane: registry, orchestration, task bucket, operator API"
 
 [dependencies]
 zstd.workspace = true
-ocl-protocol.workspace = true
+moocher-protocol.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true

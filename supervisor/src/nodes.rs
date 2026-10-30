@@ -13,10 +13,10 @@
 use crate::state::{Actor, Sup};
 use crate::tlslink::LinkPeer;
 use anyhow::{anyhow, bail, Result};
-use ocl_protocol::config::{valid_name, AllowlistScope, NodeRole};
-use ocl_protocol::link::Hello;
-use ocl_protocol::model::*;
-use ocl_protocol::proto::EnrollReply;
+use moocher_protocol::config::{valid_name, AllowlistScope, NodeRole};
+use moocher_protocol::link::Hello;
+use moocher_protocol::model::*;
+use moocher_protocol::proto::EnrollReply;
 use serde_json::{json, Value};
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -72,14 +72,14 @@ impl Sup {
             let ca = self.ca()?;
             let ttl = self.cfg.enrollment.token_ttl_secs as i64 * 1000;
             let (secret, expires_at) = self.db.create_join_token(node, role.as_str(), &labels, &actor.to_string(), ttl)?;
-            let token = ocl_protocol::tls::JoinToken { secret, ca_fingerprint: ca.fingerprint() }.render();
+            let token = moocher_protocol::tls::JoinToken { secret, ca_fingerprint: ca.fingerprint() }.render();
             let url = self.link_url().unwrap_or_default();
             Ok(json!({
                 "node": node,
                 "role": role.as_str(),
                 "token": token,
                 "expires_at": expires_at,
-                "command": format!("opencode-node join {url} --token {token}"),
+                "command": format!("moocher-node join {url} --token {token}"),
                 "approval_required": self.cfg.enrollment.require_approval,
             }))
         })();
@@ -182,7 +182,7 @@ impl Sup {
     #[allow(clippy::result_large_err)] // tonic::Status is what the handler returns
     pub fn admit(&self, peer: &LinkPeer, hello: &Hello) -> Result<Admission, tonic::Status> {
         use tonic::Status;
-        let fp = peer.cert.as_deref().ok_or_else(|| Status::unauthenticated("a client certificate is required (enroll with `opencode-node join`)"))?;
+        let fp = peer.cert.as_deref().ok_or_else(|| Status::unauthenticated("a client certificate is required (enroll with `moocher-node join`)"))?;
         let (cert_node, revoked, expires) = self.db.node_cert(fp).ok_or_else(|| Status::unauthenticated("unknown client certificate"))?;
         let deny = |why: String| {
             let key = format!("{}|{why}", hello.node);
@@ -213,7 +213,7 @@ impl Sup {
         let enrolled_role = NodeRole::parse(&role).unwrap_or_default();
         match status.as_str() {
             "approved" => {}
-            "pending" => return Err(Status::permission_denied(format!("node {cert_node} is awaiting operator approval (`ocl node approve {cert_node}`)"))),
+            "pending" => return Err(Status::permission_denied(format!("node {cert_node} is awaiting operator approval (`moo node approve {cert_node}`)"))),
             other => return Err(deny(format!("node {cert_node} is {other}"))),
         }
         // A node cannot dodge the relay allowlist by changing its own role.

@@ -4,10 +4,10 @@ use crate::nodes::Admission;
 use crate::state::Sup;
 use crate::tlslink::LinkPeer;
 use anyhow::{anyhow, bail, Result};
-use ocl_protocol::link::*;
-use ocl_protocol::model::*;
-use ocl_protocol::proto::node_link_server::NodeLink;
-use ocl_protocol::proto::{EnrollReply, EnrollRequest, Envelope, TunnelFrame};
+use moocher_protocol::link::*;
+use moocher_protocol::model::*;
+use moocher_protocol::proto::node_link_server::NodeLink;
+use moocher_protocol::proto::{EnrollReply, EnrollRequest, Envelope, TunnelFrame};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -158,7 +158,7 @@ impl NodeLink for LinkService {
                 if !relay_ok || !sup.nodes.connected(&relay) {
                     return Err(Status::unavailable(format!("relay node {relay} is not connected or does not relay")));
                 }
-                let id = ocl_protocol::new_id("t");
+                let id = moocher_protocol::new_id("t");
                 let (tx, rx) = mpsc::channel::<Result<TunnelFrame, Status>>(64);
                 sup.nodes.tunnels.lock().unwrap().insert(id.clone(), PendingTunnel { relay: relay.clone(), inbound, tx: tx.clone() });
                 tokio::spawn(async move {
@@ -227,7 +227,7 @@ impl NodeLink for LinkService {
         if hello.protocol != PROTOCOL_VERSION {
             return Err(Status::failed_precondition(format!("protocol {} unsupported (want {PROTOCOL_VERSION})", hello.protocol)));
         }
-        if !ocl_protocol::config::valid_name(&hello.node) {
+        if !moocher_protocol::config::valid_name(&hello.node) {
             return Err(Status::invalid_argument("bad node name"));
         }
         // Same-machine nodes use the 0600 unix socket (file permissions are the

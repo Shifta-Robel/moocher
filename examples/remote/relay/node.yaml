@@ -1,5 +1,5 @@
 # A machine that only lends its IP: no agents, no Podman needed. Its source
-# address must be in the hub's allowed sources (`ocl allow add <ip>`).
+# address must be in the hub's allowed sources (`moo allow add <ip>`).
 name: relay-de
 supervisor: https://hub.example.org:7443
 role: relay

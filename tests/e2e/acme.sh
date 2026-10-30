@@ -32,12 +32,12 @@ wait_for 20 "the dashboard is served with the issued certificate" curl -s --cace
 expect "issued by Pebble for localhost" bash -c "openssl x509 -in $W/hub/supervisor/acme/cert.pem -noout -issuer -ext subjectAltName | grep -q 'Pebble' && openssl x509 -in $W/hub/supervisor/acme/cert.pem -noout -ext subjectAltName | grep -q 'DNS:localhost'"
 expect "the account key and certificate key are private (0600)" bash -c "[ \"\$(stat -c %a $W/hub/supervisor/acme/key.pem)\" = 600 ] && [ \"\$(stat -c %a $W/hub/supervisor/acme/account.json)\" = 600 ]"
 expect "the HTTP-01 port redirects everything else to HTTPS" bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' -H 'Host: localhost' http://127.0.0.1:5002/instances)\" = '301 https://localhost/instances' ]"
-expect "audited" bash -c "OCL_URL=https://localhost:7700 OCL_CA_CERT=$S/pebble-root.pem $O audit --limit 20 | grep -q tls.certificate"
+expect "audited" bash -c "MOO_URL=https://localhost:7700 MOO_CA_CERT=$S/pebble-root.pem $O audit --limit 20 | grep -q tls.certificate"
 
 say "a restart reuses the cached certificate"
 SUM=$(sha256sum < "$W/hub/supervisor/acme/cert.pem")
 kill "${PIDS[2]}"; sleep 2
-"$BIN/ocl-supervisor" --config-dir "$W/hub" run > "$W/supervisor2.log" 2>&1 & PIDS+=($!)
+"$BIN/moocher-hub" --config-dir "$W/hub" run > "$W/supervisor2.log" 2>&1 & PIDS+=($!)
 wait_for 20 "serving again" curl -s --cacert "$S/pebble-root.pem" https://localhost:7700/healthz
 expect "no new order: the same certificate" bash -c "[ \"\$(sha256sum < $W/hub/supervisor/acme/cert.pem)\" = '$SUM' ] && grep -q 'loaded from cache' $W/supervisor2.log"
 

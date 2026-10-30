@@ -2,7 +2,7 @@
 # Phase 4 e2e: the web UI in a real browser (headless Chromium via Playwright):
 # login, overview, starting an instance, live updates, Open in OpenCode,
 # answering a question, the task board, adding a machine, dark mode and the
-# phone layout. Screenshots go to $OCL_E2E_DIR/shots.
+# phone layout. Screenshots go to $MOO_E2E_DIR/shots.
 # Needs PW_DIR (npm install playwright; npx playwright install chromium-headless-shell).
 source "$(dirname "$0")/lib.sh"
 : "${PW_DIR:?set PW_DIR to a directory with node_modules/playwright}"
@@ -16,7 +16,7 @@ mock_script qtop <<'JSON'
 JSON
 mock_prices qtop
 agent_yaml "$W/hub" qtop qtop
-echo "browser-test-password" | "$BIN/ocl-supervisor" --config-dir "$W/hub" user set admin >/dev/null
+echo "browser-test-password" | "$BIN/moocher-hub" --config-dir "$W/hub" user set admin >/dev/null
 wait_for 20 "agents loaded" bash -c "$O agents | grep -q qtop"
 Q=$(spawn_id qtop -p "start")
 mkdir -p "$S/shots"

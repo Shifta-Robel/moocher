@@ -1,4 +1,4 @@
-# Written by `opencode-node join` (name, supervisor) and extended by hand.
+# Written by `moocher-node join` (name, supervisor) and extended by hand.
 name: vps-fi
 supervisor: https://hub.example.org:7443
 max_sessions: 4

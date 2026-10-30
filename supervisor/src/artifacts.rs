@@ -7,10 +7,10 @@ use crate::state::Sup;
 use crate::tlslink::LinkPeer;
 use anyhow::{anyhow, bail, Result};
 use futures::{Stream, StreamExt};
-use ocl_protocol::api::StreamEvent;
-use ocl_protocol::model::*;
-use ocl_protocol::proto::blobs_server::Blobs;
-use ocl_protocol::proto::{BlobChunk, BlobGet, BlobPut};
+use moocher_protocol::api::StreamEvent;
+use moocher_protocol::model::*;
+use moocher_protocol::proto::blobs_server::Blobs;
+use moocher_protocol::proto::{BlobChunk, BlobGet, BlobPut};
 use serde::Deserialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -46,7 +46,7 @@ impl BlobStore {
     {
         let tmp_dir = self.root.join("tmp");
         tokio::fs::create_dir_all(&tmp_dir).await?;
-        let tmp = tmp_dir.join(ocl_protocol::new_id("up"));
+        let tmp = tmp_dir.join(moocher_protocol::new_id("up"));
         let mut f = tokio::fs::File::create(&tmp).await?;
         let mut h = blake3::Hasher::new();
         let mut n = 0u64;

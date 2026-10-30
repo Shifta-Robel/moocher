@@ -203,48 +203,48 @@ mod tests {
 
     const MI: &str = "\
 22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
-40 22 8:17 / /srv/ocl rw,noatime shared:20 - xfs /dev/sdb1 rw,attr2,inode64,logbufs=8,prjquota
+40 22 8:17 / /srv/moo rw,noatime shared:20 - xfs /dev/sdb1 rw,attr2,inode64,logbufs=8,prjquota
 41 22 8:33 / /srv/plain\\040xfs rw - xfs /dev/sdc1 rw,attr2,noquota
-42 22 0:45 /@data /var/lib/ocl rw shared:30 - btrfs /dev/sdd rw,space_cache=v2,subvolid=256,subvol=/@data
+42 22 0:45 /@data /var/lib/moo rw shared:30 - btrfs /dev/sdd rw,space_cache=v2,subvolid=256,subvol=/@data
 ";
 
     #[test]
     fn detects_the_filesystem_under_a_path() {
-        assert_eq!(detect_in(MI, Path::new("/srv/ocl/data/instances")), Some(Fs::Xfs { mount: "/srv/ocl".into(), prjquota: true }));
+        assert_eq!(detect_in(MI, Path::new("/srv/moo/data/instances")), Some(Fs::Xfs { mount: "/srv/moo".into(), prjquota: true }));
         assert_eq!(detect_in(MI, Path::new("/srv/plain xfs/d")), Some(Fs::Xfs { mount: "/srv/plain xfs".into(), prjquota: false }));
-        assert_eq!(detect_in(MI, Path::new("/var/lib/ocl/w")), Some(Fs::Btrfs { mount: "/var/lib/ocl".into() }));
+        assert_eq!(detect_in(MI, Path::new("/var/lib/moo/w")), Some(Fs::Btrfs { mount: "/var/lib/moo".into() }));
         assert!(matches!(detect_in(MI, Path::new("/home/x")), Some(Fs::Other { fstype, .. }) if fstype == "ext4"));
         assert!(check(&detect_in(MI, Path::new("/srv/plain xfs/d")).unwrap(), 0).unwrap_err().to_string().contains("prjquota"));
         assert!(check(&detect_in(MI, Path::new("/home")).unwrap(), 0).unwrap_err().to_string().contains("ext4"));
-        assert!(check(&detect_in(MI, Path::new("/srv/ocl")).unwrap(), 1000).unwrap_err().to_string().contains("root"));
-        assert!(check(&detect_in(MI, Path::new("/srv/ocl")).unwrap(), 0).is_ok());
+        assert!(check(&detect_in(MI, Path::new("/srv/moo")).unwrap(), 1000).unwrap_err().to_string().contains("root"));
+        assert!(check(&detect_in(MI, Path::new("/srv/moo")).unwrap(), 0).is_ok());
     }
 
     #[test]
     fn plans() {
-        let dirs = vec![PathBuf::from("/srv/ocl/data/instances/s-1/home"), PathBuf::from("/srv/ocl/data/workspaces/s-1")];
+        let dirs = vec![PathBuf::from("/srv/moo/data/instances/s-1/home"), PathBuf::from("/srv/moo/data/workspaces/s-1")];
         let id = quota_id("s-1");
         assert_eq!(id, quota_id("s-1"));
         assert_ne!(id, quota_id("s-2"));
         assert!(id >= 1_000_000);
-        let xfs = Fs::Xfs { mount: "/srv/ocl".into(), prjquota: true };
+        let xfs = Fs::Xfs { mount: "/srv/moo".into(), prjquota: true };
         let p = plan_apply(&xfs, &dirs, id, 5 << 30);
         assert_eq!(
             p,
             vec![
-                Step::Run(s(&["xfs_quota", "-x", "-c", &format!("project -s -p /srv/ocl/data/instances/s-1/home {id}"), "/srv/ocl"])),
-                Step::Run(s(&["xfs_quota", "-x", "-c", &format!("project -s -p /srv/ocl/data/workspaces/s-1 {id}"), "/srv/ocl"])),
-                Step::Run(s(&["xfs_quota", "-x", "-c", &format!("limit -p bhard=5368709120 {id}"), "/srv/ocl"])),
+                Step::Run(s(&["xfs_quota", "-x", "-c", &format!("project -s -p /srv/moo/data/instances/s-1/home {id}"), "/srv/moo"])),
+                Step::Run(s(&["xfs_quota", "-x", "-c", &format!("project -s -p /srv/moo/data/workspaces/s-1 {id}"), "/srv/moo"])),
+                Step::Run(s(&["xfs_quota", "-x", "-c", &format!("limit -p bhard=5368709120 {id}"), "/srv/moo"])),
             ]
         );
-        assert_eq!(plan_clear(&xfs, &dirs, id)[0], Step::Run(s(&["xfs_quota", "-x", "-c", &format!("limit -p bhard=0 {id}"), "/srv/ocl"])));
-        let b = Fs::Btrfs { mount: "/var/lib/ocl".into() };
+        assert_eq!(plan_clear(&xfs, &dirs, id)[0], Step::Run(s(&["xfs_quota", "-x", "-c", &format!("limit -p bhard=0 {id}"), "/srv/moo"])));
+        let b = Fs::Btrfs { mount: "/var/lib/moo".into() };
         let p = plan_apply(&b, &dirs, id, 1 << 30);
-        assert_eq!(p[0], Step::Run(s(&["btrfs", "quota", "enable", "/var/lib/ocl"])));
+        assert_eq!(p[0], Step::Run(s(&["btrfs", "quota", "enable", "/var/lib/moo"])));
         assert_eq!(p[1], Step::BtrfsSubvol(dirs[0].clone()));
-        assert_eq!(p[3], Step::Run(s(&["btrfs", "qgroup", "create", &format!("1/{id}"), "/var/lib/ocl"])));
-        assert_eq!(p[5], Step::BtrfsAssign { dir: dirs[1].clone(), qgroup: format!("1/{id}"), mount: "/var/lib/ocl".into() });
-        assert_eq!(p[6], Step::Run(s(&["btrfs", "qgroup", "limit", "1073741824", &format!("1/{id}"), "/var/lib/ocl"])));
+        assert_eq!(p[3], Step::Run(s(&["btrfs", "qgroup", "create", &format!("1/{id}"), "/var/lib/moo"])));
+        assert_eq!(p[5], Step::BtrfsAssign { dir: dirs[1].clone(), qgroup: format!("1/{id}"), mount: "/var/lib/moo".into() });
+        assert_eq!(p[6], Step::Run(s(&["btrfs", "qgroup", "limit", "1073741824", &format!("1/{id}"), "/var/lib/moo"])));
         assert!(plan_apply(&Fs::Other { mount: "/".into(), fstype: "ext4".into() }, &dirs, id, 1).is_empty());
     }
 }

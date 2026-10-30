@@ -1,14 +1,14 @@
-//! ocl-bridge — the only cluster code that runs inside an agent container.
+//! moo-bridge — the only cluster code that runs inside an agent container.
 //!
 //! Agent containers run with `--network=none`, so the container's loopback is
 //! the only network it has. The bridge relays between that loopback and Unix
-//! sockets bind-mounted from the host (`/run/ocl`), in both directions, and
+//! sockets bind-mounted from the host (`/run/moo`), in both directions, and
 //! then runs the given command (normally `opencode serve`) as its child:
 //!
 //! ```text
-//! ocl-bridge \
-//!   --fwd tcp:127.0.0.1:7777=unix:/run/ocl/node.sock \   # agent -> node gateway
-//!   --fwd unix:/run/ocl/oc.sock=tcp:127.0.0.1:4096 \     # node -> opencode serve
+//! moo-bridge \
+//!   --fwd tcp:127.0.0.1:7777=unix:/run/moo/node.sock \   # agent -> node gateway
+//!   --fwd unix:/run/moo/oc.sock=tcp:127.0.0.1:4096 \     # node -> opencode serve
 //!   -- opencode serve --port 4096 --hostname 127.0.0.1
 //! ```
 //!
@@ -60,7 +60,7 @@ async fn pipe(mut inbound: Box<dyn Stream>, target: Addr) {
         }
     }
     let Some(mut outbound) = outbound else {
-        eprintln!("ocl-bridge: target {target:?} unreachable");
+        eprintln!("moo-bridge: target {target:?} unreachable");
         return;
     };
     let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
@@ -91,7 +91,7 @@ async fn serve(listen: Addr, target: Addr) -> std::io::Result<()> {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: ocl-bridge [--fwd LISTEN=TARGET]... -- COMMAND [ARGS]...\n  LISTEN/TARGET: tcp:HOST:PORT | unix:PATH");
+    eprintln!("usage: moo-bridge [--fwd LISTEN=TARGET]... -- COMMAND [ARGS]...\n  LISTEN/TARGET: tcp:HOST:PORT | unix:PATH");
     ExitCode::from(2)
 }
 
@@ -108,7 +108,7 @@ async fn main() -> ExitCode {
                 match (Addr::parse(l), Addr::parse(t)) {
                     (Ok(l), Ok(t)) => fwds.push((l, t)),
                     (Err(e), _) | (_, Err(e)) => {
-                        eprintln!("ocl-bridge: {e}");
+                        eprintln!("moo-bridge: {e}");
                         return usage();
                     }
                 }
@@ -120,7 +120,7 @@ async fn main() -> ExitCode {
             }
             "-h" | "--help" => return usage(),
             other => {
-                eprintln!("ocl-bridge: unexpected argument {other:?}");
+                eprintln!("moo-bridge: unexpected argument {other:?}");
                 return usage();
             }
         }
@@ -129,7 +129,7 @@ async fn main() -> ExitCode {
     for (l, t) in fwds {
         tokio::spawn(async move {
             if let Err(e) = serve(l.clone(), t).await {
-                eprintln!("ocl-bridge: listener {l:?} failed: {e}");
+                eprintln!("moo-bridge: listener {l:?} failed: {e}");
                 std::process::exit(1);
             }
         });
@@ -144,7 +144,7 @@ async fn main() -> ExitCode {
     let mut child = match tokio::process::Command::new(&cmd[0]).args(&cmd[1..]).spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("ocl-bridge: cannot start {:?}: {e}", cmd[0]);
+            eprintln!("moo-bridge: cannot start {:?}: {e}", cmd[0]);
             return ExitCode::from(127);
         }
     };

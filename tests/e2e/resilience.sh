@@ -17,7 +17,7 @@ SID=$($O spawn builder --node worker-b -p "Write greet(name) in greet.py with py
 wait_for 60 "builder is running" bash -c "$O show $SID --json | grep -q '\"state\": \"running\"'"
 kill "$SUP_PID"; sleep 15
 expect_fail "supervisor is down" $O nodes
-"$BIN/ocl-supervisor" --config-dir "$W/hub" run >> "$W/supervisor.log" 2>&1 &
+"$BIN/moocher-hub" --config-dir "$W/hub" run >> "$W/supervisor.log" 2>&1 &
 PIDS+=($!)
 wait_for 70 "worker-b reconnects over mTLS after the restart" is_connected worker-b
 grep -c '"outbox":[1-9]' "$W/node-worker-b.log" >/dev/null && pass "the node buffered events while the hub was down" || fail "the node buffered events while the hub was down"

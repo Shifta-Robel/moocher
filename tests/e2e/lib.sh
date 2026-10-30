@@ -3,25 +3,25 @@
 # nodes are separate config dirs that enroll and talk mTLS to 127.0.0.1.
 #
 # Settings (environment):
-#   OCL_BIN            built binaries        (default: <repo>/target/debug)
-#   OCL_OPENCODE_BIN   opencode 1.19.x       (default: `opencode` on PATH)
-#   OCL_E2E_DIR        scratch directory     (default: /tmp/ocl-e2e). Keep it short:
+#   MOO_BIN            built binaries        (default: <repo>/target/debug)
+#   MOO_OPENCODE_BIN   opencode 1.19.x       (default: `opencode` on PATH)
+#   MOO_E2E_DIR        scratch directory     (default: /tmp/moo-e2e). Keep it short:
 #                      session sockets must fit in 107 bytes.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BIN=${OCL_BIN:-$REPO/target/debug}
-OC=${OCL_OPENCODE_BIN:-$(command -v opencode || true)}
-[ -x "$OC" ] || { echo "opencode not found: install opencode-ai@1.19.4 or set OCL_OPENCODE_BIN" >&2; exit 2; }
-S=${OCL_E2E_DIR:-/tmp/ocl-e2e}
+BIN=${MOO_BIN:-$REPO/target/debug}
+OC=${MOO_OPENCODE_BIN:-$(command -v opencode || true)}
+[ -x "$OC" ] || { echo "opencode not found: install opencode-ai@1.19.4 or set MOO_OPENCODE_BIN" >&2; exit 2; }
+S=${MOO_E2E_DIR:-/tmp/moo-e2e}
 mkdir -p "$S"
-export OCL_BRIDGE=$BIN/ocl-bridge
+export MOO_BRIDGE=$BIN/moo-bridge
 W=$S/work
-O="$BIN/ocl"
+O="$BIN/moo"
 PIDS=()
 cleanup() {
   # Stop live sessions through the API first, so their process trees go too
   # (stopping a node daemon leaves sessions running, by design).
-  if [ -n "${OCL_TOKEN:-}" ]; then
+  if [ -n "${MOO_TOKEN:-}" ]; then
     for s in $($O sessions --json 2>/dev/null | python3 -c 'import sys,json;[print(s["id"]) for s in json.load(sys.stdin) if s["state"] not in ("stopped","lost")]' 2>/dev/null); do
       $O stop "$s" >/dev/null 2>&1 || true
     done
@@ -88,23 +88,23 @@ EOF
   # shellcheck disable=SC2086
   python3 -I "$REPO/examples/mock-llm/mock_llm.py" --port 8099 --scripts "$W/scripts" --require-key "$MOCK_API_KEY" ${MOCK_ARGS:-} > "$W/mock.log" 2>&1 &
   PIDS+=($!)
-  "$BIN/ocl-supervisor" --config-dir "$W/hub" init > "$W/init.txt"
-  export OCL_TOKEN="$(cat "$W/hub/cli-token")"
-  "$BIN/ocl-supervisor" --config-dir "$W/hub" run > "$W/supervisor.log" 2>&1 &
+  "$BIN/moocher-hub" --config-dir "$W/hub" init > "$W/init.txt"
+  export MOO_TOKEN="$(cat "$W/hub/cli-token")"
+  "$BIN/moocher-hub" --config-dir "$W/hub" run > "$W/supervisor.log" 2>&1 &
   PIDS+=($!)
   sleep 1
-  "$BIN/opencode-node" --config-dir "$W/hub" run > "$W/node-hub.log" 2>&1 &
+  "$BIN/moocher-node" --config-dir "$W/hub" run > "$W/node-hub.log" 2>&1 &
   PIDS+=($!)
   sleep 2
 }
 
-# join_node NAME [--relay]: invite on the hub, `opencode-node join` in $W/NAME
+# join_node NAME [--relay]: invite on the hub, `moocher-node join` in $W/NAME
 join_node() {
   local name=$1; shift
   local cmd
   cmd=$($O node invite "$name" "$@" --json | python3 -c 'import sys,json;print(json.load(sys.stdin)["command"])')
   # shellcheck disable=SC2086
-  "$BIN/opencode-node" --config-dir "$W/$name" ${cmd#opencode-node }
+  "$BIN/moocher-node" --config-dir "$W/$name" ${cmd#moocher-node }
 }
 
 # make_worker NAME: after join, give the worker agents and a process runtime
@@ -123,7 +123,7 @@ PY
 }
 
 start_node() { # start_node NAME
-  "$BIN/opencode-node" --config-dir "$W/$1" run > "$W/node-$1.log" 2>&1 &
+  "$BIN/moocher-node" --config-dir "$W/$1" run > "$W/node-$1.log" 2>&1 &
   PIDS+=($!)
   eval "PID_$(echo "$1" | tr - _)=$!"
 }

@@ -7,9 +7,9 @@
 
 use crate::link::LinkHandle;
 use anyhow::{anyhow, bail, Context, Result};
-use ocl_protocol::model::*;
-use ocl_protocol::proto::blobs_client::BlobsClient;
-use ocl_protocol::proto::{BlobChunk, BlobGet};
+use moocher_protocol::model::*;
+use moocher_protocol::proto::blobs_client::BlobsClient;
+use moocher_protocol::proto::{BlobChunk, BlobGet};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,7 +41,7 @@ impl Cas {
     }
 
     pub fn tmp_path(&self, prefix: &str) -> PathBuf {
-        self.dir.join("tmp").join(ocl_protocol::new_id(prefix))
+        self.dir.join("tmp").join(moocher_protocol::new_id(prefix))
     }
 
     fn blob(&self, hash: &str) -> PathBuf {
@@ -58,7 +58,7 @@ impl Cas {
     pub async fn put(&self, file: &Path, info: PutInfo) -> Result<ArtifactMeta> {
         let (hash, size) = {
             let p = file.to_path_buf();
-            tokio::task::spawn_blocking(move || ocl_protocol::archive::hash_file(&p)).await??
+            tokio::task::spawn_blocking(move || moocher_protocol::archive::hash_file(&p)).await??
         };
         let cached = self.blob(&hash);
         if !cached.exists() {

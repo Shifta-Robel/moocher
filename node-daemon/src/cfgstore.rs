@@ -5,8 +5,8 @@
 //! apply to sessions started afterwards.
 
 use anyhow::{Context, Result};
-use ocl_protocol::config::*;
-use ocl_protocol::model::AgentInfo;
+use moocher_protocol::config::*;
+use moocher_protocol::model::AgentInfo;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

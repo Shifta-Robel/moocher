@@ -1,4 +1,4 @@
-# opencode-cluster — Usage guide
+# moocher — Usage guide
 
 Practical, copy-pasteable examples for every feature that exists today (Phases 1–5: hub, local and remote nodes, relays, quotas, templates, artifacts, questions, recovery from dead agents, harvesting, the web dashboard with login and HTTPS, Open in OpenCode, notifications, the TUI, usage metering, egress allowlists, housekeeping, hard disk limits, systemd units). Features from later phases are listed at the end. Enrolling machines and debugging them: [RUNBOOK.md](./RUNBOOK.md).
 
@@ -41,15 +41,15 @@ Contents:
 ## 1. Mental model in 60 seconds
 
 ```
-you ──ocl / curl──▶ ocl-supervisor (hub) ◀──gRPC── opencode-node (hub)  ──▶ podman: [ocl-bridge + opencode] × N
-                                          ◀──gRPC── opencode-node (more)  ──▶ …
+you ──moo / curl──▶ moocher-hub (hub) ◀──gRPC── moocher-node (hub)  ──▶ podman: [moo-bridge + opencode] × N
+                                          ◀──gRPC── moocher-node (more)  ──▶ …
 ```
 
 | Term | Meaning |
 |---|---|
 | **Agent (profile)** | A YAML file in `agents/`: model, key reference, role prompt, tool permissions, limits. It is a template. |
 | **Session** | One running OpenCode conversation spawned from a profile, in its own container. It has an id like `s-3f9a1c2b7d`. |
-| **Node** | A machine running `opencode-node`. The hub is a node too. |
+| **Node** | A machine running `moocher-node`. The hub is a node too. |
 | **Workflow** | A fixed sequence of steps (build → review), each a session, with pass/fail rules. |
 | **Task** | An item in your bucket. A *coordinator* session (the main agent) does it using other agents. |
 | **Todos** | Every agent keeps an OpenCode todo list. Its progress is how success is judged. |
@@ -62,24 +62,24 @@ Session states: `starting → idle ⇄ running`, plus `blocked` (waiting on a pe
 ## 2. One-time setup
 
 ```bash
-git clone <this repo> opencode-cluster && cd opencode-cluster
+git clone <this repo> moocher && cd moocher
 rustup target add x86_64-unknown-linux-musl
 cargo build --release
-cargo build --release -p ocl-bridge --target x86_64-unknown-linux-musl
-podman build -t localhost/ocl-agent:1.19.4 -f images/agent/Containerfile .
+cargo build --release -p moo-bridge --target x86_64-unknown-linux-musl
+podman build -t localhost/moocher-agent:1.19.4 -f images/agent/Containerfile .
 
 # Put binaries on PATH (or use target/release/… directly)
-sudo install -m755 target/release/{ocl,ocl-supervisor,opencode-node} /usr/local/bin/
-sudo install -m755 target/x86_64-unknown-linux-musl/release/ocl-bridge /usr/local/bin/
+sudo install -m755 target/release/{moo,moocher-hub,moocher-node} /usr/local/bin/
+sudo install -m755 target/x86_64-unknown-linux-musl/release/moo-bridge /usr/local/bin/
 
 # Start from the example config
-mkdir -p ~/.opencode-cluster && cp -r examples/quickstart/hub/* ~/.opencode-cluster/
+mkdir -p ~/.moocher && cp -r examples/quickstart/hub/* ~/.moocher/
 ```
 
 The hub's config directory now holds both halves:
 
 ```
-~/.opencode-cluster/
+~/.moocher/
   supervisor.yaml   node.yaml   providers.yaml
   agents/builder.yaml  agents/reviewer.yaml  agents/coordinator.yaml
   prompts/…            workflows/build-review.yaml
@@ -88,40 +88,40 @@ The hub's config directory now holds both halves:
 Initialise and start:
 
 ```bash
-ocl-supervisor init          # prints an admin token once; also saved to ~/.opencode-cluster/cli-token (0600)
-ocl-supervisor run &         # API on 127.0.0.1:7700, node socket /run/ocl/supervisor.sock
-opencode-node check          # validates agents, resolves secrets (never prints them)
-opencode-node run &          # the hub's own node
-ocl agents                   # READY=yes for every agent you expect
+moocher-hub init          # prints an admin token once; also saved to ~/.moocher/cli-token (0600)
+moocher-hub run &         # API on 127.0.0.1:7700, node socket /run/moo/supervisor.sock
+moocher-node check          # validates agents, resolves secrets (never prints them)
+moocher-node run &          # the hub's own node
+moo agents                   # READY=yes for every agent you expect
 ```
 
-`ocl` reads the token from `OCL_TOKEN`, or else `~/.opencode-cluster/cli-token`, and the server from `OCL_URL` (default `http://127.0.0.1:7700`). Add `--json` to any command for machine-readable output.
+`moo` reads the token from `MOO_TOKEN`, or else `~/.moocher/cli-token`, and the server from `MOO_URL` (default `http://127.0.0.1:7700`). Add `--json` to any command for machine-readable output.
 
-> If `/run` isn't writable for your user, set `runtime.run_dir` in `node.yaml` and `link_socket` in `supervisor.yaml` to e.g. `$XDG_RUNTIME_DIR/ocl`, and point `node.yaml: supervisor:` at the same socket.
+> If `/run` isn't writable for your user, set `runtime.run_dir` in `node.yaml` and `link_socket` in `supervisor.yaml` to e.g. `$XDG_RUNTIME_DIR/moo`, and point `node.yaml: supervisor:` at the same socket.
 
 ### A second node on the same machine
 
 Useful for testing placement, or for keeping two sets of keys apart:
 
 ```bash
-mkdir -p ~/ocl-worker-a/agents
-cp ~/.opencode-cluster/providers.yaml ~/ocl-worker-a/ && cp -r ~/.opencode-cluster/prompts ~/ocl-worker-a/
-cp ~/.opencode-cluster/agents/builder.yaml ~/ocl-worker-a/agents/
-cat > ~/ocl-worker-a/node.yaml <<'EOF'
+mkdir -p ~/moo-worker-a/agents
+cp ~/.moocher/providers.yaml ~/moo-worker-a/ && cp -r ~/.moocher/prompts ~/moo-worker-a/
+cp ~/.moocher/agents/builder.yaml ~/moo-worker-a/agents/
+cat > ~/moo-worker-a/node.yaml <<'EOF'
 name: worker-a
-supervisor: unix:///run/ocl/supervisor.sock
+supervisor: unix:///run/moo/supervisor.sock
 max_sessions: 4
-runtime: { run_dir: /run/ocl-worker-a }
+runtime: { run_dir: /run/moo-worker-a }
 EOF
-opencode-node --config-dir ~/ocl-worker-a run &
-ocl status        # two nodes, connected
+moocher-node --config-dir ~/moo-worker-a run &
+moo status        # two nodes, connected
 ```
 
 ---
 
 ## 3. Defining agents
 
-One file per agent in `agents/`. Changes are picked up automatically: limits, keys and routes apply immediately, and role, tools and container settings apply to the next session. Run `opencode-node check` after editing.
+One file per agent in `agents/`. Changes are picked up automatically: limits, keys and routes apply immediately, and role, tools and container settings apply to the next session. Run `moocher-node check` after editing.
 
 ### 3.1 BYOK coder on OpenRouter
 
@@ -142,7 +142,7 @@ container: { memory: 1500m, cpus: 2 }
 limits: { max_sessions: 2, budget_usd: 2.50, max_tokens: 2000000, wall_clock_secs: 3600 }
 ```
 
-`OPENROUTER_API_KEY` must be in **`opencode-node`'s** environment, not in your shell for `ocl`. With systemd, use credentials instead (§15):
+`OPENROUTER_API_KEY` must be in **`moocher-node`'s** environment, not in your shell for `moo`. With systemd, use credentials instead (§15):
 
 ```yaml
   key: { ref: "systemd-creds:openrouter" }
@@ -154,7 +154,7 @@ limits: { max_sessions: 2, budget_usd: 2.50, max_tokens: 2000000, wall_clock_sec
 # agents/reviewer-fast.yaml
 name: reviewer-fast
 description: Quick code review. Ends with VERDICT APPROVED or CHANGES_REQUESTED.
-provider: { id: groq, model: llama-4-maverick, key: { ref: "file:/etc/ocl/keys/groq" } }
+provider: { id: groq, model: llama-4-maverick, key: { ref: "file:/etc/moo/keys/groq" } }
 role: { system_prompt_file: prompts/reviewer.md }
 tools:
   edit: deny                         # reviewers read, they don't write
@@ -194,7 +194,7 @@ description: Drafts docs and READMEs.
 provider: { id: pollinations, model: openai }
 ```
 
-Keyless gateways are marked `best_effort` in `ocl agents`. Expect rate limits.
+Keyless gateways are marked `best_effort` in `moo agents`. Expect rate limits.
 
 ### 3.5 Your own provider (any OpenAI/Anthropic/Gemini-compatible endpoint)
 
@@ -244,11 +244,11 @@ The coordinator automatically gets extra tools (`cluster_spawn_agent`, `cluster_
 ### 3.7 Check what you defined
 
 ```bash
-opencode-node check
+moocher-node check
 #   ✓ agent coder            openrouter/qwen/qwen3-coder
 #   ✗ agent reviewer-fast    groq/llama-4-maverick  [secret does not resolve]
-ocl agents
-opencode-node schema --out ~/.opencode-cluster/schemas   # JSON Schemas for your editor
+moo agents
+moocher-node schema --out ~/.moocher/schemas   # JSON Schemas for your editor
 ```
 
 ---
@@ -257,20 +257,20 @@ opencode-node schema --out ~/.opencode-cluster/schemas   # JSON Schemas for your
 
 ```bash
 # Start a session (placed on any node that has the agent and capacity)
-ocl spawn coder -p "Add a --json flag to cli.py and tests for it" --title "json flag"
+moo spawn coder -p "Add a --json flag to cli.py and tests for it" --title "json flag"
 # s-81c2d0a3f4 on hub
 
-ocl spawn coder -p "…" --node worker-a          # pin to a node
-ocl spawn coder -p "…" --shared payments-api    # use a named shared workspace (§9)
+moo spawn coder -p "…" --node worker-a          # pin to a node
+moo spawn coder -p "…" --shared payments-api    # use a named shared workspace (§9)
 
-ocl sessions                 # live + recent (add --all for history)
-ocl show s-81c2d0a3f4        # state, model, workspace, tokens, cost, todos, last output
-ocl interrupt s-81c2d0a3f4   # abort the current step (session stays alive)
-ocl stop s-81c2d0a3f4        # stop and remove the container (workspace kept)
-ocl stop s-81c2d0a3f4 --rm-workspace   # isolated workspaces only
+moo sessions                 # live + recent (add --all for history)
+moo show s-81c2d0a3f4        # state, model, workspace, tokens, cost, todos, last output
+moo interrupt s-81c2d0a3f4   # abort the current step (session stays alive)
+moo stop s-81c2d0a3f4        # stop and remove the container (workspace kept)
+moo stop s-81c2d0a3f4 --rm-workspace   # isolated workspaces only
 ```
 
-Example `ocl show` output:
+Example `moo show` output:
 
 ```
 s-81c2d0a3f4 · agent coder · node hub · running
@@ -289,9 +289,9 @@ A session stays alive after its turn ends (`idle`), so you can keep talking to i
 ## 5. Messaging: queue, steer, inbox
 
 ```bash
-ocl send s-81c2 "Also handle the empty-input case."             # queue (default)
-ocl send s-81c2 "Stop — use argparse, not click." --steer       # steer
-ocl send s-81c2 "FYI: CI is red on main, not your fault." --inbox
+moo send s-81c2 "Also handle the empty-input case."             # queue (default)
+moo send s-81c2 "Stop — use argparse, not click." --steer       # steer
+moo send s-81c2 "FYI: CI is red on main, not your fault." --inbox
 ```
 
 | Mode | What happens | Use it for |
@@ -317,7 +317,7 @@ Every agent has these MCP tools (OpenCode shows them as `cluster_*`):
 Prompt pattern that works well:
 
 ```bash
-ocl spawn coder --title "api" -p "Implement the /orders endpoint. When done, send a
+moo spawn coder --title "api" -p "Implement the /orders endpoint. When done, send a
 message to session s-REVIEWER with cluster_send_message summarising what changed."
 ```
 
@@ -328,17 +328,17 @@ message to session s-REVIEWER with cluster_send_message summarising what changed
 Anything set to `ask` in an agent's `tools` pauses the session until you answer:
 
 ```bash
-ocl sessions
+moo sessions
 # s-81c2…  coder  hub  blocked  1/3  …  permission: bash ["rm -rf build"] (request per_7f…)
 
-ocl permit s-81c2d0a3f4 per_7f2c… once     # allow this one call
-ocl permit s-81c2d0a3f4 per_7f2c… always   # allow this pattern for the rest of the session
-ocl permit s-81c2d0a3f4 per_7f2c… reject   # the agent is told it was refused
+moo permit s-81c2d0a3f4 per_7f2c… once     # allow this one call
+moo permit s-81c2d0a3f4 per_7f2c… always   # allow this pattern for the rest of the session
+moo permit s-81c2d0a3f4 per_7f2c… reject   # the agent is told it was refused
 ```
 
 Tip: use `ask` as the default for `bash`, with an explicit `allow` list of safe commands. Most sessions then never block.
 
-Each permission request is also a **question** (§19): it goes to the agent that started the session first, then up the chain, and to you depending on the question mode. `ocl questions` shows it; `ocl answer <q-id> once|always|reject` answers it. Requests matching the vital rules (`rm -rf`, `deploy`, …) are `vital`.
+Each permission request is also a **question** (§19): it goes to the agent that started the session first, then up the chain, and to you depending on the question mode. `moo questions` shows it; `moo answer <q-id> once|always|reject` answers it. Requests matching the vital rules (`rm -rf`, `deploy`, …) are `vital`.
 
 ---
 
@@ -349,23 +349,23 @@ A workflow is a YAML file in the hub's `workflows/`. Each step spawns a session.
 ### 7.1 Run the bundled one
 
 ```bash
-ocl workflow ls
+moo workflow ls
 # build-review   Builder implements, reviewer approves or sends it back.  [build → review]
 
-ocl workflow run build-review "Write slugify(text) in slug.py with pytest tests"
+moo workflow run build-review "Write slugify(text) in slug.py with pytest tests"
 # run r-1a6a0a0485 started
 
-ocl workflow runs
+moo workflow runs
 # r-1a6a0a0485  build-review  Running  40s  build:Pass → review:…
-ocl workflow show r-1a6a0a0485 --json | jq '.steps[] | {step, verdict, check_results}'
-ocl workflow cancel r-1a6a0a0485
+moo workflow show r-1a6a0a0485 --json | jq '.steps[] | {step, verdict, check_results}'
+moo workflow cancel r-1a6a0a0485
 ```
 
 ### 7.2 A three-step plan → build → review with a fix-up loop
 
 ```yaml
 # workflows/feature.yaml
-apiVersion: ocl/v1
+apiVersion: moo/v1
 kind: Workflow
 name: feature
 description: Plan, implement, review; review failures go back to implementation.
@@ -404,7 +404,7 @@ steps:
 ```
 
 ```bash
-ocl workflow run feature "Rate-limit the /login endpoint to 5 attempts per minute per IP"
+moo workflow run feature "Rate-limit the /login endpoint to 5 attempts per minute per IP"
 ```
 
 How judging works for each step:
@@ -425,35 +425,35 @@ Write tasks into the bucket; the cluster works through them on its own.
 ### 8.1 Adding tasks
 
 ```bash
-ocl task add "Upgrade pydantic to v3 and fix breakages" --label when_free
-ocl task add "Prod: 500s on /checkout since 14:00" -b "Stack trace in logs/checkout.txt. Find and fix." --label urgent
-ocl task add "Write release notes for 2.4" --label on_demand
-ocl task add "Add pagination to /orders" -t workflow:feature --label when_free   # run a workflow instead
-ocl task add "Refresh docs" -t docs -t low-risk                                  # free-form tags
+moo task add "Upgrade pydantic to v3 and fix breakages" --label when_free
+moo task add "Prod: 500s on /checkout since 14:00" -b "Stack trace in logs/checkout.txt. Find and fix." --label urgent
+moo task add "Write release notes for 2.4" --label on_demand
+moo task add "Add pagination to /orders" -t workflow:feature --label when_free   # run a workflow instead
+moo task add "Refresh docs" -t docs -t low-risk                                  # free-form tags
 ```
 
 | Label | Starts… |
 |---|---|
 | `urgent` | immediately, when a task slot is free (one extra slot is reserved for urgent work) |
 | `when_free` | only when no task is running **and** all sessions have been idle for `idle_grace_secs` |
-| `on_demand` | only when you run `ocl task run <id>` |
+| `on_demand` | only when you run `moo task run <id>` |
 
 ### 8.2 Sorting and editing
 
 ```bash
-ocl task ls
+moo task ls
 #   ID STATUS     LABEL       RANK  TITLE
 #    2 running    urgent         2  Prod: 500s on /checkout since 14:00
 #    1 queued     when_free      1  Upgrade pydantic to v3 and fix breakages
 #    4 queued     when_free      4  Add pagination to /orders
 #    3 queued     on_demand      3  Write release notes for 2.4
 
-ocl task order 4 1                  # 4 first, then 1, then everything else as before
-ocl task edit 1 --label urgent      # promote
-ocl task edit 4 --body "Cursor-based, default page size 50"
-ocl task run 3                      # start an on_demand task now
-ocl task cancel 1                   # stops its coordinator and every agent it spawned
-ocl task rm 3                       # delete (not while running)
+moo task order 4 1                  # 4 first, then 1, then everything else as before
+moo task edit 1 --label urgent      # promote
+moo task edit 4 --body "Cursor-based, default page size 50"
+moo task run 3                      # start an on_demand task now
+moo task cancel 1                   # stops its coordinator and every agent it spawned
+moo task rm 3                       # delete (not while running)
 ```
 
 ### 8.3 What happens when a task starts
@@ -467,15 +467,15 @@ ocl task rm 3                       # delete (not while running)
 Watch it live:
 
 ```bash
-ocl task show 2 --json | jq '{status, coordinator_session, notes, result}'
-ocl events -f | grep -E 'task\.|turn_ended|spawn'
-ocl sessions          # children show the coordinator as their parent (in --json)
+moo task show 2 --json | jq '{status, coordinator_session, notes, result}'
+moo events -f | grep -E 'task\.|turn_ended|spawn'
+moo sessions          # children show the coordinator as their parent (in --json)
 ```
 
 Steer a running task the same way as any session:
 
 ```bash
-ocl send <coordinator-session> "Don't touch the payments module; open a TODO instead."
+moo send <coordinator-session> "Don't touch the payments module; open a TODO instead."
 ```
 
 ### 8.4 Tuning the scheduler (`supervisor.yaml`)
@@ -487,7 +487,7 @@ tasks:
   max_concurrent_tasks: 2
   idle_grace_secs: 120           # how quiet the cluster must be before when_free work starts
   max_nudges: 2
-  enabled: true                  # false = nothing starts unless you `ocl task run`
+  enabled: true                  # false = nothing starts unless you `moo task run`
 ```
 
 ---
@@ -503,21 +503,21 @@ tasks:
 
 ```bash
 # Two agents collaborating on one tree
-ocl spawn coder    --shared payments -p "Implement refunds in payments/refund.py"
-ocl spawn reviewer-fast --shared payments -p "Wait for a message, then review payments/refund.py"
+moo spawn coder    --shared payments -p "Implement refunds in payments/refund.py"
+moo spawn reviewer-fast --shared payments -p "Wait for a message, then review payments/refund.py"
 
 # Seed a shared workspace with an existing repo, then point agents at it
-git clone https://example.org/me/payments ~/.opencode-cluster/data/workspaces/shared-payments
+git clone https://example.org/me/payments ~/.moocher/data/workspaces/shared-payments
 # (rootful podman: sudo chown -R 1000:1000 that directory)
 
 # Grab results from the host side; no podman cp needed
-ls ~/.opencode-cluster/data/workspaces/shared-task-2/
+ls ~/.moocher/data/workspaces/shared-task-2/
 ```
 
 Shared workspaces have no locking. Tell agents (or the coordinator) who owns which files.
 
 **Across machines.** A shared workspace can be used by sessions on different nodes; each node has its own copy and the hub moves changes between them through the artifact store:
-- before a session starts on a node whose copy may be behind (it shows in `ocl show`: `placed: … workspace demo: synced from hub`);
+- before a session starts on a node whose copy may be behind (it shows in `moo show`: `placed: … workspace demo: synced from hub`);
 - after every turn, towards the other machines that have live sessions in it;
 - when an agent calls `cluster_sync_workspace`.
 
@@ -534,7 +534,7 @@ Per agent:
 ```yaml
 limits:
   max_sessions: 2          # concurrent sessions of this agent per node
-  budget_usd: 1.00         # per session; keyproxy then answers "[opencode-cluster] session budget $1.00 exhausted"
+  budget_usd: 1.00         # per session; keyproxy then answers "[moocher] session budget $1.00 exhausted"
   max_tokens: 500000       # per session
   wall_clock_secs: 1800    # aborts the session's work after 30 min
 container:
@@ -606,25 +606,25 @@ providers:
 ```
 
 ```bash
-ocl quotas kilo-free          # per-IP buckets: used/limit, left, RESETS IN 3h 24m, source (header/429/config/override)
-ocl ips                       # which nodes and sessions share each IP
-ocl quota set kilo-free --scope-id 203.0.113.7 --resets-at 03:15 --remaining 0   # you know better than the counters
-ocl route set vps-fi free-coder --prefer via-relay-de --failover direct          # live, kept in that node's overrides.yaml
+moo quotas kilo-free          # per-IP buckets: used/limit, left, RESETS IN 3h 24m, source (header/429/config/override)
+moo ips                       # which nodes and sessions share each IP
+moo quota set kilo-free --scope-id 203.0.113.7 --resets-at 03:15 --remaining 0   # you know better than the counters
+moo route set vps-fi free-coder --prefer via-relay-de --failover direct          # live, kept in that node's overrides.yaml
 ```
 
-When every route is used up, the session is `parked`, and `ocl status` shows the countdown. It resumes by itself after the reset. For BYOK accounts use `scope: account` (keys labelled with the same `account`) or `scope: key`. Their limits and resets are learned from the provider's rate-limit headers.
+When every route is used up, the session is `parked`, and `moo status` shows the countdown. It resumes by itself after the reset. For BYOK accounts use `scope: account` (keys labelled with the same `account`) or `scope: key`. Their limits and resets are learned from the provider's rate-limit headers.
 
 ---
 
 ## 11. Monitoring: status, events, metrics
 
 ```bash
-ocl status                       # nodes, sessions (state, todos, tokens, cost), tasks, totals
-ocl tui                          # dashboard in the terminal (or the web dashboard, §23)
-ocl events --limit 100           # recent event log
-ocl events -f                    # follow live
-ocl events -f --session s-81c2…  # one session: tool calls, state changes, turn ends
-ocl events --json | jq -c 'select(.kind=="run.verdict") | .data'
+moo status                       # nodes, sessions (state, todos, tokens, cost), tasks, totals
+moo tui                          # dashboard in the terminal (or the web dashboard, §23)
+moo events --limit 100           # recent event log
+moo events -f                    # follow live
+moo events -f --session s-81c2…  # one session: tool calls, state changes, turn ends
+moo events --json | jq -c 'select(.kind=="run.verdict") | .data'
 ```
 
 Event kinds you'll see:
@@ -638,16 +638,16 @@ Event kinds you'll see:
 ```yaml
 # prometheus.yml
 scrape_configs:
-  - job_name: opencode-cluster
-    authorization: { credentials_file: /etc/prometheus/ocl-token }   # a read-scope token (§13)
+  - job_name: moocher
+    authorization: { credentials_file: /etc/prometheus/moo-token }   # a read-scope token (§13)
     static_configs: [ { targets: ["127.0.0.1:7700"] } ]
 ```
 
-Metrics: `ocl_nodes_connected`, `ocl_sessions{state}`, `ocl_tokens_total{agent,kind}`, `ocl_cost_usd_total{agent}`, `ocl_tasks{status}`.
+Metrics: `moo_nodes_connected`, `moo_sessions{state}`, `moo_tokens_total{agent,kind}`, `moo_cost_usd_total{agent}`, `moo_tasks{status}`.
 
 Example queries:
-- `sum(ocl_cost_usd_total)`
-- `sum by (agent) (rate(ocl_tokens_total[1h]))`
+- `sum(moo_cost_usd_total)`
+- `sum by (agent) (rate(moo_tokens_total[1h]))`
 
 ---
 
@@ -657,7 +657,7 @@ All endpoints are under `/api/v1` and need `Authorization: Bearer <token>`. Muta
 
 ```bash
 API=http://127.0.0.1:7700/api/v1
-H="Authorization: Bearer $(cat ~/.opencode-cluster/cli-token)"
+H="Authorization: Bearer $(cat ~/.moocher/cli-token)"
 
 curl -s -H "$H" $API/overview | jq '.totals'
 curl -s -H "$H" $API/nodes | jq '.[] | {name, connected, agents: [.agents[].name]}'
@@ -693,7 +693,7 @@ curl -s -H "$H" -X POST $API/runs/r-1a6a0a0485/cancel
 # Event log (paged) and live stream (SSE)
 curl -s -H "$H" "$API/events?after=0&limit=200&session=s-81c2d0a3f4"
 curl -sN -H "$H" $API/stream          # data: {"type":"session"|"task"|"run"|"node"|"log", …}
-curl -sN "$API/stream?token=$(cat ~/.opencode-cluster/cli-token)"   # for EventSource clients
+curl -sN "$API/stream?token=$(cat ~/.moocher/cli-token)"   # for EventSource clients
 
 # Metrics, health
 curl -s -H "$H" http://127.0.0.1:7700/metrics
@@ -707,14 +707,14 @@ Errors come back as `{"error": "…"}` with 400, 401, 403 or 404.
 ## 13. Access tokens and the audit log
 
 ```bash
-ocl token create grafana --scope read       # dashboards, Prometheus
-ocl token create ci-bot --scope operate     # scripts that add tasks / spawn sessions
-ocl token create backup-admin --scope admin
-ocl token ls
-ocl token revoke ci-bot
+moo token create grafana --scope read       # dashboards, Prometheus
+moo token create ci-bot --scope operate     # scripts that add tasks / spawn sessions
+moo token create backup-admin --scope admin
+moo token ls
+moo token revoke ci-bot
 
 # Offline (supervisor stopped), e.g. if you lost the admin token:
-ocl-supervisor token create rescue --scope admin
+moocher-hub token create rescue --scope admin
 ```
 
 Each token is shown once and stored only as a hash.
@@ -722,12 +722,12 @@ Each token is shown once and stored only as a hash.
 Every control action is in a hash-chained audit log. The actor is `operator:<token>`, `session:<id>` for agent tool calls, or `system`.
 
 ```bash
-ocl audit --limit 20
+moo audit --limit 20
 # 22:00:13 operator:admin   session.spawn   s-e3a64da210  ok
 # 22:00:48 system           supervisor.stop -             ok
 # 22:02:25 operator:admin   session.spawn   -             FAILED
-ocl audit --verify            # {"ok": true, "entries": 66}
-ocl-supervisor audit-verify   # same, offline
+moo audit --verify            # {"ok": true, "entries": 66}
+moocher-hub audit-verify   # same, offline
 ```
 
 ---
@@ -737,9 +737,9 @@ ocl-supervisor audit-verify   # same, offline
 **Wait for a workflow run and fail CI if it didn't pass**
 
 ```bash
-RUN=$(ocl workflow run build-review "$REQUEST" --json | jq -r .id)
+RUN=$(moo workflow run build-review "$REQUEST" --json | jq -r .id)
 while :; do
-  ST=$(ocl workflow show "$RUN" --json | jq -r .status)
+  ST=$(moo workflow show "$RUN" --json | jq -r .status)
   [ "$ST" != running ] && break; sleep 10
 done
 echo "run $RUN: $ST"; [ "$ST" = passed ]
@@ -748,22 +748,22 @@ echo "run $RUN: $ST"; [ "$ST" = passed ]
 **Nightly maintenance tasks (cron)**
 
 ```cron
-0 1 * * *  OCL_TOKEN=ocl_… ocl task add "Update dependencies, run tests, summarise breakages" --label when_free
-30 1 * * 1 OCL_TOKEN=ocl_… ocl task add "Weekly: triage TODO comments into issues.md" --label when_free -t weekly
+0 1 * * *  MOO_TOKEN=moo_… moo task add "Update dependencies, run tests, summarise breakages" --label when_free
+30 1 * * 1 MOO_TOKEN=moo_… moo task add "Weekly: triage TODO comments into issues.md" --label when_free -t weekly
 ```
 
 **Turn a TODO file into tasks**
 
 ```bash
 grep -E '^- \[ \]' TODO.md | sed 's/^- \[ \] //' | while read -r line; do
-  ocl task add "$line" --label when_free
+  moo task add "$line" --label when_free
 done
 ```
 
 **Spend report per agent (today)**
 
 ```bash
-ocl sessions --all --json | jq -r --argjson since $(( $(date -d today +%s) * 1000 )) '
+moo sessions --all --json | jq -r --argjson since $(( $(date -d today +%s) * 1000 )) '
   map(select(.started_at >= $since)) | group_by(.agent)[]
   | "\(.[0].agent)\t\(map(.tokens.input + .tokens.output) | add) tok\t$\(map(.tokens.cost_usd) | add)"'
 ```
@@ -771,14 +771,14 @@ ocl sessions --all --json | jq -r --argjson since $(( $(date -d today +%s) * 100
 **Stop every idle session older than an hour**
 
 ```bash
-ocl sessions --json | jq -r --argjson cut $(( ($(date +%s) - 3600) * 1000 )) \
-  '.[] | select(.state=="idle" and .updated_at < $cut) | .id' | xargs -rn1 ocl stop
+moo sessions --json | jq -r --argjson cut $(( ($(date +%s) - 3600) * 1000 )) \
+  '.[] | select(.state=="idle" and .updated_at < $cut) | .id' | xargs -rn1 moo stop
 ```
 
 **Alert when something gets blocked**
 
 ```bash
-ocl events -f --json | jq --unbuffered -c 'select(.kind=="permission.asked")' |
+moo events -f --json | jq --unbuffered -c 'select(.kind=="permission.asked")' |
 while read -r ev; do notify-send "agent needs permission" "$ev"; done
 ```
 
@@ -790,28 +790,28 @@ Ready-made units are in `deploy/`; `tests/deploy-check.sh` runs `systemd-analyze
 
 | File | What |
 |---|---|
-| `deploy/systemd/ocl-supervisor.service` | The hub, as user `ocl`, config and state in `/var/lib/ocl/hub`, link socket in `/run/ocl-hub`. Fully sandboxed (`systemd-analyze security`: 1.6, "OK"); only `CAP_NET_BIND_SERVICE` for ports 80/443. |
-| `deploy/systemd/opencode-node.service` | A node with rootful Podman, config in `/etc/ocl/node`. Lighter sandbox (Podman needs mounts and namespaces; the agents' sandbox is their container). `KillMode=process`: agent containers survive a restart of the daemon and are re-adopted. |
-| `deploy/systemd/opencode-node.user.service` | A node with rootless Podman as a user service (`loginctl enable-linger`). |
-| `deploy/quadlet/ocl-supervisor.container` + `images/supervisor/Containerfile` | The hub as a Podman Quadlet: read-only root, no capabilities, uid 10001. |
+| `deploy/systemd/moocher-hub.service` | The hub, as user `moo`, config and state in `/var/lib/moo/hub`, link socket in `/run/moo-hub`. Fully sandboxed (`systemd-analyze security`: 1.6, "OK"); only `CAP_NET_BIND_SERVICE` for ports 80/443. |
+| `deploy/systemd/moocher-node.service` | A node with rootful Podman, config in `/etc/moo/node`. Lighter sandbox (Podman needs mounts and namespaces; the agents' sandbox is their container). `KillMode=process`: agent containers survive a restart of the daemon and are re-adopted. |
+| `deploy/systemd/moocher-node.user.service` | A node with rootless Podman as a user service (`loginctl enable-linger`). |
+| `deploy/quadlet/moocher-hub.container` + `images/supervisor/Containerfile` | The hub as a Podman Quadlet: read-only root, no capabilities, uid 10001. |
 
 ```bash
-sudo useradd --system --home-dir /var/lib/ocl --shell /usr/sbin/nologin ocl
-sudo install -m 0644 deploy/systemd/ocl-supervisor.service deploy/systemd/opencode-node.service /etc/systemd/system/
-# supervisor.yaml in /var/lib/ocl/hub:  link_socket: /run/ocl-hub/link.sock
-# node.yaml in /etc/ocl/node:           supervisor: unix:///run/ocl-hub/link.sock
-sudo systemctl daemon-reload && sudo systemctl enable --now ocl-supervisor opencode-node
+sudo useradd --system --home-dir /var/lib/moo --shell /usr/sbin/nologin moo
+sudo install -m 0644 deploy/systemd/moocher-hub.service deploy/systemd/moocher-node.service /etc/systemd/system/
+# supervisor.yaml in /var/lib/moo/hub:  link_socket: /run/moo-hub/link.sock
+# node.yaml in /etc/moo/node:           supervisor: unix:///run/moo-hub/link.sock
+sudo systemctl daemon-reload && sudo systemctl enable --now moocher-hub moocher-node
 ```
 
 Provider keys as encrypted credentials, referenced in agents as `systemd-creds:<name>`:
 
 ```bash
-sudo systemd-creds encrypt --name=openrouter - /etc/ocl/creds/openrouter.cred   # paste key, Ctrl-D
-sudo systemctl edit opencode-node     # add: [Service] LoadCredentialEncrypted=openrouter:/etc/ocl/creds/openrouter.cred
-journalctl -u opencode-node -o cat | jq -r '.fields.message'      # logs are JSON
+sudo systemd-creds encrypt --name=openrouter - /etc/moo/creds/openrouter.cred   # paste key, Ctrl-D
+sudo systemctl edit moocher-node     # add: [Service] LoadCredentialEncrypted=openrouter:/etc/moo/creds/openrouter.cred
+journalctl -u moocher-node -o cat | jq -r '.fields.message'      # logs are JSON
 ```
 
-`OCL_LOG=debug` (or e.g. `OCL_LOG=info,opencode_node::manager=debug`) raises verbosity.
+`MOO_LOG=debug` (or e.g. `MOO_LOG=info,moocher_node::manager=debug`) raises verbosity.
 
 ---
 
@@ -821,7 +821,7 @@ journalctl -u opencode-node -o cat | jq -r '.fields.message'      # logs are JSO
 
 ```bash
 python3 examples/mock-llm/mock_llm.py --port 8099 --require-key test-key &
-export MOCK_API_KEY=test-key     # for opencode-node; proves keyproxy injects the real key
+export MOCK_API_KEY=test-key     # for moocher-node; proves keyproxy injects the real key
 ```
 
 ```json
@@ -858,12 +858,12 @@ The whole demo is `examples/quickstart/run-local.sh --with-worker [--keep]`.
 | Node daemon restarts | Nothing. | It re-attaches to its running containers, restarts stopped ones, and resyncs each session from OpenCode's history. |
 | Machine reboot | Start both services. | Stopped containers are restarted and sessions continue from their saved OpenCode state. |
 | Session shows `unreachable` | Check the node. | After `disconnect_grace_secs` (default 600) it becomes `lost`, which counts as a death: see §21. |
-| Session shows `lost` or `dead` | `ocl halts`, then `ocl recover <halt> restart|resume_elsewhere|handoff|abandon`. | The cheapest recovery may already have run by itself (§21). |
-| Task shows `halted` | `ocl halts` shows the options with their costs; `ocl recover <h-id> <option>` resumes everything. | Halted sessions keep their containers until then. |
-| Stuck in `starting` > 2 min | `podman logs ocl-<session>`; OpenCode log under `data/instances/<session>/home/.local/share/opencode/log/` | — |
-| `[opencode-cluster] …` error in a session | It came from keyproxy: budget, token cap, model allowlist or missing secret. Check `opencode-node check`. | — |
+| Session shows `lost` or `dead` | `moo halts`, then `moo recover <halt> restart|resume_elsewhere|handoff|abandon`. | The cheapest recovery may already have run by itself (§21). |
+| Task shows `halted` | `moo halts` shows the options with their costs; `moo recover <h-id> <option>` resumes everything. | Halted sessions keep their containers until then. |
+| Stuck in `starting` > 2 min | `podman logs moo-<session>`; OpenCode log under `data/instances/<session>/home/.local/share/opencode/log/` | — |
+| `[moocher] …` error in a session | It came from keyproxy: budget, token cap, model allowlist or missing secret. Check `moocher-node check`. | — |
 
-Where data lives (default `~/.opencode-cluster`):
+Where data lives (default `~/.moocher`):
 
 ```
 supervisor/supervisor.db      sessions, tasks, runs, events, audit, API token hashes (back this up)
@@ -878,9 +878,9 @@ cli-token                     admin token from `init` (0600) — move it somewhe
 Clean-up:
 
 ```bash
-podman ps -a --filter label=ocl.session            # every agent container
-ocl sessions --json | jq -r '.[] | select(.state=="idle") | .id' | xargs -rn1 ocl stop
-sqlite3 ~/.opencode-cluster/supervisor/supervisor.db "DELETE FROM events WHERE ts < strftime('%s','now','-30 days')*1000"
+podman ps -a --filter label=moo.session            # every agent container
+moo sessions --json | jq -r '.[] | select(.state=="idle") | .id' | xargs -rn1 moo stop
+sqlite3 ~/.moocher/supervisor/supervisor.db "DELETE FROM events WHERE ts < strftime('%s','now','-30 days')*1000"
 ```
 
 Upgrading OpenCode: bump `OPENCODE_VERSION` in `images/agent/Containerfile`, rebuild the image, regenerate `node-daemon/tests/fixtures/opencode-<ver>-paths.json` from the new server's `/doc`, and run `cargo test`. The test fails if an endpoint we rely on disappeared.
@@ -904,9 +904,9 @@ secrets:
 ```
 
 ```bash
-ocl templates                                   # where each template can run, and why not elsewhere
-ocl spawn coder --append "Focus on the parser" --budget 2 --route via-relay-de
-ocl show <session> --preamble                   # the rendered instructions it started with
+moo templates                                   # where each template can run, and why not elsewhere
+moo spawn coder --append "Focus on the parser" --budget 2 --route via-relay-de
+moo show <session> --preamble                   # the rendered instructions it started with
 ```
 
 Coordinators get the same through `cluster_spawn_agent` (`role_append`, `budget_usd`, `route`), and `cluster_list_nodes` lets them choose a machine.
@@ -934,26 +934,26 @@ Agents ask in two ways:
 Importance is set by the asker; **rules only raise it**. Mentions of money, credentials, deleting data, irreversible or external actions make it `vital` (`questions.vital_keywords`). Questions about passwords, secrets or keys are **operator-only**: no agent may answer them, whatever the mode.
 
 ```bash
-ocl questions                          # open ones: importance, then how many wait on it, then age
+moo questions                          # open ones: importance, then how many wait on it, then age
 # q-3f2a…  vital  open  ask  blocked 2  1m  on worker-a task #3
 #     May I delete the old data directory?
 #     chain: builder s-81c2… → s-77ab… → operator   held by operator
 #     note (s-77ab…): the coordinator does not know whether it is still used
 #     raised to vital: mentions "delete"
-ocl answer q-3f2a… "Yes, it was migrated last week"
-ocl answer q-3f2a… --choice 2          # pick an option
-ocl answer q-3f2a… --decide            # "let the agent decide" (logged as an assumption)
-ocl answer q-3f2a… --reject
+moo answer q-3f2a… "Yes, it was migrated last week"
+moo answer q-3f2a… --choice 2          # pick an option
+moo answer q-3f2a… --decide            # "let the agent decide" (logged as an assumption)
+moo answer q-3f2a… --reject
 
-ocl questions mode                     # cluster mode and per-task modes
-ocl questions mode vital_only          # switch live
-ocl questions mode autonomous --task 7 # or for one task (also: ocl task add … --question-mode …)
-ocl assumptions [--task 7]             # decisions made without you, for review
+moo questions mode                     # cluster mode and per-task modes
+moo questions mode vital_only          # switch live
+moo questions mode autonomous --task 7 # or for one task (also: moo task add … --question-mode …)
+moo assumptions [--task 7]             # decisions made without you, for review
 ```
 
-**Budgets:** when keyproxy refuses a call because a session's `budget_usd` is used up, you get a `vital` operator-only question: `ocl answer q-… "raise 2.50"` raises it live, `stop` stops the session (its outputs are harvested).
+**Budgets:** when keyproxy refuses a call because a session's `budget_usd` is used up, you get a `vital` operator-only question: `moo answer q-… "raise 2.50"` raises it live, `stop` stops the session (its outputs are harvested).
 
-**Upward reports:** `cluster_report_up(message)` sends a status report to the parent, or for a top-level agent, to the task notes and the notification centre (`ocl notifications`).
+**Upward reports:** `cluster_report_up(message)` sends a status report to the parent, or for a top-level agent, to the task notes and the notification centre (`moo notifications`).
 
 Questions are also in `GET /api/v1/questions` (and on the SSE stream), answered with `POST /api/v1/questions/{id}/answer`.
 
@@ -964,11 +964,11 @@ Questions are also in `GET /api/v1/questions` (and on the SSE stream), answered 
 Content-addressed files and directory trees, stored on the hub (`art://b3/<hash>`). Identical content has the same reference. Metadata records who made it, on which node, for which task, and **lineage**: the artifacts it was made from.
 
 ```bash
-ocl artifact put report.pdf --tag release
-ocl artifact put ./build-output --name build-42      # a directory becomes a tree (tar.zst)
-ocl artifact ls [text] [--task 3]
-ocl artifact show art://b3/9f2c…                      # metadata, parents ("from") and children ("used by")
-ocl artifact get art://b3/9f2c… -o out/               # a tree is unpacked into the directory
+moo artifact put report.pdf --tag release
+moo artifact put ./build-output --name build-42      # a directory becomes a tree (tar.zst)
+moo artifact ls [text] [--task 3]
+moo artifact show art://b3/9f2c…                      # metadata, parents ("from") and children ("used by")
+moo artifact get art://b3/9f2c… -o out/               # a tree is unpacked into the directory
 ```
 
 **Agents** use:
@@ -976,7 +976,7 @@ ocl artifact get art://b3/9f2c… -o out/               # a tree is unpacked int
 - `cluster_artifact_get(ref, path?)` puts it into their workspace;
 - `cluster_artifact_list` and `cluster_artifact_info`.
 
-Whatever an agent publishes lists the artifacts it fetched before as parents, so `ocl artifact show` traces where a result came from.
+Whatever an agent publishes lists the artifacts it fetched before as parents, so `moo artifact show` traces where a result came from.
 
 Bytes move on their own gRPC stream to and from the hub (never node to node). Each node caches blobs (`artifact_cache`, default 2 GB), so a second fetch on the same node does not download again. Links in a workspace are never followed or packed.
 
@@ -1008,7 +1008,7 @@ The cheapest option runs **automatically** once (`on_death.auto_retry`), if it c
 You get a `vital` notification with the reason, what it was doing, the spend and the priced options:
 
 ```bash
-ocl halts
+moo halts
 # h-2e1c…  open  task:3  s-81c2… died (exit:137)  spent $0.4120  2m
 #     was doing: write tests
 #     halted: s-77ab…, s-90fe…
@@ -1016,9 +1016,9 @@ ocl halts
 #     * resume_elsewhere  ~$0.0310   on hub (best placement); workspace: snapshot taken now from the dead instance's volume
 #     * handoff           ~$0.2060   parent s-77ab… spawns a replacement with its own summary
 #     * abandon           ~$0.0000   give up: the step/task fails with the death reason
-ocl recover h-2e1c… restart                     # one call resumes the whole tree
-ocl recover h-2e1c… resume_elsewhere --node hub
-ocl recover s-81c2… restart                     # a dead session without a halt
+moo recover h-2e1c… restart                     # one call resumes the whole tree
+moo recover h-2e1c… resume_elsewhere --node hub
+moo recover s-81c2… restart                     # a dead session without a halt
 ```
 
 **Checkpoints:** every `checkpoint_every_turns` (default 3) finished turns, a node sends a snapshot of the workspace and the transcript to the hub. If a machine is lost, the replacement starts from there. The harvest record says that anything written after the checkpoint is unrecoverable. If the lost machine comes back later, its old instance of a replaced session is stopped.
@@ -1038,7 +1038,7 @@ retain: on_failure
 ```
 
 ```bash
-ocl harvests --session s-81c2…
+moo harvests --session s-81c2…
 # 14:02:11 s-81c2… on worker-a (stop)
 #     report.md      art://b3/77e1…   812B → parent_workspace isolated:s-77ab… on hub: from-builder/report.md
 #     dist/*.whl     art://b3/1c4d…  2048B → artifact
@@ -1046,7 +1046,7 @@ ocl harvests --session s-81c2…
 #     transcript art://b3/a09b…
 ```
 
-The lifecycle is `running → stopping → harvesting → stopped → reaped`. After the harvest, the capability token stops working (the instance's gateway is gone). `retain:` decides when the OpenCode home and isolated workspace are removed (default 24 h); `ocl stop --rm-workspace` removes them at once.
+The lifecycle is `running → stopping → harvesting → stopped → reaped`. After the harvest, the capability token stops working (the instance's gateway is gone). `retain:` decides when the OpenCode home and isolated workspace are removed (default 24 h); `moo stop --rm-workspace` removes them at once.
 
 ---
 
@@ -1055,10 +1055,10 @@ The lifecycle is `running → stopping → harvesting → stopped → reaped`. A
 The supervisor serves the dashboard itself (no separate web server): open `http://127.0.0.1:7700` on the hub, or your domain once HTTPS is set up (§24).
 
 ```bash
-ocl-supervisor user set admin                 # asks for a password (≥ 10 characters)
-ocl-supervisor user set alice --scope operate # read | operate | admin, as for API tokens
-ocl-supervisor user totp admin                # authenticator-app codes (prints the secret / otpauth:// URI)
-ocl-supervisor user list
+moocher-hub user set admin                 # asks for a password (≥ 10 characters)
+moocher-hub user set alice --scope operate # read | operate | admin, as for API tokens
+moocher-hub user totp admin                # authenticator-app codes (prints the secret / otpauth:// URI)
+moocher-hub user list
 ```
 
 **Views:**
@@ -1100,7 +1100,7 @@ Point your domain's DNS record at the hub (the only DNS needed), open ports 80 a
 api_listen: 0.0.0.0:443
 tls:
   acme:
-    domains: [ocl.example.org]
+    domains: [moo.example.org]
     email: you@example.org
     http01_listen: 0.0.0.0:80      # challenges; everything else redirects to https
 attach_listen: 0.0.0.0:7444        # Open in OpenCode (§25), same certificate
@@ -1111,11 +1111,11 @@ attach_listen: 0.0.0.0:7444        # Open in OpenCode (§25), same certificate
 - **Renewal:** it renews 30 days before expiry and is swapped in without a restart.
 - **Ports below 1024:** binding them needs `CAP_NET_BIND_SERVICE` (`AmbientCapabilities=CAP_NET_BIND_SERVICE` in the unit) or root.
 
-**Your own certificate:** `tls: { cert_file: /etc/ocl/fullchain.pem, key_file: /etc/ocl/key.pem }`. Replacing the files is picked up within a minute. It must be a server certificate: a self-signed certificate that is its own CA is rejected by rustls-based clients. Use a small private CA or mkcert, and give the CLI `OCL_CA_CERT=/path/ca.pem`.
+**Your own certificate:** `tls: { cert_file: /etc/moo/fullchain.pem, key_file: /etc/moo/key.pem }`. Replacing the files is picked up within a minute. It must be a server certificate: a self-signed certificate that is its own CA is rejected by rustls-based clients. Use a small private CA or mkcert, and give the CLI `MOO_CA_CERT=/path/ca.pem`.
 
 **Behind Caddy or nginx:** keep `api_listen` on loopback, set `trusted_proxies: [127.0.0.1]` (so lockouts see the real client IP and cookies get `Secure`), and proxy both the dashboard port and the attach port.
 
-`ocl` talks to HTTPS with `OCL_URL=https://ocl.example.org`.
+`moo` talks to HTTPS with `MOO_URL=https://moo.example.org`.
 
 ---
 
@@ -1135,8 +1135,8 @@ attach_listen: 0.0.0.0:7444        # Open in OpenCode (§25), same certificate
 In a terminal:
 
 ```bash
-ocl attach s-81c2…                  # runs `opencode attach` against a local proxy that adds the cookie
-ocl attach s-81c2… --no-launch      # just prints the local address (e.g. for a second terminal)
+moo attach s-81c2…                  # runs `opencode attach` against a local proxy that adds the cookie
+moo attach s-81c2… --no-launch      # just prints the local address (e.g. for a second terminal)
 ```
 
 ---
@@ -1154,7 +1154,7 @@ Everything appears in the notification centre (bell, with an unread count). What
   notifications:
     ntfy: { url: https://ntfy.sh/my-private-topic, token: "env:NTFY_TOKEN" }
   ```
-- **Webhook:** set `webhook: { url: …, secret: "file:/etc/ocl/hook" }`. It POSTs JSON `{title, body, kind, severity, target, id, ts}`, signed with `X-OCL-Signature: sha256=…`.
+- **Webhook:** set `webhook: { url: …, secret: "file:/etc/moo/hook" }`. It POSTs JSON `{title, body, kind, severity, target, id, ts}`, signed with `X-Moo-Signature: sha256=…`.
 - **Rules:** `rules: [{ kinds: ["question.*", "task.halted"], min_severity: info, channels: [push] }]`. Event kinds are listed in CONFIG.md.
 - **Test:** **Send a test** on the Notifications page, or `curl -X POST …/api/v1/notifications/test`.
 
@@ -1175,13 +1175,13 @@ What triggers them:
 ## 27. The terminal dashboard
 
 ```bash
-ocl tui
+moo tui
 ```
 
 - **Views:** instances, questions, halts with tasks, and nodes. Switch with `1`–`4` or Tab.
 - **Keys:** ↑/↓ select, Enter shows details, `a` answers a question, `m` messages an instance, `x` stops it, `r` recovers a halt (cheapest option), `q` quits.
 - **Refresh:** every 2 s.
-- **Remote use:** it works over SSH with the same API token as `ocl`.
+- **Remote use:** it works over SSH with the same API token as `moo`.
 
 ---
 
@@ -1195,7 +1195,7 @@ OpenCode reports its tokens from inside the container, where the agent also has 
 
 For OpenAI-compatible streams, keyproxy adds `stream_options.include_usage` when the request lacks it.
 
-- `ocl show <id>` prints the metered count when it differs. The dashboard shows the larger of the two counts as the session's tokens and cost, and so do `ocl sessions`, stats and recovery cost estimates.
+- `moo show <id>` prints the metered count when it differs. The dashboard shows the larger of the two counts as the session's tokens and cost, and so do `moo sessions`, stats and recovery cost estimates.
 - `budget_usd` and `max_tokens` are enforced on the larger count. A call made around OpenCode with `curl` and the token still runs into the budget.
 - When the meter is ahead of OpenCode by more than 25% and 2000 tokens, the session raises `usage.mismatch`, a warning notification, once.
 
@@ -1221,10 +1221,10 @@ Every hour the hub:
 - **Expires artifacts** older than `artifacts.retain` (off by default). Artifacts tagged `keep` are spared, and so is anything still referenced: live sessions, open tasks and runs, open halts, checkpoints, shared workspaces, and `art://b3/…` in config files such as an agent's `workspace.seed`.
 
 ```bash
-ocl housekeeping --dry-run --ahead 1d       # what tomorrow's run would do, changing nothing
-ocl housekeeping                             # run now (admin; audited)
-zstdcat ~/.opencode-cluster/supervisor/exports/events-20261024.jsonl.zst | jq -c 'select(.kind=="session.dead")'
-ocl-supervisor events-cat …/events-20261024.jsonl.zst     # the same without zstd installed
+moo housekeeping --dry-run --ahead 1d       # what tomorrow's run would do, changing nothing
+moo housekeeping                             # run now (admin; audited)
+zstdcat ~/.moocher/supervisor/exports/events-20261024.jsonl.zst | jq -c 'select(.kind=="session.dead")'
+moocher-hub events-cat …/events-20261024.jsonl.zst     # the same without zstd installed
 ```
 
 ## 31. Hard disk limits

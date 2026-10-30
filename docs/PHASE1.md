@@ -6,12 +6,12 @@ Status: **done and verified end to end** on 2026-10-22, on Ubuntu 24.04 with Pod
 
 | Piece | Where | Notes |
 |---|---|---|
-| Config store + schema | `shared-protocol/src/config.rs`, `node-daemon/src/cfgstore.rs` | Per-agent YAML under `agents/`, plus `node.yaml`, `providers.yaml`, `routes.yaml`, `supervisor.yaml` and `workflows/`. Hot reload with a debounced watch; a broken file keeps the last good config. JSON Schemas via `opencode-node schema`. |
-| `ocl-bridge` | `bridge/` | 1.2 MB static binary and the container entrypoint. UDS⇄TCP both ways, forwards signals. |
+| Config store + schema | `shared-protocol/src/config.rs`, `node-daemon/src/cfgstore.rs` | Per-agent YAML under `agents/`, plus `node.yaml`, `providers.yaml`, `routes.yaml`, `supervisor.yaml` and `workflows/`. Hot reload with a debounced watch; a broken file keeps the last good config. JSON Schemas via `moocher-node schema`. |
+| `moo-bridge` | `bridge/` | 1.2 MB static binary and the container entrypoint. UDS⇄TCP both ways, forwards signals. |
 | Agent image | `images/agent/Containerfile` | OpenCode 1.19.4 from npm, plus bridge, git, python3 and pytest. 421 MB. |
-| `opencode-node` | `node-daemon/` | Podman runtime (plus `process` runtime for dev), OpenCode client, event handling, keyproxy, cluster MCP, outbox, reconcile, wall-clock limits. |
-| `ocl-supervisor` | `supervisor/` | SQLite state, gRPC node link (unix socket), REST + SSE API with scoped tokens, audit chain, workflows, task bucket + coordinator, `/metrics`. |
-| `ocl` CLI | `cli/` | Every API action, `--json` on all commands, `events -f` live. |
+| `moocher-node` | `node-daemon/` | Podman runtime (plus `process` runtime for dev), OpenCode client, event handling, keyproxy, cluster MCP, outbox, reconcile, wall-clock limits. |
+| `moocher-hub` | `supervisor/` | SQLite state, gRPC node link (unix socket), REST + SSE API with scoped tokens, audit chain, workflows, task bucket + coordinator, `/metrics`. |
+| `moo` CLI | `cli/` | Every API action, `--json` on all commands, `events -f` live. |
 | Demo kit | `examples/` | Hub config, mock LLM with phase scripts, `run-local.sh`. |
 
 ## Verified (each was run, not just compiled)
@@ -20,8 +20,8 @@ Status: **done and verified end to end** on 2026-10-22, on Ubuntu 24.04 with Pod
 |---|---|
 | Turn-based handoff | `build-review` workflow: build PASS (todos 3/3 + `pytest` exit 0) → review PASS (`VERDICT: APPROVED`) → run **Passed**. A failing review routes back to build with feedback, and nudges fire on open todos. |
 | Task bucket + main agent | Urgent task → coordinator → `cluster_spawn_agent(builder)` → notified when the builder's turn ends → spawns the reviewer → `cluster_task_complete` → task **done** with summary; all task sessions stopped. `when_free` waited for an idle cluster; `on_demand` stayed queued. |
-| Mid-run operator command | `ocl send <builder> "Please also add a docstring"` while it worked. The final `greet.py` contains the docstring. |
-| Token usage + cost | Per session and in total, live in `ocl status`, and per agent in `/metrics`. Cost comes from the `providers.yaml` price table when the provider reports none. |
+| Mid-run operator command | `moo send <builder> "Please also add a docstring"` while it worked. The final `greet.py` contains the docstring. |
+| Token usage + cost | Per session and in total, live in `moo status`, and per agent in `/metrics`. Cost comes from the `providers.yaml` price table when the provider reports none. |
 | Secrets never reach agents | Mock provider rejects any key but the real one, and all calls succeeded. Inside the container: real key found 0 times; forged capability → 401; other model → 403. |
 | Container isolation | `--network=none` (outbound connect refused), all capabilities dropped, read-only rootfs and read-only config, memory and pids limits applied. |
 | Supervisor restart doesn't orphan | Killed the supervisor mid-run for 20 s. The node buffered 25 events, replayed them on reconnect (outbox → 0), and the session ended with correct tokens, todos and verdict. |
@@ -58,7 +58,7 @@ Run it yourself: `examples/quickstart/run-local.sh --with-worker` (see QUICKSTAR
 ## Upstream notes for OpenCode
 
 - The v2 runner should expose MCP tools; then we can use durable replay and `delivery: steer|queue`.
-- `serve --unix-socket`, which would remove half of `ocl-bridge`.
+- `serve --unix-socket`, which would remove half of `moo-bridge`.
 - `OPENCODE_CONFIG` should be honoured at boot, like `OPENCODE_CONFIG_DIR`.
 - Don't write `.gitignore` into a read-only config dir.
 - `/api/health` should only report OK once the model catalog is ready.

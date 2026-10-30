@@ -3,7 +3,7 @@ self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
 
 self.addEventListener("push", (event) => {
-  let n = { title: "opencode-cluster", body: "", severity: "info", target: null, kind: "" };
+  let n = { title: "moocher", body: "", severity: "info", target: null, kind: "" };
   try { n = Object.assign(n, event.data ? event.data.json() : {}); } catch (e) { n.body = event.data ? event.data.text() : ""; }
   const url = targetUrl(n);
   event.waitUntil(

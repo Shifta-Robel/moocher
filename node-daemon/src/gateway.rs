@@ -1,5 +1,5 @@
 //! Per-session gateway, served on `<run>/<id>/node.sock` and reachable from the
-//! container as `http://127.0.0.1:7777` through ocl-bridge.
+//! container as `http://127.0.0.1:7777` through moo-bridge.
 //!
 //! * `/llm/<provider>/...` — **keyproxy**: checks the session capability token,
 //!   model allowlist and budget, swaps in the real API key (resolved on this
@@ -21,9 +21,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
-use ocl_protocol::config::{AuthStyle, OnExhausted, Route, SpawnOverrides};
-use ocl_protocol::link::{AgentCall, NodeEvent};
-use ocl_protocol::model::{now_ms, SessionRole, TokenUsage, Ts};
+use moocher_protocol::config::{AuthStyle, OnExhausted, Route, SpawnOverrides};
+use moocher_protocol::link::{AgentCall, NodeEvent};
+use moocher_protocol::model::{now_ms, SessionRole, TokenUsage, Ts};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -208,7 +208,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 fn llm_error(status: StatusCode, msg: &str) -> Response {
     // Shaped like an OpenAI error so OpenCode surfaces the message.
-    (status, Json(json!({"error": {"message": format!("[opencode-cluster] {msg}"), "type": "ocl_gateway"}}))).into_response()
+    (status, Json(json!({"error": {"message": format!("[moocher] {msg}"), "type": "moo_gateway"}}))).into_response()
 }
 
 const HOP: &[&str] = &[
@@ -557,7 +557,7 @@ impl Gateway {
             None if p.starts_with('/') => anyhow::bail!("{p} is outside your workspace ({})", self.ws.runtime_path),
             None => p,
         };
-        ocl_protocol::archive::clean_rel(rel)
+        moocher_protocol::archive::clean_rel(rel)
     }
 
     async fn local_tool(&self, name: &str, a: &Value) -> anyhow::Result<Value> {
@@ -803,7 +803,7 @@ fn to_call(name: &str, a: &Value) -> Result<AgentCall, String> {
         "ask" => AgentCall::Ask {
             question: s("question")?,
             options: a.get("options").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default(),
-            importance: s("importance").ok().and_then(|i| ocl_protocol::model::Importance::parse(&i)),
+            importance: s("importance").ok().and_then(|i| moocher_protocol::model::Importance::parse(&i)),
             context: s("context").ok(),
         },
         "answer" => AgentCall::Answer { id: s("id")?, answer: s("answer")? },
@@ -850,7 +850,7 @@ async fn handle_rpc(g: &Gateway, m: &Value) -> Option<Value> {
             ok(json!({
                 "protocolVersion": pv,
                 "capabilities": {"tools": {"listChanged": false}},
-                "serverInfo": {"name": "opencode-cluster", "version": ocl_protocol::VERSION},
+                "serverInfo": {"name": "moocher", "version": moocher_protocol::VERSION},
                 "instructions": "Cluster tools for coordinating with other OpenCode agents. Your session id is available via list_sessions."
             }))
         }

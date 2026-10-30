@@ -1936,6 +1936,152 @@ dependencies = [
 ]
 
 [[package]]
+name = "moo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "bytes",
+ "chrono",
+ "clap",
+ "crossterm",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "moocher-protocol",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "moo-bridge"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
+name = "moocher-hub"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "argon2",
+ "axum",
+ "base64 0.22.1",
+ "blake3",
+ "bytes",
+ "chrono",
+ "clap",
+ "futures",
+ "hex",
+ "hkdf 0.12.4",
+ "hmac 0.12.1",
+ "http-body-util",
+ "httparse",
+ "hyper",
+ "hyper-util",
+ "instant-acme",
+ "ipnet",
+ "moocher-protocol",
+ "p256",
+ "rand 0.8.8",
+ "rcgen",
+ "reqwest",
+ "rusqlite",
+ "rust-embed",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha1",
+ "sha2 0.10.9",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "x509-parser",
+ "zstd",
+]
+
+[[package]]
+name = "moocher-node"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "blake3",
+ "bytes",
+ "clap",
+ "futures",
+ "globset",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "moocher-protocol",
+ "notify",
+ "rand 0.8.8",
+ "rcgen",
+ "reqwest",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "walkdir",
+]
+
+[[package]]
+name = "moocher-protocol"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "hex",
+ "libc",
+ "prost",
+ "protoc-bin-vendored",
+ "rand 0.8.8",
+ "rustls",
+ "rustls-pki-types",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "tonic",
+ "tonic-build",
+ "walkdir",
+ "zstd",
+]
+
+[[package]]
 name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2059,112 +2205,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ocl"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "bytes",
- "chrono",
- "clap",
- "crossterm",
- "futures",
- "http-body-util",
- "hyper",
- "hyper-util",
- "libc",
- "ocl-protocol",
- "ratatui",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "ocl-bridge"
-version = "0.1.0"
-dependencies = [
- "tokio",
-]
-
-[[package]]
-name = "ocl-protocol"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "hex",
- "libc",
- "prost",
- "protoc-bin-vendored",
- "rand 0.8.8",
- "rustls",
- "rustls-pki-types",
- "schemars",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2 0.10.9",
- "tar",
- "tempfile",
- "tonic",
- "tonic-build",
- "walkdir",
- "zstd",
-]
-
-[[package]]
-name = "ocl-supervisor"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "argon2",
- "axum",
- "base64 0.22.1",
- "blake3",
- "bytes",
- "chrono",
- "clap",
- "futures",
- "hex",
- "hkdf 0.12.4",
- "hmac 0.12.1",
- "http-body-util",
- "httparse",
- "hyper",
- "hyper-util",
- "instant-acme",
- "ipnet",
- "ocl-protocol",
- "p256",
- "rand 0.8.8",
- "rcgen",
- "reqwest",
- "rusqlite",
- "rust-embed",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha1",
- "sha2 0.10.9",
- "tempfile",
- "time",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tonic",
- "tower",
- "tracing",
- "tracing-subscriber",
- "x509-parser",
- "zstd",
-]
-
-[[package]]
 name = "oid-registry"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2190,46 +2230,6 @@ name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
-
-[[package]]
-name = "opencode-node"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "blake3",
- "bytes",
- "clap",
- "futures",
- "globset",
- "hex",
- "http-body-util",
- "hyper",
- "hyper-util",
- "libc",
- "notify",
- "ocl-protocol",
- "rand 0.8.8",
- "rcgen",
- "reqwest",
- "rusqlite",
- "rustls",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2 0.10.9",
- "tempfile",
- "time",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tonic",
- "tower",
- "tracing",
- "tracing-subscriber",
- "walkdir",
-]
 
 [[package]]
 name = "openssl-probe"

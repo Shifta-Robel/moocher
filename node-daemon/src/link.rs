@@ -11,9 +11,9 @@ use crate::store::Store;
 use anyhow::{anyhow, bail, Result};
 use futures::future::BoxFuture;
 use hyper_util::rt::TokioIo;
-use ocl_protocol::link::*;
-use ocl_protocol::proto::node_link_client::NodeLinkClient;
-use ocl_protocol::proto::Envelope;
+use moocher_protocol::link::*;
+use moocher_protocol::proto::node_link_client::NodeLinkClient;
+use moocher_protocol::proto::Envelope;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -144,7 +144,7 @@ impl LinkHandle {
         let v = self.call(move |req| NodeMsg::RenewCert { req, csr_pem }).await?;
         let cert = v["cert_pem"].as_str().ok_or_else(|| anyhow!("renewal reply without certificate"))?;
         let expires_at = v["expires_at"].as_i64().unwrap_or(0);
-        pki.store(&key_pem, cert, None, &crate::pki::CertMeta { node: meta.node, issued_at: ocl_protocol::model::now_ms(), expires_at })?;
+        pki.store(&key_pem, cert, None, &crate::pki::CertMeta { node: meta.node, issued_at: moocher_protocol::model::now_ms(), expires_at })?;
         tracing::info!(expires_at, "link certificate renewed");
         Ok(())
     }

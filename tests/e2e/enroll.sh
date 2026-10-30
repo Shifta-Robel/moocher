@@ -15,14 +15,14 @@ expect "node key is 0600" bash -c "[ \$(stat -c %a $W/worker-b/pki/node.key) = 6
 [ "$(node_field worker-b enrollment)" = pending ] && pass "worker-b is pending after enroll" || fail "worker-b is pending after enroll"
 
 say "join token is single use"
-TOK=$(grep -o 'ocljoin\.[^ ]*' "$W/join-b.txt" || true)
+TOK=$(grep -o 'moojoin\.[^ ]*' "$W/join-b.txt" || true)
 CMD=$($O node invite worker-c --json | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
-expect "worker-c enrolls with its token" "$BIN/opencode-node" --config-dir "$W/worker-c" join https://127.0.0.1:7443 --token "$CMD"
-expect_fail "re-using worker-c's token is refused" "$BIN/opencode-node" --config-dir "$W/worker-c2" join https://127.0.0.1:7443 --token "$CMD"
+expect "worker-c enrolls with its token" "$BIN/moocher-node" --config-dir "$W/worker-c" join https://127.0.0.1:7443 --token "$CMD"
+expect_fail "re-using worker-c's token is refused" "$BIN/moocher-node" --config-dir "$W/worker-c2" join https://127.0.0.1:7443 --token "$CMD"
 
 say "CA pinning: a token with the wrong CA fingerprint is refused before anything is sent"
 BAD=$($O node invite worker-d --json | python3 -c 'import sys,json;t=json.load(sys.stdin)["token"];a,s,f=t.split(".");print(a+"."+s+"."+"0"*64)')
-expect_fail "wrong CA fingerprint refused" "$BIN/opencode-node" --config-dir "$W/worker-d" join https://127.0.0.1:7443 --token "$BAD"
+expect_fail "wrong CA fingerprint refused" "$BIN/moocher-node" --config-dir "$W/worker-d" join https://127.0.0.1:7443 --token "$BAD"
 
 say "pending node cannot attach until approved"
 make_worker worker-b

@@ -1,0 +1,30 @@
+# moocher node, rootless Podman, as a systemd *user* service.
+#
+#   install -D -m 0644 deploy/systemd/moocher-node.user.service \
+#       ~/.config/systemd/user/moocher-node.service
+#   loginctl enable-linger "$USER"     # keep it running without a login
+#   systemctl --user enable --now moocher-node
+#
+# Config in ~/.config/moo/node (node.yaml, agents/, providers.yaml). Session
+# sockets go to $XDG_RUNTIME_DIR/moo. `disk_enforce: hard` is not available
+# rootless (quotas need root); `soft` is the default.
+[Unit]
+Description=moocher node (rootless)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/moocher-node --config-dir %E/moo/node run
+Restart=on-failure
+RestartSec=5s
+KillMode=process
+TimeoutStopSec=20s
+Environment=RUST_LOG=info
+#LoadCredentialEncrypted=openrouter:%E/moo/creds/openrouter.cred
+# No NoNewPrivileges/PrivateTmp: rootless Podman needs the setuid newuidmap
+# and newgidmap helpers to set up its user namespace.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

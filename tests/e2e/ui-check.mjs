@@ -120,7 +120,7 @@ await step("nodes: Add machine shows a join command", async () => {
   await page.getByRole("button", { name: "Add machine" }).click();
   await page.getByLabel("Name").fill("vps-test");
   await page.getByRole("button", { name: "Create join command" }).click();
-  await page.getByText(/opencode-node join .* --token ocljoin\./).waitFor();
+  await page.getByText(/moocher-node join .* --token moojoin\./).waitFor();
   await page.keyboard.press("Escape");
   await page.getByRole("dialog").waitFor({ state: "detached", timeout: 5000 });
 });

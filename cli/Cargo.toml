@@ -1,12 +1,12 @@
 [package]
-name = "ocl"
+name = "moo"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "opencode-cluster command-line client"
+description = "moocher command-line client"
 
 [dependencies]
-ocl-protocol.workspace = true
+moocher-protocol.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 futures.workspace = true

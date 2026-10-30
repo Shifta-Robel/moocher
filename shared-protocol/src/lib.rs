@@ -1,4 +1,4 @@
-//! Shared types for opencode-cluster.
+//! Shared types for moocher.
 //!
 //! * [`config`] — on-disk YAML formats (agents, node, supervisor, providers, routes, workflows)
 //! * [`model`]  — domain types (sessions, tokens, todos, tasks, runs)
@@ -16,7 +16,7 @@ pub mod model;
 pub mod tls;
 
 pub mod proto {
-    tonic::include_proto!("ocl.link.v1");
+    tonic::include_proto!("moo.link.v1");
 }
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

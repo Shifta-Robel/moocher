@@ -14,8 +14,8 @@
 
 use crate::state::Sup;
 use anyhow::{anyhow, bail, Result};
-use ocl_protocol::api::QuotaView;
-use ocl_protocol::model::*;
+use moocher_protocol::api::QuotaView;
+use moocher_protocol::model::*;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -160,7 +160,7 @@ impl Sup {
             .map(|n| {
                 let reason = match n.agents.iter().find(|a| a.name == agent) {
                     _ if !n.connected || !self.nodes.connected(&n.name) => "not connected".to_string(),
-                    None => "does not have this agent (check `ocl agents` and the node's config errors)".into(),
+                    None => "does not have this agent (check `moo agents` and the node's config errors)".into(),
                     Some(a) if !a.errors.is_empty() => format!("config errors: {}", a.errors.join("; ")),
                     Some(a) if !a.secret_ok => format!("the {} key does not resolve (node.yaml `secrets:` alias or its env var; restart the node after editing node.env)", a.provider),
                     Some(_) if n.running >= n.max_sessions => format!("at capacity ({}/{} sessions)", n.running, n.max_sessions),

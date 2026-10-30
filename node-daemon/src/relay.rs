@@ -14,8 +14,8 @@
 
 use crate::link::LinkHandle;
 use anyhow::{anyhow, bail, Context, Result};
-use ocl_protocol::link::TunnelOpen;
-use ocl_protocol::proto::TunnelFrame;
+use moocher_protocol::link::TunnelOpen;
+use moocher_protocol::proto::TunnelFrame;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -166,7 +166,7 @@ async fn reply(s: &mut TcpStream, code: u8) -> std::io::Result<()> {
 /// Open a Tunnel RPC and wait for the hub's "ready" (the far end is connected).
 pub async fn open(link: &LinkHandle, open: TunnelOpen, me: &str) -> Result<(mpsc::Sender<TunnelFrame>, Streaming<TunnelFrame>)> {
     let ch = link.channel().ok_or_else(|| anyhow!("not connected to the hub"))?;
-    let mut client = ocl_protocol::proto::node_link_client::NodeLinkClient::new(ch);
+    let mut client = moocher_protocol::proto::node_link_client::NodeLinkClient::new(ch);
     let (tx, rx) = mpsc::channel::<TunnelFrame>(64);
     let mut header = serde_json::to_value(&open)?;
     header["from"] = serde_json::json!(me);
@@ -218,8 +218,8 @@ pub async fn pump<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'stat
 
 /// Relay side of `NodeCommand::OpenTunnel`: connect to the target from this
 /// machine, then hand the connection to the hub.
-pub async fn accept(cfg: &ocl_protocol::config::NodeConfig, link: &LinkHandle, id: &str, host: &str, port: u16, from: &str) -> Result<()> {
-    if !(cfg.relay || cfg.role == ocl_protocol::config::NodeRole::Relay) {
+pub async fn accept(cfg: &moocher_protocol::config::NodeConfig, link: &LinkHandle, id: &str, host: &str, port: u16, from: &str) -> Result<()> {
+    if !(cfg.relay || cfg.role == moocher_protocol::config::NodeRole::Relay) {
         bail!("node {} does not relay traffic (set relay: true or role: relay)", cfg.name);
     }
     if !cfg.relay_ports.contains(&port) {

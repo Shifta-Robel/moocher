@@ -1,6 +1,6 @@
 {
-  "name": "opencode-cluster",
-  "short_name": "ocl",
+  "name": "moocher",
+  "short_name": "moo",
   "description": "Operate OpenCode agents across your machines",
   "start_url": "/",
   "scope": "/",

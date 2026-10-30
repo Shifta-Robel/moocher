@@ -6,7 +6,7 @@
 //! * Disk: a size walk of the workspace and OpenCode home, at most once a
 //!   minute per instance (bounded, so a huge tree cannot stall the node).
 
-use ocl_protocol::model::{now_ms, HostStats, InstanceStats, Ts};
+use moocher_protocol::model::{now_ms, HostStats, InstanceStats, Ts};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

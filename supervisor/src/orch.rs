@@ -15,9 +15,9 @@
 
 use crate::state::{truncate, Actor, SpawnOpts, Sup};
 use anyhow::{anyhow, bail, Result};
-use ocl_protocol::api::*;
-use ocl_protocol::config::*;
-use ocl_protocol::model::*;
+use moocher_protocol::api::*;
+use moocher_protocol::config::*;
+use moocher_protocol::model::*;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -103,7 +103,7 @@ impl Sup {
                 }
             }
         }
-        let id = ocl_protocol::new_id("r");
+        let id = moocher_protocol::new_id("r");
         let ws_name = format!("run-{}", &id[2..]);
         let now = now_ms();
         let mut run = WorkflowRun {

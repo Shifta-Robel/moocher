@@ -20,10 +20,10 @@
 
 use crate::state::{truncate, Actor, SpawnOpts, Sup};
 use anyhow::{anyhow, bail, Result};
-use ocl_protocol::api::StreamEvent;
-use ocl_protocol::config::{DeathPolicy, WorkspaceMode, WorkspaceSpec};
-use ocl_protocol::link::NodeCommand;
-use ocl_protocol::model::*;
+use moocher_protocol::api::StreamEvent;
+use moocher_protocol::config::{DeathPolicy, WorkspaceMode, WorkspaceSpec};
+use moocher_protocol::link::NodeCommand;
+use moocher_protocol::model::*;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -224,7 +224,7 @@ impl Sup {
             }
         }
         let h = Halt {
-            id: ocl_protocol::new_id("h"),
+            id: moocher_protocol::new_id("h"),
             scope: scope.into(),
             dead_session: dead.report.id.clone(),
             reason: reason.into(),
@@ -245,7 +245,7 @@ impl Sup {
             "vital",
             format!("{scope} halted: {} ({}) died ({reason})", dead.report.agent, dead.report.id),
             format!(
-                "Was doing: {}. Spent so far ${spent:.4}. Not recovered automatically: {}. Options: {}. Resume with `ocl recover {} <option>`.",
+                "Was doing: {}. Spent so far ${spent:.4}. Not recovered automatically: {}. Options: {}. Resume with `moo recover {} <option>`.",
                 h.current_todo.as_deref().unwrap_or("-"),
                 if why.is_empty() { "-".into() } else { why.join("; ") },
                 opts.join(", "),

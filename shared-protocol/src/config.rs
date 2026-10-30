@@ -1,9 +1,9 @@
 //! On-disk configuration formats (YAML). See docs/CONFIG.md.
 //!
-//! Layout of a config directory (default `~/.opencode-cluster`):
+//! Layout of a config directory (default `~/.moocher`):
 //!
 //! ```text
-//! node.yaml            NodeConfig        (every machine running opencode-node)
+//! node.yaml            NodeConfig        (every machine running moocher-node)
 //! supervisor.yaml      SupervisorConfig  (hub only)
 //! providers.yaml       ProvidersFile     (optional; merged over built-in defaults)
 //! routes.yaml          RoutesFile        (optional)
@@ -30,8 +30,8 @@ use std::path::{Path, PathBuf};
 pub struct NodeConfig {
     /// Unique node name within the cluster (`[a-z0-9-]+`).
     pub name: String,
-    /// Where the supervisor is: `unix:///run/ocl/supervisor.sock` (same machine)
-    /// or `https://hub.example:7443` (remote, mTLS; set up by `opencode-node join`).
+    /// Where the supervisor is: `unix:///run/moo/supervisor.sock` (same machine)
+    /// or `https://hub.example:7443` (remote, mTLS; set up by `moocher-node join`).
     pub supervisor: String,
     /// `worker` (default) runs agents. `relay` runs no agents and only carries
     /// other nodes' LLM traffic out through this machine's IP (`via_node` routes).
@@ -146,7 +146,7 @@ pub struct RuntimeConfig {
     /// Default agent image.
     #[serde(default = "default_image")]
     pub image: String,
-    /// Directory for per-session sockets. Default: `$XDG_RUNTIME_DIR/ocl` or `/run/ocl`.
+    /// Directory for per-session sockets. Default: `$XDG_RUNTIME_DIR/moo` or `/run/moo`.
     #[serde(default)]
     pub run_dir: Option<PathBuf>,
     /// Directory for workspaces and node state. Default: `<config dir>/data`.
@@ -183,7 +183,7 @@ fn default_runtime_kind() -> RuntimeKind {
 fn default_podman() -> String {
     "podman".into()
 }
-pub const DEFAULT_IMAGE: &str = "localhost/ocl-agent:1.19.4";
+pub const DEFAULT_IMAGE: &str = "localhost/moocher-agent:1.19.4";
 fn default_image() -> String {
     DEFAULT_IMAGE.into()
 }
@@ -393,7 +393,7 @@ pub struct NtfyConfig {
 #[serde(deny_unknown_fields)]
 pub struct WebhookConfig {
     pub url: String,
-    /// HMAC secret reference (`env:NAME` or `file:/path`): adds `X-OCL-Signature: sha256=<hex>`.
+    /// HMAC secret reference (`env:NAME` or `file:/path`): adds `X-Moo-Signature: sha256=<hex>`.
     #[serde(default)]
     pub secret: Option<String>,
 }
@@ -401,7 +401,7 @@ pub struct WebhookConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QuestionsConfig {
-    /// Starting mode; switch it live with `ocl questions mode` (per task too).
+    /// Starting mode; switch it live with `moo questions mode` (per task too).
     #[serde(default)]
     pub mode: crate::model::QuestionMode,
     /// An agent holding a question for this long without answering or
@@ -1275,7 +1275,7 @@ impl SpawnOverrides {
 }
 
 fn default_api_version() -> String {
-    "ocl/v1".into()
+    "moo/v1".into()
 }
 fn default_kind_agent() -> String {
     "Agent".into()
@@ -1602,6 +1602,20 @@ pub struct WorkflowStep {
 
 // ------------------------------------------------------------------ loading
 
+/// `~/.moocher`, or `~/.opencode-cluster` when only that one exists (installs from
+/// before the rename keep working in place). Without `$HOME`: `/etc/moocher`.
+pub fn default_config_dir() -> PathBuf {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return PathBuf::from("/etc/moocher");
+    };
+    let (new, old) = (home.join(".moocher"), home.join(".opencode-cluster"));
+    if !new.exists() && old.exists() {
+        old
+    } else {
+        new
+    }
+}
+
 pub fn load_yaml<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
     let text = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
     serde_yaml::from_str(&text).map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))
@@ -1740,7 +1754,7 @@ impl HostPattern {
     }
 }
 
-/// JSON Schemas for editor validation (`opencode-node schema`).
+/// JSON Schemas for editor validation (`moocher-node schema`).
 pub fn schemas() -> BTreeMap<&'static str, serde_json::Value> {
     let mut m = BTreeMap::new();
     m.insert("agent", serde_json::to_value(schemars::schema_for!(AgentConfig)).unwrap());

@@ -15,7 +15,7 @@ Design: [PHASE1_5.md](./PHASE1_5.md) §6–§9. Usage: [USAGE.md](./USAGE.md) §
 | Questions | `supervisor/src/questions.rs`, node interception in `manager.rs` | `cluster_ask`, OpenCode's `question` tool, `ask` permissions and budget stops. Routing up the chain, `cluster_answer/escalate`, timeouts, the four modes (live and per task), rules that only raise importance, operator-only questions, the assumption log, notifications. |
 | Dead agents | `supervisor/src/recovery.rs`, node `tick`/`mark_dead`/`restart`/`halt` | Detection: exit code (128+signal from the bridge), OOM (Podman), wall clock, lost node, container gone. Priced `restart` / `resume_elsewhere` / `handoff` / `abandon`. Automatic within `on_death`; otherwise a halt of the whole tree with containers kept, resumed by one call. Checkpoints every N turns. |
 | Harvest and clean-up | node `harvest`/`stop`/`reap`, hub `on_harvested` | `outputs:` (files, directories, globs), the transcript, delivery to the parent's / task's / any shared workspace on whichever machine holds it, and `retain:` (duration, `on_failure`, `always`, `never`). |
-| CLI and API | `cli/`, `supervisor/src/api.rs` | CLI: `ocl questions [mode]`, `ocl answer`, `ocl assumptions`, `ocl artifact put/get/ls/show`, `ocl halts`, `ocl recover`, `ocl harvests`, `ocl notifications`, `ocl spawn --coordinator`, `ocl task add/edit --question-mode`. The matching REST endpoints exist under `/api/v1/*`, plus SSE events. |
+| CLI and API | `cli/`, `supervisor/src/api.rs` | CLI: `moo questions [mode]`, `moo answer`, `moo assumptions`, `moo artifact put/get/ls/show`, `moo halts`, `moo recover`, `moo harvests`, `moo notifications`, `moo spawn --coordinator`, `moo task add/edit --question-mode`. The matching REST endpoints exist under `/api/v1/*`, plus SSE events. |
 | E2E suites | `tests/e2e/{artifacts,questions,death,harvest}.sh` | Four new suites, rerunnable on one machine. The six Phase 2 suites run unchanged. |
 
 ## Verified (each was run, not just compiled)
@@ -35,22 +35,22 @@ Unit tests: 32. (The suite counter used to count each suite's "ALL PASSED" line 
 | Requirement | Evidence |
 |---|---|
 | Artifacts, operator side | A file and a tree (with an executable file and a link) go up and come back identical. The exec bit is kept; the link is not packed. The same content gives the same reference. |
-| Artifacts between agents, lineage | An agent on the hub shares `greet.py` and a directory. An agent on worker-b fetches the file (it lands in its workspace) and publishes `derived.py`, whose parent is `greet.py`; `ocl artifact show` lists the child under `greet.py`. |
+| Artifacts between agents, lineage | An agent on the hub shares `greet.py` and a directory. An agent on worker-b fetches the file (it lands in its workspace) and publishes `derived.py`, whose parent is `greet.py`; `moo artifact show` lists the child under `greet.py`. |
 | One shared workspace on two machines | B (worker-b) started with A's files (synced at placement: `workspace demo: synced from hub`). B's new file reached the hub after B's turn, and A's next change reached worker-b. The same file was changed on both sides: the hub kept its version, wrote B's as `conflict.txt.theirs`, and the agent on the hub was told. |
 | Workflow steps on different machines | `build` ran on the hub and `review` on worker-b. Its `exit_code: pytest` check ran on worker-b's copy of the run workspace and passed. Before the fix described below, the same check failed with "no tests ran", which is how the bug was found. |
-| Questions reach the operator | `cluster_ask` from a top-level agent arrived as `normal` and `blocked 1`, with a notification. `ocl answer --choice 2` reached the agent as a message, and it wrote `9090`. |
-| OpenCode's question tool | The session was `blocked`, and the inbox showed OpenCode's options. `ocl answer … postgres` replied through `/question/{id}/reply` and the session finished. |
+| Questions reach the operator | `cluster_ask` from a top-level agent arrived as `normal` and `blocked 1`, with a notification. `moo answer --choice 2` reached the agent as a message, and it wrote `9090`. |
+| OpenCode's question tool | The session was `blocked`, and the inbox showed OpenCode's options. `moo answer … postgres` replied through `/question/{id}/reply` and the session finished. |
 | The chain answers | A child's `low` question went to its parent, which answered (`answered_by` = the parent); the child received it. |
 | Escalation with a note | The parent escalated a `normal` question; it reached the operator with the note "parent does not know the deployment port", and the operator's answer reached the child. |
 | Rules only raise importance | A `low` question about deleting data became `vital` (`mentions "delete"`). It went through the parent first and reached the operator in `vital_only`. |
 | Operator-only | A question about a password went straight to the operator (`operator only`); the parent got an FYI. |
-| Autonomous mode, assumption log | The parent escalated, nobody above would answer, so the parent decided (`decided` by the parent). The child acted on it and the decision is in `ocl assumptions`. A task can have its own mode. |
+| Autonomous mode, assumption log | The parent escalated, nobody above would answer, so the parent decided (`decided` by the parent). The child acted on it and the decision is in `moo assumptions`. A task can have its own mode. |
 | Timeout | A parent that ignored the question: after `answer_timeout_secs` (6 s in the test) it moved to the operator (`escalated by timeout`). "Let the agent decide" reached the child. |
-| Permissions as questions | `rm -rf build` became a `vital` permission question. `ocl answer … reject` rejected it; the command did not run, the agent was told, and it continued without it. |
+| Permissions as questions | `rm -rf build` became a `vital` permission question. `moo answer … reject` rejected it; the command did not run, the agent was told, and it continued without it. |
 | Spending past a budget | The keyproxy refusal raised a `vital`, operator-only budget question. `raise 1.00` raised the budget live, and the session finished. |
 | Death detected, restart in place | OpenCode killed mid-step: `session.dead` with `exit:137`, then `recovery.auto` with `restart`. The agent finished in the same OpenCode session (history kept), with `deaths` = 1. |
-| Halt when recovery is not cheap enough | With `max_auto_cost_usd: 0`, the child's death halted the tree from its parent: the parent was `halted` and the child `dead/exit:137`. The options were priced, and the reason was in the vital notification. `ocl recover <h> restart` finished the child and resumed the parent; the halt was then `resolved`. |
-| Resume on another machine | `ocl recover <h> resume_elsewhere --node worker-b` started a replacement on worker-b (`replaces` = the dead one). Its workspace held the dead instance's files, and it was briefed with the original prompt and todos. |
+| Halt when recovery is not cheap enough | With `max_auto_cost_usd: 0`, the child's death halted the tree from its parent: the parent was `halted` and the child `dead/exit:137`. The options were priced, and the reason was in the vital notification. `moo recover <h> restart` finished the child and resumed the parent; the halt was then `resolved`. |
+| Resume on another machine | `moo recover <h> resume_elsewhere --node worker-b` started a replacement on worker-b (`replaces` = the dead one). Its workspace held the dead instance's files, and it was briefed with the original prompt and todos. |
 | Lost node, checkpoint | worker-b and its sessions were killed. After the grace period: `node_lost`, then an automatic resume on the hub from the turn-1 checkpoint. The harvest record says anything written after the checkpoint is unrecoverable. |
 | Wall clock | `dead/wall_clock` and halted, with the reason it was not retried. |
 | Harvest on stop | The parent stopped its child. `report.md` was delivered into the parent's workspace at `dest`. Two wheels (not the sdist) became one tree artifact; `missing.txt` was reported as missing; the transcript artifact holds the conversation. `retain: never` removed the volumes at once. |
@@ -74,7 +74,7 @@ Unit tests added in this phase:
 6. **A halt of a session without a task covers its whole tree,** from the top ancestor down, so a parent waiting on a dead child is paused too.
 7. **The wall clock and crash loops are never retried automatically.** Giving an agent more time is the operator's call.
 8. **A replaced session on a node that comes back is stopped,** so two instances never work on the same thing.
-9. **The operator can start coordinators without a task** (`ocl spawn --coordinator`). This was needed for agent trees outside the task bucket.
+9. **The operator can start coordinators without a task** (`moo spawn --coordinator`). This was needed for agent trees outside the task bucket.
 10. **The bridge reports a signal death as 128+signal,** like shells and Podman (a kill or OOM kill shows as 137).
 11. **Every harvested output is also an artifact,** with lineage to what the instance fetched, whatever its destination.
 12. **Each new instance home gets an empty model catalog.** Without one, OpenCode fetches models.dev at boot. On a host whose DNS prefers unreachable IPv6 that stalled every new instance for ~30 s (38 s → 4 s here). Containers have no network and fail at once, so this mostly helps the `process` runtime.
@@ -100,14 +100,14 @@ Release builds, idle and connected (`VmRSS`). Budgets from ARCHITECTURE §2: sup
 
 | Process | Phase 3 | Phase 2 |
 |---|---|---|
-| `ocl-supervisor` | 14.1 MB | 12.4 MB |
-| `opencode-node` (hub's own / worker) | 15.7 / 15.7 MB | 14.0 / 14.3 MB |
-| `opencode-node` (relay) | 13.9 MB | 12.3 MB |
+| `moocher-hub` | 14.1 MB | 12.4 MB |
+| `moocher-node` (hub's own / worker) | 15.7 / 15.7 MB | 14.0 / 14.3 MB |
+| `moocher-node` (relay) | 13.9 MB | 12.3 MB |
 
 Artifacts stream end to end:
 - a 64 MiB put and get through the hub raised the supervisor to 17.3 MB;
-- `ocl artifact put` / `get` of 64 MiB peaked at 11 / 10 MB.
+- `moo artifact put` / `get` of 64 MiB peaked at 11 / 10 MB.
 
-Binary sizes: supervisor 16.7 MB, node 21.6 MB, `ocl` 10.0 MB, `ocl-bridge` 1.2 MB (zstd and tar added about 3 MB per daemon).
+Binary sizes: supervisor 16.7 MB, node 21.6 MB, `moo` 10.0 MB, `moo-bridge` 1.2 MB (zstd and tar added about 3 MB per daemon).
 
 A new instance now boots in about 4 s on this host, down from 38 s (design change 12).

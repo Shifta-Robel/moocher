@@ -14,8 +14,8 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use ocl_protocol::api::*;
-use ocl_protocol::model::*;
+use moocher_protocol::api::*;
+use moocher_protocol::model::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
@@ -76,7 +76,7 @@ fn cookie(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
 
 /// Bearer API token (CLI, scripts), or a browser session cookie. Cookie
 /// requests that change anything must echo the session's CSRF token in
-/// `X-CSRF-Token` (the UI reads it from the `ocl_csrf` cookie).
+/// `X-CSRF-Token` (the UI reads it from the `moo_csrf` cookie).
 async fn auth(State(sup): S, mut req: Request, next: Next) -> Result<Response, ApiError> {
     let token = req
         .headers()
@@ -101,7 +101,7 @@ async fn auth(State(sup): S, mut req: Request, next: Next) -> Result<Response, A
         req.extensions_mut().insert(Caller { name, scope });
         return Ok(next.run(req).await);
     }
-    let Some(ws) = cookie(req.headers(), "ocl_session").and_then(|c| sup.web_session(&c)) else {
+    let Some(ws) = cookie(req.headers(), "moo_session").and_then(|c| sup.web_session(&c)) else {
         return Err(ApiError(StatusCode::UNAUTHORIZED, "log in, or send an API token (Authorization: Bearer …)".into()));
     };
     let safe = matches!(*req.method(), axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS);
@@ -471,7 +471,7 @@ struct HousekeepingReq {
 async fn housekeeping(State(sup): S, Extension(c): Extension<Caller>, Json(r): Json<HousekeepingReq>) -> R<Value> {
     c.need(Scope::Admin)?;
     let ahead = match r.ahead.as_deref() {
-        Some(a) => ocl_protocol::config::parse_duration_ms(a).ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, format!("ahead {a:?} is not a duration")))?,
+        Some(a) => moocher_protocol::config::parse_duration_ms(a).ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, format!("ahead {a:?} is not a duration")))?,
         None => 0,
     };
     let actor = c.actor();
@@ -568,7 +568,7 @@ struct UploadQ {
     name: String,
     #[serde(default)]
     media_type: String,
-    /// `file` or `tree` (tar.zst made by `ocl artifact put <dir>`).
+    /// `file` or `tree` (tar.zst made by `moo artifact put <dir>`).
     #[serde(default)]
     kind: String,
     /// Comma-separated.
@@ -596,8 +596,8 @@ async fn artifact_blob(State(sup): S, Path(r): Path<String>) -> Result<Response,
     Ok((
         [
             ("content-type", meta.media_type.clone()),
-            ("x-ocl-kind", meta.kind.clone()),
-            ("x-ocl-name", meta.name.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').collect::<String>()),
+            ("x-moo-kind", meta.kind.clone()),
+            ("x-moo-name", meta.name.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').collect::<String>()),
             ("content-length", meta.size.to_string()),
         ],
         body,
@@ -686,8 +686,8 @@ struct LoginRequest {
 fn session_cookies(token: &str, csrf: &str, max_age_s: i64, secure: bool) -> [(axum::http::HeaderName, String); 2] {
     let sec = if secure { "; Secure" } else { "" };
     [
-        (axum::http::header::SET_COOKIE, format!("ocl_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age_s}{sec}")),
-        (axum::http::header::SET_COOKIE, format!("ocl_csrf={csrf}; SameSite=Strict; Path=/; Max-Age={max_age_s}{sec}")),
+        (axum::http::header::SET_COOKIE, format!("moo_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age_s}{sec}")),
+        (axum::http::header::SET_COOKIE, format!("moo_csrf={csrf}; SameSite=Strict; Path=/; Max-Age={max_age_s}{sec}")),
     ]
 }
 
@@ -718,7 +718,7 @@ async fn login(State(sup): S, conn: Option<Extension<crate::web::ConnInfo>>, hea
 }
 
 async fn logout(State(sup): S, headers: axum::http::HeaderMap) -> Response {
-    if let Some(c) = cookie(&headers, "ocl_session") {
+    if let Some(c) = cookie(&headers, "moo_session") {
         if let Some(ws) = sup.web_session(&c) {
             let sent = headers.get("x-csrf-token").and_then(|v| v.to_str().ok()).unwrap_or("");
             if sent != ws.csrf {
@@ -735,7 +735,7 @@ async fn logout(State(sup): S, headers: axum::http::HeaderMap) -> Response {
 }
 
 async fn me(State(sup): S, headers: axum::http::HeaderMap) -> R<Value> {
-    match cookie(&headers, "ocl_session").and_then(|c| sup.web_session(&c)) {
+    match cookie(&headers, "moo_session").and_then(|c| sup.web_session(&c)) {
         Some(s) => Ok(Json(json!({"user": s.user, "scope": s.scope.as_str(), "expires_at": s.expires_at, "csrf": s.csrf}))),
         None => Err(ApiError(StatusCode::UNAUTHORIZED, "not logged in".into())),
     }
@@ -748,7 +748,7 @@ struct PasswordChange {
 }
 
 async fn change_password(State(sup): S, headers: axum::http::HeaderMap, Json(r): Json<PasswordChange>) -> R<Value> {
-    let ws = cookie(&headers, "ocl_session").and_then(|c| sup.web_session(&c)).ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "not logged in".into()))?;
+    let ws = cookie(&headers, "moo_session").and_then(|c| sup.web_session(&c)).ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "not logged in".into()))?;
     if headers.get("x-csrf-token").and_then(|v| v.to_str().ok()) != Some(ws.csrf.as_str()) {
         return Err(ApiError(StatusCode::FORBIDDEN, "missing or wrong CSRF token".into()));
     }
@@ -764,7 +764,7 @@ async fn ui(State(sup): S, req: Request) -> Response {
     }
     let is_page = !path.contains('.') || path.ends_with(".html");
     let public = path == "/login" || !is_page;
-    if !public && cookie(req.headers(), "ocl_session").and_then(|c| sup.web_session(&c)).is_none() {
+    if !public && cookie(req.headers(), "moo_session").and_then(|c| sup.web_session(&c)).is_none() {
         let next = if path == "/" { String::new() } else { format!("?next={}", path.chars().filter(|c| c.is_ascii_alphanumeric() || "/-_".contains(*c)).collect::<String>()) };
         return (StatusCode::FOUND, [(axum::http::header::LOCATION, format!("/login{next}"))]).into_response();
     }
@@ -843,7 +843,7 @@ fn default_scope() -> String {
 
 async fn add_user(State(sup): S, Extension(c): Extension<Caller>, Json(r): Json<NewUser>) -> R<Value> {
     c.need(Scope::Admin)?;
-    if !ocl_protocol::config::valid_name(&r.name) {
+    if !moocher_protocol::config::valid_name(&r.name) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "user names are [a-z0-9-]".into()));
     }
     let scope = Scope::parse(&r.scope).ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "scope must be read, operate or admin".into()))?;
@@ -866,7 +866,7 @@ struct Promote {
 
 async fn promote_route(State(sup): S, Extension(c): Extension<Caller>, Path(node): Path<String>, Json(r): Json<Promote>) -> R<Value> {
     c.need(Scope::Admin)?;
-    let res = sup.nodes.call(&node, ocl_protocol::link::NodeCommand::PromoteRoute { agent: r.agent.clone(), by: c.name.clone() }, crate::state::CMD_TIMEOUT).await;
+    let res = sup.nodes.call(&node, moocher_protocol::link::NodeCommand::PromoteRoute { agent: r.agent.clone(), by: c.name.clone() }, crate::state::CMD_TIMEOUT).await;
     sup.audit(&c.actor(), "route.promote", &format!("{node}/{}", r.agent), json!({"error": res.as_ref().err().map(|e| format!("{e:#}"))}), res.is_ok());
     Ok(Json(res?))
 }
@@ -874,7 +874,7 @@ async fn promote_route(State(sup): S, Extension(c): Extension<Caller>, Path(node
 /// What the UI needs to know about this hub.
 async fn info(State(sup): S, Extension(c): Extension<Caller>) -> Json<Value> {
     Json(json!({
-        "version": ocl_protocol::VERSION,
+        "version": moocher_protocol::VERSION,
         "user": c.name,
         "scope": c.scope.as_str(),
         "attach": sup.cfg.attach_listen.is_some(),
@@ -892,7 +892,7 @@ async fn metrics(State(sup): S) -> impl IntoResponse {
     use std::fmt::Write;
     let mut out = String::new();
     let nodes = sup.db.nodes();
-    let _ = writeln!(out, "# TYPE ocl_nodes_connected gauge\nocl_nodes_connected {}", nodes.iter().filter(|n| n.connected).count());
+    let _ = writeln!(out, "# TYPE moo_nodes_connected gauge\nmoo_nodes_connected {}", nodes.iter().filter(|n| n.connected).count());
     let sessions = sup.db.sessions(true);
     let mut by_state: BTreeMap<&str, u64> = BTreeMap::new();
     let mut tokens: BTreeMap<(String, &str), u64> = BTreeMap::new();
@@ -905,35 +905,35 @@ async fn metrics(State(sup): S) -> impl IntoResponse {
         }
         *cost.entry(a).or_default() += s.report.billed().cost_usd;
     }
-    let _ = writeln!(out, "# TYPE ocl_sessions gauge");
+    let _ = writeln!(out, "# TYPE moo_sessions gauge");
     for (k, v) in by_state {
-        let _ = writeln!(out, "ocl_sessions{{state=\"{k}\"}} {v}");
+        let _ = writeln!(out, "moo_sessions{{state=\"{k}\"}} {v}");
     }
-    let _ = writeln!(out, "# TYPE ocl_tokens_total counter");
+    let _ = writeln!(out, "# TYPE moo_tokens_total counter");
     for ((a, k), v) in tokens {
-        let _ = writeln!(out, "ocl_tokens_total{{agent=\"{a}\",kind=\"{k}\"}} {v}");
+        let _ = writeln!(out, "moo_tokens_total{{agent=\"{a}\",kind=\"{k}\"}} {v}");
     }
-    let _ = writeln!(out, "# TYPE ocl_cost_usd_total counter");
+    let _ = writeln!(out, "# TYPE moo_cost_usd_total counter");
     for (a, v) in cost {
-        let _ = writeln!(out, "ocl_cost_usd_total{{agent=\"{a}\"}} {v}");
+        let _ = writeln!(out, "moo_cost_usd_total{{agent=\"{a}\"}} {v}");
     }
     let relays = sup.nodes.relay_stats.lock().unwrap().clone();
-    let _ = writeln!(out, "# TYPE ocl_relay_tunnels_total counter");
+    let _ = writeln!(out, "# TYPE moo_relay_tunnels_total counter");
     for (r, (n, _, _)) in &relays {
-        let _ = writeln!(out, "ocl_relay_tunnels_total{{relay=\"{r}\"}} {n}");
+        let _ = writeln!(out, "moo_relay_tunnels_total{{relay=\"{r}\"}} {n}");
     }
-    let _ = writeln!(out, "# TYPE ocl_relay_bytes_total counter");
+    let _ = writeln!(out, "# TYPE moo_relay_bytes_total counter");
     for (r, (_, up, down)) in &relays {
-        let _ = writeln!(out, "ocl_relay_bytes_total{{relay=\"{r}\",direction=\"out\"}} {up}");
-        let _ = writeln!(out, "ocl_relay_bytes_total{{relay=\"{r}\",direction=\"in\"}} {down}");
+        let _ = writeln!(out, "moo_relay_bytes_total{{relay=\"{r}\",direction=\"out\"}} {up}");
+        let _ = writeln!(out, "moo_relay_bytes_total{{relay=\"{r}\",direction=\"in\"}} {down}");
     }
     let mut ts: BTreeMap<&str, u64> = BTreeMap::new();
     for t in sup.db.tasks() {
         *ts.entry(t.status.as_str()).or_default() += 1;
     }
-    let _ = writeln!(out, "# TYPE ocl_tasks gauge");
+    let _ = writeln!(out, "# TYPE moo_tasks gauge");
     for (k, v) in ts {
-        let _ = writeln!(out, "ocl_tasks{{status=\"{k}\"}} {v}");
+        let _ = writeln!(out, "moo_tasks{{status=\"{k}\"}} {v}");
     }
     ([("content-type", "text/plain; version=0.0.4")], out)
 }

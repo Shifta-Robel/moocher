@@ -13,8 +13,8 @@
 //! * Anthropic: `message_start.message.usage` + `message_delta.usage.output_tokens`;
 //! * Gemini: `usageMetadata.{promptTokenCount, candidatesTokenCount, thoughtsTokenCount, cachedContentTokenCount}`.
 
-use ocl_protocol::config::{ApiKind, Price};
-use ocl_protocol::model::TokenUsage;
+use moocher_protocol::config::{ApiKind, Price};
+use moocher_protocol::model::TokenUsage;
 use serde_json::Value;
 
 const MAX_JSON: usize = 8 << 20;

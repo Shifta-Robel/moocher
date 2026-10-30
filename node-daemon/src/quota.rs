@@ -11,8 +11,8 @@
 //! allowance is used up, and reported to the hub as a full snapshot.
 
 use crate::store::Store;
-use ocl_protocol::config::*;
-use ocl_protocol::model::{now_ms, QuotaBucket, Ts};
+use moocher_protocol::config::*;
+use moocher_protocol::model::{now_ms, QuotaBucket, Ts};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};

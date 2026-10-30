@@ -2,7 +2,7 @@
 //! few indexed columns; the event log and audit chain are append-only.
 
 use anyhow::{anyhow, Result};
-use ocl_protocol::model::*;
+use moocher_protocol::model::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -114,7 +114,7 @@ impl Db {
     pub fn create_token(&self, name: &str, scope: Scope) -> Result<String> {
         use rand::Rng;
         let raw: [u8; 32] = rand::thread_rng().gen();
-        let token = format!("ocl_{}", hex::encode(raw));
+        let token = format!("moo_{}", hex::encode(raw));
         self.c.lock().unwrap().execute(
             "INSERT INTO api_tokens(hash,name,scope,created_at) VALUES(?1,?2,?3,?4)",
             params![hash_token(&token), name, scope.as_str(), now_ms()],
@@ -974,7 +974,7 @@ mod tests {
         let db = Db::open(&dir.path().join("t.db")).unwrap();
         let t = db.create_token("cli", Scope::Operate).unwrap();
         assert_eq!(db.token_lookup(&t), Some(("cli".into(), Scope::Operate)));
-        assert_eq!(db.token_lookup("ocl_wrong"), None);
+        assert_eq!(db.token_lookup("moo_wrong"), None);
         let stored: String = db.c.lock().unwrap().query_row("SELECT hash FROM api_tokens", [], |r| r.get(0)).unwrap();
         assert_ne!(stored, t);
     }

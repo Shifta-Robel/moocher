@@ -24,7 +24,7 @@ curl -s http://127.0.0.1:8099/v1/_log | python3 -c 'import sys,json;l=[e for e i
 
 say "calls made around OpenCode, with the capability token from inside the instance"
 CFG="$W/hub/data/instances/$SID/etc/opencode.json"
-BASE=$(python3 -c 'import sys,json;c=json.load(open(sys.argv[1]));print(c["provider"]["ocl-mock"]["options"]["baseURL"])' "$CFG" 2>/dev/null || python3 -c 'import sys,json;c=json.load(open(sys.argv[1]));print(next(iter(c["provider"].values()))["options"]["baseURL"])' "$CFG")
+BASE=$(python3 -c 'import sys,json;c=json.load(open(sys.argv[1]));print(c["provider"]["moo-mock"]["options"]["baseURL"])' "$CFG" 2>/dev/null || python3 -c 'import sys,json;c=json.load(open(sys.argv[1]));print(next(iter(c["provider"].values()))["options"]["baseURL"])' "$CFG")
 CAP=$(python3 -c 'import sys,json;c=json.load(open(sys.argv[1]));print(next(iter(c["provider"].values()))["options"]["apiKey"])' "$CFG")
 # ~50k tokens per call by the mock's count ($0.025 at $0.50/Mtok).
 python3 -c 'import json;print(json.dumps({"model":"mmeter","stream":True,"messages":[{"role":"user","content":"x"*200000}]}))' > "$W/big.json"
@@ -35,7 +35,7 @@ wait_for 10 "the meter counts them; OpenCode's count does not move" bash -c "[ \
 sess '"  OpenCode: %d tok $%.5f  metered: %d tok $%.5f" % (s["tokens"]["input"]+s["tokens"]["output"], s["tokens"]["cost_usd"], s["metered"]["input"]+s["metered"]["output"], s["metered"]["cost_usd"])' "$SID"
 wait_for 30 "usage.mismatch recorded" bash -c "$O events --session $SID --limit 1000 | grep -q usage.mismatch"
 wait_for 10 "and raised as a warning notification" bash -c "$O notifications | grep -q 'more tokens than OpenCode reports'"
-$O show "$SID" | contains "metered by keyproxy" && pass "ocl show prints the metered count" || fail "ocl show prints the metered count"
+$O show "$SID" | contains "metered by keyproxy" && pass "moo show prints the metered count" || fail "moo show prints the metered count"
 $O sessions --json | python3 -c "import sys,json;s=[x for x in json.load(sys.stdin) if x['id']=='$SID'][0];sys.exit(0 if s['metered']['cost_usd']>=0.05 else 1)" \
   && pass "metered spend is past the \$0.05 budget" || fail "metered spend is past the budget"
 
@@ -48,7 +48,7 @@ say "the meter survives a node restart"
 BEFORE=$(sess 's["metered"]["input"]' "$SID")
 kill "${PIDS[2]}"
 wait_for 20 "hub node gone" is_disconnected hub
-"$BIN/opencode-node" --config-dir "$W/hub" run >> "$W/node-hub.log" 2>&1 &
+"$BIN/moocher-node" --config-dir "$W/hub" run >> "$W/node-hub.log" 2>&1 &
 PIDS+=($!)
 wait_for 30 "hub node back" is_connected hub
 wait_for 30 "metered count kept" bash -c "[ \"\$(sess 's[\"metered\"][\"input\"]' $SID)\" = $BEFORE ]"

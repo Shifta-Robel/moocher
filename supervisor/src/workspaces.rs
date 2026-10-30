@@ -4,7 +4,7 @@
 //! on more than one machine, the hub moves changes between the copies through
 //! the artifact store: the holder node snapshots its copy (tar.zst of the
 //! tree) and the other node merges it file by file against the last state both
-//! saw (see `ocl_protocol::archive::merge3`). This happens
+//! saw (see `moocher_protocol::archive::merge3`). This happens
 //! * before a session starts on a node whose copy may be behind,
 //! * after a session's turn, towards the other machines with live sessions,
 //! * when an agent calls `cluster_sync_workspace`.
@@ -14,8 +14,8 @@
 
 use crate::state::{Actor, Sup};
 use anyhow::{anyhow, Result};
-use ocl_protocol::link::NodeCommand;
-use ocl_protocol::model::*;
+use moocher_protocol::link::NodeCommand;
+use moocher_protocol::model::*;
 use serde_json::{json, Value};
 use std::time::Duration;
 

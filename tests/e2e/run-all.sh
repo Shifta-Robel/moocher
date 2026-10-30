@@ -7,10 +7,10 @@ suites="enroll relay quota templates stats resilience artifacts questions death 
 [ -n "${PEBBLE_DIR:-}" ] && suites="$suites acme"
 [ -n "${PW_DIR:-}" ] && suites="$suites ui"
 for t in $suites; do
-  if ./$t.sh > "${OCL_E2E_DIR:-/tmp/ocl-e2e}/$t.out" 2>&1; then
-    printf '%-12s ok    (%s checks)\n' "$t" "$(grep -c "32mPASS" "${OCL_E2E_DIR:-/tmp/ocl-e2e}/$t.out")"
+  if ./$t.sh > "${MOO_E2E_DIR:-/tmp/moo-e2e}/$t.out" 2>&1; then
+    printf '%-12s ok    (%s checks)\n' "$t" "$(grep -c "32mPASS" "${MOO_E2E_DIR:-/tmp/moo-e2e}/$t.out")"
   else
-    printf '%-12s FAIL  see %s\n' "$t" "${OCL_E2E_DIR:-/tmp/ocl-e2e}/$t.out"
+    printf '%-12s FAIL  see %s\n' "$t" "${MOO_E2E_DIR:-/tmp/moo-e2e}/$t.out"
     rc=1
   fi
 done

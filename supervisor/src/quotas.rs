@@ -7,10 +7,10 @@
 
 use crate::state::{Actor, Sup, CMD_TIMEOUT};
 use anyhow::{bail, Result};
-use ocl_protocol::api::*;
-use ocl_protocol::config::QuotaOverride;
-use ocl_protocol::link::NodeCommand;
-use ocl_protocol::model::*;
+use moocher_protocol::api::*;
+use moocher_protocol::config::QuotaOverride;
+use moocher_protocol::link::NodeCommand;
+use moocher_protocol::model::*;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 

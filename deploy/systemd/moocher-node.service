@@ -1,25 +1,25 @@
-# opencode-cluster node, rootful Podman (the hub's own node or a worker).
+# moocher node, rootful Podman (the hub's own node or a worker).
 # Root is needed for rootful Podman and for `disk_enforce: hard` quotas;
 # the agents themselves run as uid 1000 inside --network=none containers.
 #
-#   install -m 0644 deploy/systemd/opencode-node.service /etc/systemd/system/
-#   opencode-node --config-dir /etc/ocl/node join …   # once, for a remote worker
-#   systemctl enable --now opencode-node
+#   install -m 0644 deploy/systemd/moocher-node.service /etc/systemd/system/
+#   moocher-node --config-dir /etc/moo/node join …   # once, for a remote worker
+#   systemctl enable --now moocher-node
 #
 # Provider keys: keep them out of node.yaml and environment files; use
 # systemd credentials, referenced as `key: { ref: "systemd-creds:openrouter" }`:
-#   systemd-creds encrypt --name=openrouter key.txt /etc/ocl/creds/openrouter.cred
+#   systemd-creds encrypt --name=openrouter key.txt /etc/moo/creds/openrouter.cred
 # and uncomment LoadCredentialEncrypted below (one line per key). keyproxy
 # reads the key per request, so `systemctl restart` is needed only to add one.
 [Unit]
-Description=opencode-cluster node
-Documentation=file:///usr/share/doc/opencode-cluster/RUNBOOK.md
-After=network-online.target ocl-supervisor.service
+Description=moocher node
+Documentation=file:///usr/share/doc/moocher/RUNBOOK.md
+After=network-online.target moocher-hub.service
 Wants=network-online.target
 
 [Service]
 Type=exec
-ExecStart=/usr/local/bin/opencode-node --config-dir /etc/ocl/node run
+ExecStart=/usr/local/bin/moocher-node --config-dir /etc/moo/node run
 Restart=on-failure
 RestartSec=5s
 # Stopping the node leaves agent containers running (by design: they are
@@ -27,12 +27,12 @@ RestartSec=5s
 KillMode=process
 TimeoutStopSec=20s
 Environment=RUST_LOG=info
-#LoadCredentialEncrypted=openrouter:/etc/ocl/creds/openrouter.cred
+#LoadCredentialEncrypted=openrouter:/etc/moo/creds/openrouter.cred
 
-ConfigurationDirectory=ocl/node
+ConfigurationDirectory=moo/node
 ConfigurationDirectoryMode=0750
-StateDirectory=ocl/node
-RuntimeDirectory=ocl
+StateDirectory=moo/node
+RuntimeDirectory=moo
 RuntimeDirectoryMode=0711
 RuntimeDirectoryPreserve=yes
 UMask=0027

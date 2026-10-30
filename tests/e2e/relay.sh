@@ -23,7 +23,7 @@ YAML
 start_node worker-b; start_node relay-2
 wait_for 20 "worker-b connected" is_connected worker-b
 wait_for 20 "relay-2 connected" is_connected relay-2
-expect "worker-b's builder config is valid with a via_node route" bash -c "$BIN/opencode-node --config-dir $W/worker-b check | grep -q '✓ agent builder'"
+expect "worker-b's builder config is valid with a via_node route" bash -c "$BIN/moocher-node --config-dir $W/worker-b check | grep -q '✓ agent builder'"
 
 say "LLM calls leave through the relay's IP"
 SID=$($O spawn builder --node worker-b -p "Write greet(name) in greet.py with pytest tests." --json | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
@@ -34,7 +34,7 @@ echo "  mock saw chat requests from: $CLIENTS"
 AUTH=$(curl -s http://127.0.0.1:8099/v1/_log | python3 -c 'import sys,json;print({e["auth"] for e in json.load(sys.stdin)} == {"Bearer '"$MOCK_API_KEY"'"})')
 [ "$AUTH" = True ] && pass "real key injected by worker-b (relay only forwards bytes)" || fail "real key injected by worker-b"
 expect "relay-2 holds no provider key file or agents" bash -c "[ ! -d $W/relay-2/agents ]"
-M=$(curl -s -H "Authorization: Bearer $OCL_TOKEN" http://127.0.0.1:7700/metrics | grep 'ocl_relay_bytes_total{relay="relay-2",direction="in"}' | awk '{print $2}')
+M=$(curl -s -H "Authorization: Bearer $MOO_TOKEN" http://127.0.0.1:7700/metrics | grep 'moo_relay_bytes_total{relay="relay-2",direction="in"}' | awk '{print $2}')
 [ "${M:-0}" -gt 0 ] && pass "hub counts relayed bytes ($M in)" || fail "hub counts relayed bytes"
 
 say "relay limits and failures"

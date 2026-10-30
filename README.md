@@ -1,11 +1,11 @@
-# opencode-cluster
+# moocher
 
-Run [OpenCode](https://opencode.ai) agents across several Linux machines as one cluster you can observe and control.
+Run [OpenCode](https://opencode.ai) agents across several Linux machines as one cluster you can observe and control. (Formerly opencode-cluster: `moo` was `ocl`, `moocher-hub` was `ocl-supervisor`, `moocher-node` was `opencode-node`, `moo-bridge` was `ocl-bridge`. Upgrading an existing install: [RUNBOOK §10](docs/RUNBOOK.md#10-upgrading-from-opencode-cluster).)
 
 - **Supervisor** (hub): node registry, workflows (plan → build → review), a **task bucket** worked by a coordinator "main agent", REST/SSE API, hash-chained audit log. It holds no provider secrets.
-- **opencode-node** (every machine, including the hub): runs each OpenCode session in a locked-down **Podman** container (no network, read-only config, all capabilities dropped). It injects provider keys through a local proxy, so agents only ever hold a revocable, budget-capped capability token. It also serves the `cluster_*` MCP tools agents use to message, delegate and report.
-- **Dashboard**: a mobile-first web UI served by the supervisor (password login, HTTPS on your domain via Let's Encrypt, phone push), plus `ocl` (CLI) and `ocl tui`.
-- **Remote machines** join with a one-time token (`ocl node invite`, then `opencode-node join`). Relay-only machines lend their IP to other nodes' LLM calls.
+- **moocher-node** (every machine, including the hub): runs each OpenCode session in a locked-down **Podman** container (no network, read-only config, all capabilities dropped). It injects provider keys through a local proxy, so agents only ever hold a revocable, budget-capped capability token. It also serves the `cluster_*` MCP tools agents use to message, delegate and report.
+- **Dashboard**: a mobile-first web UI served by the supervisor (password login, HTTPS on your domain via Let's Encrypt, phone push), plus `moo` (CLI) and `moo tui`.
+- **Remote machines** join with a one-time token (`moo node invite`, then `moocher-node join`). Relay-only machines lend their IP to other nodes' LLM calls.
 
 Status: **Phase 5 complete** (Phases 1–4 plus hardening):
 - remote workers and IP-lending relays over mTLS, with join tokens, approval, revocation and a source allowlist;
@@ -39,7 +39,7 @@ Docs:
 
 | Binary | Crate |
 |---|---|
-| `ocl-supervisor` | `supervisor/` |
-| `opencode-node` | `node-daemon/` |
-| `ocl-bridge` | `bridge/` (static, runs inside agent containers) |
-| `ocl` | `cli/` |
+| `moocher-hub` | `supervisor/` |
+| `moocher-node` | `node-daemon/` |
+| `moo-bridge` | `bridge/` (static, runs inside agent containers) |
+| `moo` | `cli/` |

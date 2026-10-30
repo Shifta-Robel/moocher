@@ -12,7 +12,7 @@ use crate::state::Sup;
 use anyhow::{anyhow, bail, Context, Result};
 use axum::body::Body;
 use axum::http::{header, HeaderMap, Request, Response, StatusCode};
-use ocl_protocol::config::{AcmeConfig, TlsConfig};
+use moocher_protocol::config::{AcmeConfig, TlsConfig};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use std::collections::HashMap;
@@ -58,8 +58,8 @@ impl ResolvesServerCert for CertStore {
 
 impl CertStore {
     pub fn set_pem(&self, chain_pem: &str, key_pem: &str) -> Result<Ts> {
-        let certs = ocl_protocol::tls::certs_from_pem(chain_pem)?;
-        let key = ocl_protocol::tls::key_from_pem(key_pem)?;
+        let certs = moocher_protocol::tls::certs_from_pem(chain_pem)?;
+        let key = moocher_protocol::tls::key_from_pem(key_pem)?;
         let signer = rustls::crypto::ring::sign::any_supported_type(&key).map_err(|e| anyhow!("unsupported key: {e}"))?;
         let expires = cert_expiry(chain_pem).unwrap_or(0);
         *self.current.write().unwrap() = Some(Arc::new(CertifiedKey::new(certs, signer)));
@@ -74,7 +74,7 @@ type Ts = i64;
 
 /// notAfter of the first certificate in a PEM chain, unix ms.
 pub fn cert_expiry(pem: &str) -> Option<Ts> {
-    let der = ocl_protocol::tls::certs_from_pem(pem).ok()?.into_iter().next()?;
+    let der = moocher_protocol::tls::certs_from_pem(pem).ok()?.into_iter().next()?;
     let (_, cert) = x509_parser::parse_x509_certificate(der.as_ref()).ok()?;
     Some(cert.validity().not_after.timestamp() * 1000)
 }
@@ -219,7 +219,7 @@ async fn acme_loop(sup: Arc<Sup>, cfg: AcmeConfig, store: Arc<CertStore>, challe
     let mut backoff = 60u64;
     loop {
         let due = match std::fs::read_to_string(dir.join("cert.pem")).ok().and_then(|c| cert_expiry(&c)) {
-            Some(exp) if store.ready() => exp - ocl_protocol::model::now_ms() < 30 * 86_400_000,
+            Some(exp) if store.ready() => exp - moocher_protocol::model::now_ms() < 30 * 86_400_000,
             _ => true,
         };
         if due {

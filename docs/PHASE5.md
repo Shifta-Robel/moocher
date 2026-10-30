@@ -11,7 +11,7 @@ Usage: [USAGE.md](./USAGE.md) §15, §28–31. Operations: [RUNBOOK.md](./RUNBOO
 | Usage metering | `node-daemon/src/usage.rs`, `gateway.rs` | keyproxy reads the usage the provider reports, from JSON bodies and SSE streams, as they pass. It understands OpenAI chat, the Responses API, Anthropic and Gemini, and adds `stream_options.include_usage` to OpenAI-compatible streams. Budgets and token caps use the larger of OpenCode's count and the meter's. `usage.mismatch` is raised when the meter is clearly ahead. The metered count is kept with the session report, so it survives node restarts. It is shown in the CLI and the dashboard and used by stats and recovery estimates. |
 | Egress allowlist | `node-daemon/src/egress_proxy.rs`, `runtime.rs`, `config.rs` | `container.egress: allowlist` with `allow_hosts`. The container keeps `--network=none`; the bridge forwards `127.0.0.1:3128` to a per-instance proxy on the node, which accepts CONNECT and plain HTTP. The list is read live. A listed name that resolves to an internal address is refused. Refusals are recorded as `egress.denied`. |
 | Hard disk limits | `node-daemon/src/disk_quota.rs` | `disk_enforce: hard` puts the instance's home and its isolated workspace under one XFS project quota or btrfs qgroup. The node checks the filesystem, its mount options and root at start, and refuses to run where quotas cannot work. Quotas are cleared at reap. |
-| Housekeeping | `supervisor/src/retention.rs` | Hourly. Events are exported by UTC day to `exports/events-YYYYMMDD.jsonl.zst`; the export is incremental by event id, appending zstd frames. Only exported events are pruned. Artifacts expire after `artifacts.retain`, except those tagged `keep` and anything still referenced. `ocl housekeeping [--dry-run] [--ahead 1d]` runs it on demand; `ocl-supervisor events-cat` reads exports. Audited. |
+| Housekeeping | `supervisor/src/retention.rs` | Hourly. Events are exported by UTC day to `exports/events-YYYYMMDD.jsonl.zst`; the export is incremental by event id, appending zstd frames. Only exported events are pruned. Artifacts expire after `artifacts.retain`, except those tagged `keep` and anything still referenced. `moo housekeeping [--dry-run] [--ahead 1d]` runs it on demand; `moocher-hub events-cat` reads exports. Audited. |
 | systemd and Quadlet | `deploy/`, `images/supervisor/Containerfile` | A hardened supervisor unit, a rootful node unit, a rootless node user unit, and a Quadlet plus image for the supervisor. `tests/deploy-check.sh` runs `systemd-analyze verify` and `security`, and Quadlet's generator. |
 | Load and chaos | `tests/e2e/load.sh` | 12 instances on 3 nodes under a shared allowance that is too small. Then a worker is killed with 4 instances mid-task, then the supervisor is killed under load. Latency and memory are reported. |
 | Security audit | `tests/audit.py` | An offline `cargo audit` against the RustSec database. |
@@ -64,7 +64,7 @@ All seventeen suites passed in one run (`tests/e2e/run-all.sh` with `PEBBLE_DIR`
 | Advisory | Crate | Action |
 |---|---|---|
 | RUSTSEC-2026-0387: timing variability in "constant-time" operations | crypto-bigint 0.5.5, via p256 (Web Push ECDH, VAPID signing) | **Fixed**: p256 0.14 → crypto-bigint 0.7.7. The RFC 8291 test vector still matches byte for byte; VAPID JWTs verify; existing key files load. |
-| RUSTSEC-2026-0002, -0253: unsound `IterMut`, use-after-free in `pop` | lru 0.12.5, via ratatui (`ocl tui`) | **Fixed**: ratatui 0.30 (lru 0.18.5), crossterm 0.29. |
+| RUSTSEC-2026-0002, -0253: unsound `IterMut`, use-after-free in `pop` | lru 0.12.5, via ratatui (`moo tui`) | **Fixed**: ratatui 0.30 (lru 0.18.5), crossterm 0.29. |
 | RUSTSEC-2024-0436: unmaintained | paste, via ratatui | **Gone** with ratatui 0.30. |
 | RUSTSEC-2024-0449: unmaintained | unsafe-libyaml, via serde_yaml | **Accepted**: no known vulnerability; it parses operator-owned config only (agents cannot write config). Replacing serde_yaml is a separate change. |
 
@@ -88,12 +88,12 @@ All seventeen suites passed in one run (`tests/e2e/run-all.sh` with `PEBBLE_DIR`
 | **systemd** | Units verified statically (`systemd-analyze verify`/`security`, Quadlet dry run), not run under a real systemd. |
 | **Warm pool** | Deferred. One instance boots in ~4 s, but OpenCode needs ~9 CPU-seconds to boot. On this 4-core machine, 12 at once took 28 s alone and 54–65 s (p50) under the load test, with debug daemons on the same cores. A pool would help bursty spawns on small hosts. It needs instance ids decoupled from sockets, config and capability tokens; that is the next step if start time matters. |
 | **429 overshoot on a shared IP** | Each node learns a shared allowance's remaining count from its own responses, so near a window's end requests in flight on other nodes can overshoot. The overshoot is bounded by the number of concurrent requests (1–4 of ~62 here). Every 429 is absorbed (the session parks until the reset); none fails. |
-| `ocl quotas` "USED" | For provider-learned limits it shows requests counted since tracking began, not within the current window (LEFT and RESETS are the window's). |
+| `moo quotas` "USED" | For provider-learned limits it shows requests counted since tracking began, not within the current window (LEFT and RESETS are the window's). |
 | Halts after node death | Which of the 4 lost sessions resume automatically depends on the cost estimate against `max_auto_fraction` (across runs, 2 to 4 of 4 resumed; in the final run all 4). This is the default policy as designed. |
 
 ## Measured footprint
 
-Release builds: supervisor 22.4 MB (Phase 4: 21.5), node 22.3 MB (22.0), `ocl` 11.2 MB, `ocl-bridge` 1.2 MB. Under the 12-instance load (debug builds): supervisor 32 MB, nodes 32–33 MB.
+Release builds: supervisor 22.4 MB (Phase 4: 21.5), node 22.3 MB (22.0), `moo` 11.2 MB, `moo-bridge` 1.2 MB. Under the 12-instance load (debug builds): supervisor 32 MB, nodes 32–33 MB.
 
 | Latency (12 instances at once, 4 cores) | p50 | p95 |
 |---|---|---|

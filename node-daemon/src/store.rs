@@ -2,8 +2,8 @@
 //! telemetry outbox (survives supervisor downtime).
 
 use anyhow::Result;
-use ocl_protocol::link::NodeEvent;
-use ocl_protocol::model::SessionReport;
+use moocher_protocol::link::NodeEvent;
+use moocher_protocol::model::SessionReport;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
@@ -107,7 +107,7 @@ impl Store {
 
     /// The last state of a workspace both this node and the hub agree on:
     /// (manifest, artifact reference, manifest digest).
-    pub fn ws_base(&self, label: &str) -> Option<(ocl_protocol::archive::Manifest, String, String)> {
+    pub fn ws_base(&self, label: &str) -> Option<(moocher_protocol::archive::Manifest, String, String)> {
         let row: Option<(String, String, String)> = self
             .conn
             .lock()
@@ -119,7 +119,7 @@ impl Store {
         row.and_then(|(m, r, d)| Some((serde_json::from_str(&m).ok()?, r, d)))
     }
 
-    pub fn set_ws_base(&self, label: &str, m: &ocl_protocol::archive::Manifest, reference: &str, digest: &str) -> Result<()> {
+    pub fn set_ws_base(&self, label: &str, m: &moocher_protocol::archive::Manifest, reference: &str, digest: &str) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "INSERT INTO ws_base(label,manifest,reference,digest) VALUES(?1,?2,?3,?4)
              ON CONFLICT(label) DO UPDATE SET manifest=excluded.manifest, reference=excluded.reference, digest=excluded.digest",

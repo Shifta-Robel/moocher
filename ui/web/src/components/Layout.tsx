@@ -10,7 +10,7 @@ import { Toasts } from "./ui";
 type Theme = "system" | "light" | "dark";
 const readTheme = (): Theme => {
   try {
-    return (localStorage.getItem("ocl-theme") as Theme) || "system";
+    return (localStorage.getItem("moo-theme") as Theme) || "system";
   } catch {
     return "system";
   }
@@ -19,7 +19,7 @@ export const [theme, setThemeSig] = createSignal<Theme>(readTheme());
 export function setTheme(t: Theme) {
   setThemeSig(t);
   try {
-    localStorage.setItem("ocl-theme", t);
+    localStorage.setItem("moo-theme", t);
   } catch {}
   applyTheme();
 }
@@ -120,7 +120,7 @@ export default function Layout(p: { children?: JSX.Element }) {
       <aside class="sticky top-0 hidden h-dvh w-60 shrink-0 flex-col border-r border-slate-200 bg-white/70 p-3 md:flex dark:border-slate-800 dark:bg-slate-900/60">
         <div class="mb-4 flex items-center gap-2 px-2 pt-1">
           <img src="/icon.svg" class="size-7" alt="" />
-          <span class="font-semibold">opencode-cluster</span>
+          <span class="font-semibold">moocher</span>
         </div>
         <nav class="flex flex-1 flex-col gap-0.5" aria-label="main">
           <For each={NAV}>{(n) => <NavLink {...n} />}</For>

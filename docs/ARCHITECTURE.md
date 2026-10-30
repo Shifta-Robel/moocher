@@ -1,4 +1,4 @@
-# opencode-cluster — Architecture (v1, after Phase 4)
+# moocher — Architecture (v1, after Phase 4)
 
 > Status: Phases 1–4 implemented and verified end to end (see [`PHASE1.md`](./PHASE1.md), [`PHASE2.md`](./PHASE2.md), [`PHASE3.md`](./PHASE3.md), [`PHASE4.md`](./PHASE4.md)). Operations: [`RUNBOOK.md`](./RUNBOOK.md). Phase 0 notes: [`PHASE0.md`](./PHASE0.md). Running it: [`QUICKSTART.md`](./QUICKSTART.md). Config reference: [`CONFIG.md`](./CONFIG.md). Design additions (reviewed): [`PHASE1_5.md`](./PHASE1_5.md) (§12).
 > Sections marked **(Phase N)** describe designed-but-not-yet-built parts.
@@ -13,7 +13,7 @@ Turn OpenCode instances spread across several Linux machines into one cluster yo
 flowchart LR
   subgraph Operator
     WEB[Web UI<br/>mobile-first SPA]
-    TUI[ocl tui / ocl CLI]
+    TUI[moo tui / moo CLI]
   end
   subgraph HUB["Hub machine (always-on)"]
     SUP[supervisor<br/>Rust: axum + tonic]
@@ -23,7 +23,7 @@ flowchart LR
     SUP --- CAS
   end
   subgraph NODE["Each node (the hub runs one too)"]
-    ND[opencode-node<br/>Rust daemon]
+    ND[moocher-node<br/>Rust daemon]
     KP[keyproxy<br/>in-process]
     MCP[cluster MCP<br/>in-process]
     OUT[(outbox SQLite)]
@@ -31,11 +31,11 @@ flowchart LR
     ND --- MCP
     ND --- OUT
     subgraph POD["podman container per session (--network=none)"]
-      BR[ocl-bridge<br/>UDS⇄TCP]
+      BR[moo-bridge<br/>UDS⇄TCP]
       OC[opencode serve]
       BR --- OC
     end
-    ND <-->|UDS: /run/ocl/<session>/| BR
+    ND <-->|UDS: /run/moo/<session>/| BR
   end
   WEB & TUI -->|HTTPS REST + SSE<br/>cookie / API token| SUP
   ND <-->|gRPC bidi stream, node dials out<br/>UDS on the hub · mTLS for remote nodes| SUP
@@ -46,11 +46,11 @@ flowchart LR
 | Component | Lang | Responsibility | Budget |
 |---|---|---|---|
 | `supervisor/` | Rust (tokio, axum, tonic, rusqlite) | Registry of nodes/agents/sessions, orchestration engine (workflows + mailboxes), artifact CAS, evaluator dispatch, operator REST/SSE API, auth, audit log, `/metrics`. **Holds no provider secrets.** | < 60 MB RSS |
-| `node-daemon/` (`opencode-node`) | Rust | Reads `~/.opencode-cluster/` (hot reload), manages Podman containers (podman CLI), drives OpenCode over its HTTP API, follows its event bus, runs **keyproxy** and **cluster MCP**, keeps an outbox and replays it after supervisor outages, reconciles on its own restart. | < 40 MB RSS (OpenCode containers excluded; ~420 MB each, measured) |
-| `ocl-bridge` | Rust, static musl, ~1 MB | Runs inside each container. Forwards UDS ⇄ loopback TCP in both directions, so the container needs **no network at all**. | negligible |
-| `shared-protocol/` | protobuf + Rust crate | gRPC node⇄supervisor envelope + JSON payload enums, REST DTOs, config schema with JSON Schema output (`opencode-node schema`). | — |
+| `node-daemon/` (`moocher-node`) | Rust | Reads `~/.moocher/` (hot reload), manages Podman containers (podman CLI), drives OpenCode over its HTTP API, follows its event bus, runs **keyproxy** and **cluster MCP**, keeps an outbox and replays it after supervisor outages, reconciles on its own restart. | < 40 MB RSS (OpenCode containers excluded; ~420 MB each, measured) |
+| `moo-bridge` | Rust, static musl, ~1 MB | Runs inside each container. Forwards UDS ⇄ loopback TCP in both directions, so the container needs **no network at all**. | negligible |
+| `shared-protocol/` | protobuf + Rust crate | gRPC node⇄supervisor envelope + JSON payload enums, REST DTOs, config schema with JSON Schema output (`moocher-node schema`). | — |
 | `ui/web` ✔ | SolidJS + Tailwind v4 + Kobalte (Vite), built into `supervisor/ui-dist` and embedded (rust-embed) | Mobile-first PWA dashboard: every view in PHASE1_5 §13c, live over SSE, Web Push service worker. | ~85 KB gz total (43 KB first load) |
-| `cli/` (`ocl`, `ocl tui`, `ocl attach`) ✔ | Rust (clap; ratatui) | Same actions as the web UI, for scripting and for SSH-only use. | — |
+| `cli/` (`moo`, `moo tui`, `moo attach`) ✔ | Rust (clap; ratatui) | Same actions as the web UI, for scripting and for SSH-only use. | — |
 
 ## 3. Key design decisions
 
@@ -64,7 +64,7 @@ flowchart LR
   - `OPENCODE_DISABLE_PROJECT_CONFIG=1`, so an agent cannot rewrite its own permissions;
   - the node waits for its model to appear in `/api/model` before the first prompt.
 
-`ocl-bridge` is the only shim, and it handles transport only. The endpoints we use are listed in `node-daemon/src/oc.rs` and unit-tested against the pinned version's OpenAPI paths.
+`moo-bridge` is the only shim, and it handles transport only. The endpoints we use are listed in `node-daemon/src/oc.rs` and unit-tested against the pinned version's OpenAPI paths.
 
 **D2 — The agent never sees a real key (keyproxy).** You asked for this. Each container's `opencode.json` points every provider's `baseURL` at `http://127.0.0.1:7777/llm/<provider>` (bridge → node UDS). The `apiKey` is a **capability token**: per session, revocable, with a budget. The keyproxy is a header-rewriting reverse proxy that passes the body through unchanged, so OpenAI-compatible, Anthropic and Gemini wire formats all work. For each request it:
 1. checks the capability against the session's model allowlist and token/USD budget;
@@ -82,7 +82,7 @@ The supervisor, the UI and other nodes only ever see *secret references* by name
 | `send_message`, `read_inbox`, `list_agents`, `list_sessions`, `session_status` | every session |
 | `ask`, `answer`, `escalate`, `questions`, `report_up`, `log_assumption` | every session (questions, §6c) |
 | `artifact_put`, `artifact_get`, `artifact_list`, `artifact_info`, `sync_workspace` | every session (artifact bytes move on the node, next to the workspace) |
-| `spawn_agent`, `stop_session`, `task_get`, `task_note`, `task_complete`, `task_fail` | coordinator sessions only (enforced on the node *and* the supervisor). The operator can start a coordinator without a task (`ocl spawn --coordinator`). |
+| `spawn_agent`, `stop_session`, `task_get`, `task_note`, `task_complete`, `task_fail` | coordinator sessions only (enforced on the node *and* the supervisor). The operator can start a coordinator without a task (`moo spawn --coordinator`). |
 
 This is the "programmatic way" for an agent to start sessions without secrets: it names a **profile**, and the node that owns the key does the rest. OpenCode's native MCP support means nothing has to be compiled into OpenCode. An `agent.tools.cluster` allowlist can narrow the set per profile.
 
@@ -97,8 +97,8 @@ This is the "programmatic way" for an agent to start sessions without secrets: i
 | message bus | **None (NATS rejected)** | Hub-and-spoke with one supervisor doesn't need a broker. Fewer daemons on 8 GB machines. NATS is the upgrade path if we ever run several supervisors. |
 
 **D5 — Node identity uses mTLS, bootstrapped by a one-time token.** Implemented in Phase 2:
-1. `ocl node invite <name> [--relay]` creates a join token `ocljoin.<secret>.<CA fingerprint>`. It is single use, expires after 15 minutes, and is bound to that name and role.
-2. `opencode-node join https://hub:7443 --token …` creates an Ed25519 key **on the node**. It connects with a TLS verifier that only accepts a server whose chain contains the CA with that fingerprint, then sends a CSR with the token over the `Enroll` RPC.
+1. `moo node invite <name> [--relay]` creates a join token `moojoin.<secret>.<CA fingerprint>`. It is single use, expires after 15 minutes, and is bound to that name and role.
+2. `moocher-node join https://hub:7443 --token …` creates an Ed25519 key **on the node**. It connects with a TLS verifier that only accepts a server whose chain contains the CA with that fingerprint, then sends a CSR with the token over the `Enroll` RPC.
 3. The supervisor's private CA (rcgen, Ed25519) signs a 30-day client certificate. The hub decides the name and ignores whatever the CSR asked for. It records the certificate's **SHA-256 fingerprint → node**, so identity is a lookup and revocation is one row. Nodes renew over the live stream at two thirds of the lifetime, with a fresh key each time.
 4. One TLS port serves both: client certificates are *optional* at the TLS layer (so `Enroll` works), and every other RPC requires an enrolled, unrevoked, approved certificate whose name matches the node's hello. The TLS listener passes peer address and certificate fingerprint into each handler.
 
@@ -111,16 +111,16 @@ We chose this over a pre-shared bearer token because:
 The operator UI uses ordinary server TLS (rustls; ACME, or a supervisor-CA certificate the operator trusts).
 
 **Adding a machine (API and CLI in Phase 2, web UI in Phase 4), as requested:**
-1. The operator (admin scope) runs `ocl node invite <name> [--relay]`, or uses **Nodes → Add machine** in the dashboard (admin scope). The API is `POST /api/v1/nodes/invite`.
-2. The reply carries a one-time join token (single use, 15 min, bound to that name and role) and a copy-paste command: `opencode-node join https://hub:7443 --token ocljoin.…`.
-3. The new machine generates its key locally, sends the CSR with the token, and receives its certificate plus the hub's CA. Then it starts `opencode-node` under systemd.
-4. The node shows up as **pending approval**. The operator approves it with `ocl node approve <name>` (or **Approve** in the dashboard; approval is optional and on by default). From then on its agents are eligible.
-5. Revoking a node (`ocl node revoke`) flags its certificates and closes its stream immediately.
+1. The operator (admin scope) runs `moo node invite <name> [--relay]`, or uses **Nodes → Add machine** in the dashboard (admin scope). The API is `POST /api/v1/nodes/invite`.
+2. The reply carries a one-time join token (single use, 15 min, bound to that name and role) and a copy-paste command: `moocher-node join https://hub:7443 --token moojoin.…`.
+3. The new machine generates its key locally, sends the CSR with the token, and receives its certificate plus the hub's CA. Then it starts `moocher-node` under systemd.
+4. The node shows up as **pending approval**. The operator approves it with `moo node approve <name>` (or **Approve** in the dashboard; approval is optional and on by default). From then on its agents are eligible.
+5. Revoking a node (`moo node revoke`) flags its certificates and closes its stream immediately.
 
 Every step is in the audit log. The token is useless after first use or once expired, and a leaked token can only enroll the name it was issued for, which is still subject to approval.
 
 **D6 — Operator authentication uses a password, a cookie and optional TOTP, plus API tokens for the CLI.** (Implemented in Phase 4.)
-- **Password:** hashed with Argon2id; users have the same `read|operate|admin` scopes as tokens (`ocl-supervisor user set`).
+- **Password:** hashed with Argon2id; users have the same `read|operate|admin` scopes as tokens (`moocher-hub user set`).
 - **Session cookie:** a random token kept only as its SHA-256; `HttpOnly; SameSite=Strict`, `Secure` over HTTPS; a CSRF token (`X-CSRF-Token`) on every change.
 - **TOTP:** optional (RFC 6238), each code accepted once.
 - **Lockouts:** per account and per source IP, doubling up to 24 h, with vital notifications; everything audited.
@@ -134,17 +134,17 @@ We chose this over OAuth because there is one trusted operator, everything is se
 - `--network=none`, `--cap-drop=all`, `--security-opt=no-new-privileges`, read-only rootfs, `--init`;
 - rootless with `--userns=keep-id:uid=1000`, or rootful with host dirs chowned to uid 1000;
 - with `--memory/--cpus/--pids-limit` taken from config;
-- with mounts: workspace, OpenCode home (so sessions survive a container restart), generated config read-only at `/etc/ocl`, and the socket dir at `/run/ocl`;
-- with labels `ocl.node`, `ocl.session`, `ocl.agent` for rediscovery.
+- with mounts: workspace, OpenCode home (so sessions survive a container restart), generated config read-only at `/etc/moo`, and the socket dir at `/run/moo`;
+- with labels `moo.node`, `moo.session`, `moo.agent` for rediscovery.
 
-`container.egress: full` gives an agent normal networking (package installs, webfetch). `egress: allowlist` keeps `--network=none` and lets HTTP(S) through a per-instance proxy on the node, to `allow_hosts` only (USAGE §29). The image is built from `images/agent/Containerfile`: OpenCode from npm (pinned) plus `ocl-bridge`, git, python3 and pytest. The base image is configurable.
+`container.egress: full` gives an agent normal networking (package installs, webfetch). `egress: allowlist` keeps `--network=none` and lets HTTP(S) through a per-instance proxy on the node, to `allow_hosts` only (USAGE §29). The image is built from `images/agent/Containerfile`: OpenCode from npm (pinned) plus `moo-bridge`, git, python3 and pytest. The base image is configurable.
 
 **D8 — Durability works the same way at every level: desired state, observed state, reconcile.**
 - **Supervisor restart:** containers keep running, and nodes keep buffering events in their outbox. Each node reconnects with a full **inventory snapshot**, and the supervisor reconciles it against SQLite. Unknown sessions are adopted; missing ones are marked `lost`, which the recovery policy treats as a death (§7a). An instance that was replaced while its node was away is stopped when the node returns. **Nothing is orphaned.**
-- **Node restart:** the node runs `podman ps --filter label=ocl.node=<me>`, restarts stopped containers, re-attaches gateway and event stream, and resyncs each session from OpenCode's message history. Verified in Phase 1, including a node restart in the middle of a workflow.
+- **Node restart:** the node runs `podman ps --filter label=moo.node=<me>`, restarts stopped containers, re-attaches gateway and event stream, and resyncs each session from OpenCode's message history. Verified in Phase 1, including a node restart in the middle of a workflow.
 - **Outbox:** sequence-numbered and acknowledged by the supervisor. Reconnect uses exponential backoff with full jitter (0.5 s → 60 s).
 
-**D9 — The hub runs its own sessions.** The hub (the always-on machine with the supervisor) also runs `opencode-node`, connected over a local unix socket. Both share the hub's config directory (`supervisor.yaml` + `node.yaml` + `agents/`). Lower the hub's `max_sessions` if it should mostly coordinate.
+**D9 — The hub runs its own sessions.** The hub (the always-on machine with the supervisor) also runs `moocher-node`, connected over a local unix socket. Both share the hub's config directory (`supervisor.yaml` + `node.yaml` + `agents/`). Lower the hub's `max_sessions` if it should mostly coordinate.
 
 **D10 — Egress routes: what IP the LLM provider sees.** A *route* only affects the keyproxy's outbound calls to the LLM provider. It doesn't change agent tools or cluster traffic.
 
@@ -171,7 +171,7 @@ routes:
   - When every route is used up, it answers 429 with `retry-after` until the soonest reset. The session shows `parked` with a countdown, and OpenCode resumes by itself.
 - **Quota buckets** are kept per provider and per egress IP, key, or account label. They are learned from rate-limit headers, `retry-after` and 429s, or from configured windows, and merged across nodes at the hub (CONFIG `quota:`).
 - **Egress IPs** come from the hub-observed link address or an `ip_echo` probe through each route.
-- **Relay admission:** relay-only nodes must connect from an allowed source (`ocl allow`).
+- **Relay admission:** relay-only nodes must connect from an allowed source (`moo allow`).
 
 ## 4. Data flow — two-agent handoff (target design)
 
@@ -217,7 +217,7 @@ sequenceDiagram
   - locality (parent session or shared workspace on the node);
   - hub link RTT.
 
-  Per-IP buckets apply to every node behind that IP. Nodes whose every route is exhausted are skipped while others have headroom. Each session stores the reason (`ocl show`), and every decision is logged as `placement.decided` with all candidates' scores. `node:` pins a node. Coordinators see the same data with `cluster_list_nodes`.
+  Per-IP buckets apply to every node behind that IP. Nodes whose every route is exhausted are skipped while others have headroom. Each session stores the reason (`moo show`), and every decision is logged as `placement.decided` with all candidates' scores. `node:` pins a node. Coordinators see the same data with `cluster_list_nodes`.
 
 ## 5a. Task bucket and the main agent
 
@@ -246,17 +246,17 @@ The operator keeps a **bucket of tasks** (CLI, dashboard and TUI) and the cluste
 - **Resources:** nodes sample every 10 s, best effort and outside the outbox.
   - Host: memory, load and disk.
   - Per instance: CPU %, memory against its limit, processes (cgroup v2 for Podman, `/proc` for the process runtime) and disk (workspace + home).
-  - The hub keeps an hour of samples in memory and one per minute for a week (`ocl stats`, `GET /sessions/{id}/stats`).
+  - The hub keeps an hour of samples in memory and one per minute for a week (`moo stats`, `GET /sessions/{id}/stats`).
   - `container.disk` is a soft limit: a warning at 90%, an interrupt at 100%.
 - **Links and providers:**
   - Hub ↔ node RTT from pings every 15 s.
   - Per route and provider: time to response headers and errors.
   - Relay tunnel setup times.
-  - `/metrics` adds `ocl_relay_tunnels_total` and `ocl_relay_bytes_total`.
+  - `/metrics` adds `moo_relay_tunnels_total` and `moo_relay_bytes_total`.
 - **Tokens and cost** come from OpenCode's per-step assistant messages. Cost uses OpenCode's figure when it is non-zero, otherwise the `prices` table in `providers.yaml`; keyless gateways cost `$0`. Keyproxy also meters usage itself from every provider response (JSON and SSE; OpenAI, Responses, Anthropic, Gemini formats) and enforces `budget_usd` / `max_tokens` against the larger of the two counts; a large gap raises `usage.mismatch` (USAGE §28).
-- **Event log:** append-only `events` table (session state changes, tool calls, turn ends, verdicts, task and run transitions). Read it with `GET /api/v1/events` or `ocl events -f`. Exported by UTC day to `exports/events-YYYYMMDD.jsonl.zst` and pruned after `events.retain` once exported (USAGE §30).
-- **Logs and metrics:** JSON logs (`tracing`, level via `OCL_LOG`). The supervisor's `/metrics` (bearer token) exposes `ocl_nodes_connected`, `ocl_sessions{state}`, `ocl_tokens_total{agent,kind}`, `ocl_cost_usd_total{agent}` and `ocl_tasks{status}`.
-- **Audit log:** append-only and **hash-chained** (`h_n = SHA-256(h_{n-1} ‖ length-prefixed fields)`) for every control action: who (operator token name, `session:<id>` for agent tool calls, or `system`), what, target and result. `ocl audit --verify` checks the chain, and a unit test proves tampering is detected.
+- **Event log:** append-only `events` table (session state changes, tool calls, turn ends, verdicts, task and run transitions). Read it with `GET /api/v1/events` or `moo events -f`. Exported by UTC day to `exports/events-YYYYMMDD.jsonl.zst` and pruned after `events.retain` once exported (USAGE §30).
+- **Logs and metrics:** JSON logs (`tracing`, level via `MOO_LOG`). The supervisor's `/metrics` (bearer token) exposes `moo_nodes_connected`, `moo_sessions{state}`, `moo_tokens_total{agent,kind}`, `moo_cost_usd_total{agent}` and `moo_tasks{status}`.
+- **Audit log:** append-only and **hash-chained** (`h_n = SHA-256(h_{n-1} ‖ length-prefixed fields)`) for every control action: who (operator token name, `session:<id>` for agent tool calls, or `system`), what, target and result. `moo audit --verify` checks the chain, and a unit test proves tampering is detected.
 
 ## 6a. Success tracking with todo lists
 
@@ -290,7 +290,7 @@ workspace:
 - **Same node:** a copy from the node's cache, with no download. A hard link would let an agent edit the cached blob in place, so the node always copies. Metadata is still recorded at the hub.
 - **Different node:** chunked upload to the hub, then download to the target.
 
-Agents use `cluster_artifact_put/get` or `cluster_sync_workspace`, and the operator uses `ocl artifact put/get/ls/show`.
+Agents use `cluster_artifact_put/get` or `cluster_sync_workspace`, and the operator uses `moo artifact put/get/ls/show`.
 
 **How the cross-machine sync works (Phase 3).** Shared workspaces are synced by **snapshot + three-way merge**, not git bundles:
 1. The holder node packs its copy as a tree artifact (tar.zst; regular files and directories only, links never followed).
@@ -301,9 +301,9 @@ This needs no git in the workspace and behaves the same for any tree. Syncs happ
 ## 7. Artifacts
 
 - **Storage:** content-addressed with BLAKE3, blobs on the hub filesystem (`<data>/artifacts/b3/<aa>/<hash>`). An `object_store` backend (S3/Garage/MinIO) remains possible later.
-- **Metadata:** in SQLite: name, media type, kind (`file` or `tree`), size, producer session and node, task, tags and parent refs (**lineage**). What an agent publishes lists the artifacts it fetched as parents; `ocl artifact show` lists parents and children.
+- **Metadata:** in SQLite: name, media type, kind (`file` or `tree`), size, producer session and node, task, tags and parent refs (**lineage**). What an agent publishes lists the artifacts it fetched as parents; `moo artifact show` lists parents and children.
 - **Transfer:** a separate `Blobs` gRPC service on the same connection as the link (mTLS or the hub socket), so a large upload never delays commands. Uploads declare their hash, and the hub skips the bytes when it already has the blob. Downloads are verified against the hash. There are no node-to-node copies. Nodes cache blobs by hash (`artifact_cache`, LRU).
-- **Trees:** a directory is a deterministic tar.zst of its regular files (paths sorted, exec bit kept). `ocl artifact get` unpacks it. Extraction accepts only plain relative paths and caps the expanded size.
+- **Trees:** a directory is a deterministic tar.zst of its regular files (paths sorted, exec bit kept). `moo artifact get` unpacks it. Extraction accepts only plain relative paths and caps the expanded size.
 - **Safety on the node:** the node reads and writes workspaces host-side. It opens files with `O_NOFOLLOW` and checks through `/proc/self/fd` that each one really is inside the workspace, so an agent's symlink cannot make it read or overwrite host files.
 
 ## 7a. Questions, deaths, harvests (Phase 3)
@@ -328,7 +328,7 @@ This needs no git in the workspace and behaves the same for any tree. Syncs happ
 | Cross-agent control plane plugin | opencode-multiagent | ❌ Reject | Removed from npm. Single-process only. |
 | Telemetry | opencode-plugin-otel (devtheops), @gcornut/opencode-otel | 🔁 **Optional** | We already get tokens and cost from durable events. Enable the plugin if you also want OTLP sent to Grafana or SigNoz. |
 | Token debugging | opencode-tokenscope | 🔁 Runbook tool | Useful for post-mortems on a single session. |
-| Credential-injecting LLM proxy | LiteLLM proxy | ❌ Build (thin, in Rust) | LiteLLM is Python with a 300 MB+ footprint and far more features than we need. Ours is a header-rewriting pass-through of a few hundred lines, inside `opencode-node`. |
+| Credential-injecting LLM proxy | LiteLLM proxy | ❌ Build (thin, in Rust) | LiteLLM is Python with a 300 MB+ footprint and far more features than we need. Ours is a header-rewriting pass-through of a few hundred lines, inside `moocher-node`. |
 | Keyless: Kilo | **OpenKilo** | ✅ Reuse its endpoint as a provider template | Free models through Kilo's gateway with no key. Routing it through keyproxy keeps metering and egress routing the same as for BYOK providers. |
 | Keyless: Pollinations | gen.pollinations.ai `/v1` (direct) · KeylessAI worker | ✅ Pollinations direct (token optional) · ⚠️ KeylessAI as best-effort fallback | KeylessAI is a third-party Cloudflare worker with no SLA. The legacy `text.pollinations.ai/openai` endpoint is deprecated. |
 | Containers | **Podman** (rootless or rootful) driven via the podman CLI | ✅ Reuse | Daemonless, works with systemd. The CLI keeps us independent of libpod API versions. Hardened systemd units and a Quadlet for the supervisor are in `deploy/` (USAGE §15). |
@@ -345,7 +345,7 @@ This needs no git in the workspace and behaves the same for any tree. Syncs happ
 
 | Asset | Where it lives | Who can see it |
 |---|---|---|
-| Provider API keys | Node secret backend | `opencode-node` keyproxy **only**. Never the supervisor, the UI or the container. |
+| Provider API keys | Node secret backend | `moocher-node` keyproxy **only**. Never the supervisor, the UI or the container. |
 | Capability tokens | Container `opencode.json` | That agent. Scoped to its session, budget-capped, revoked when the session ends. |
 | Node private key | Node `0600` file or systemd-cred | That node. |
 | Operator API tokens | Supervisor DB, SHA-256 hashed, scoped `read`/`operate`/`admin` | Shown once at creation. |
@@ -379,14 +379,14 @@ This needs no git in the workspace and behaves the same for any tree. Syncs happ
 ## 11. Repository layout
 
 ```
-opencode-cluster/
+moocher/
   shared-protocol/   proto/link.proto; src/{config,model,link,api,tls,archive}.rs
   supervisor/        src/{main,api,link,tlslink,nodes,pki,state,orch,placement,quotas,templates,resources,
                           artifacts,workspaces,questions,recovery,db}.rs
   node-daemon/       src/{main,cfgstore,manager,oc,gateway,egress,quota,relay,pki,stats,link,runtime,secrets,store,
                           cas,wsops}.rs
-  bridge/            ocl-bridge (static musl)
-  cli/               ocl (clap)
+  bridge/            moo-bridge (static musl)
+  cli/               moo (clap)
   ui/web/            dashboard (SolidJS + Tailwind + Kobalte); built into supervisor/ui-dist
   images/agent/      Containerfile
   examples/          quickstart/ (hub config + run-local.sh), remote/ (hub, worker, relay configs), mock-llm/

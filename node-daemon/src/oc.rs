@@ -1,4 +1,4 @@
-//! Minimal OpenCode server client over a Unix socket (relayed by ocl-bridge).
+//! Minimal OpenCode server client over a Unix socket (relayed by moo-bridge).
 //!
 //! Sessions run on OpenCode's v1 session API: in 1.19.4 the newer v2 runner
 //! (`/api/session/*`) does not expose MCP tools yet, and agents need the
@@ -55,9 +55,9 @@ fn enc(s: &str) -> String {
 }
 
 /// Token usage of one assistant message (v1 `AssistantMessage.tokens/cost`).
-pub fn message_usage(info: &Value) -> ocl_protocol::model::TokenUsage {
+pub fn message_usage(info: &Value) -> moocher_protocol::model::TokenUsage {
     let tk = &info["tokens"];
-    ocl_protocol::model::TokenUsage {
+    moocher_protocol::model::TokenUsage {
         input: tk["input"].as_u64().unwrap_or(0),
         output: tk["output"].as_u64().unwrap_or(0),
         reasoning: tk["reasoning"].as_u64().unwrap_or(0),
@@ -170,7 +170,7 @@ impl Client {
         Ok(v.get(session).is_some_and(|s| s["type"].as_str() != Some("idle")))
     }
 
-    pub async fn todos(&self, session: &str) -> Result<Vec<ocl_protocol::model::Todo>> {
+    pub async fn todos(&self, session: &str) -> Result<Vec<moocher_protocol::model::Todo>> {
         let v = self.call(Method::GET, &self.scoped(&format!("/session/{session}/todo")), None).await?;
         Ok(serde_json::from_value(v).unwrap_or_default())
     }

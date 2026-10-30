@@ -8,7 +8,7 @@ const check = (ok, what) => { console.log(`${ok ? "ok" : "FAIL"} ${what}`); if (
 
 const r = await fetch(url, { redirect: "manual" });
 const set = r.headers.get("set-cookie") || "";
-const cookie = (set.match(/ocl_attach=[0-9a-f]+/) || [""])[0];
+const cookie = (set.match(/moo_attach=[0-9a-f]+/) || [""])[0];
 check(r.status === 302 && cookie && /HttpOnly/i.test(set), `ticket redeemed for an HttpOnly cookie (${r.status})`);
 const H = { cookie };
 const loc = r.headers.get("location") || "";
@@ -33,7 +33,7 @@ check(sp.status === 200 && /<script[^>]+\/assets\//.test(await sp.text()), `the 
 
 const noCookie = await fetch(base + "/api/health");
 check(noCookie.status === 401, `without the cookie the hub refuses (${noCookie.status})`);
-const forged = await fetch(base + "/api/health", { headers: { cookie: "ocl_attach=" + "0".repeat(64) } });
+const forged = await fetch(base + "/api/health", { headers: { cookie: "moo_attach=" + "0".repeat(64) } });
 check(forged.status === 401, `a forged cookie is refused (${forged.status})`);
 const pw = await fetch(base + "/api/health", { headers: { authorization: "Basic " + btoa("opencode:guess") } });
 check(pw.status === 401, "basic auth alone gets nowhere (the hub checks its cookie first)");

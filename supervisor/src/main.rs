@@ -1,4 +1,4 @@
-//! ocl-supervisor — the hub's control plane. See docs/ARCHITECTURE.md.
+//! moocher-hub — the hub's control plane. See docs/ARCHITECTURE.md.
 
 mod api;
 mod artifacts;
@@ -24,17 +24,17 @@ mod workspaces;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use ocl_protocol::config::{load_yaml, SupervisorConfig};
-use ocl_protocol::proto::blobs_server::BlobsServer;
-use ocl_protocol::proto::node_link_server::NodeLinkServer;
+use moocher_protocol::config::{load_yaml, SupervisorConfig};
+use moocher_protocol::proto::blobs_server::BlobsServer;
+use moocher_protocol::proto::node_link_server::NodeLinkServer;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "ocl-supervisor", version, about = "opencode-cluster supervisor")]
+#[command(name = "moocher-hub", version, about = "moocher supervisor")]
 struct Cli {
     /// Config directory (supervisor.yaml, workflows/).
-    #[arg(long, env = "OCL_CONFIG_DIR", global = true)]
+    #[arg(long, env = "MOO_CONFIG_DIR", global = true)]
     config_dir: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
@@ -96,11 +96,11 @@ enum TokenCmd {
 }
 
 fn default_dir() -> PathBuf {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".opencode-cluster")).unwrap_or_else(|| PathBuf::from("/etc/opencode-cluster"))
+    moocher_protocol::config::default_config_dir()
 }
 
 pub fn default_link_socket() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("ocl")).unwrap_or_else(|| PathBuf::from("/run/ocl")).join("supervisor.sock")
+    std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("moo")).unwrap_or_else(|| PathBuf::from("/run/moo")).join("supervisor.sock")
 }
 
 fn load_cfg(dir: &Path) -> Result<SupervisorConfig> {
@@ -127,7 +127,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("OCL_LOG").unwrap_or_else(|_| "info".into()))
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("MOO_LOG").unwrap_or_else(|_| "info".into()))
         .with_current_span(false)
         .init();
     let dir = cli.config_dir.unwrap_or_else(default_dir);
@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
         Cmd::Init => {
             let db = open_db(&dir, &cfg)?;
             if !db.tokens()?.is_empty() {
-                anyhow::bail!("already initialised (tokens exist); use `ocl-supervisor token create` for more");
+                anyhow::bail!("already initialised (tokens exist); use `moocher-hub token create` for more");
             }
             let t = db.create_token("admin", db::Scope::Admin)?;
             db.audit("system", "init", "-", &serde_json::json!({}), true)?;
@@ -175,7 +175,7 @@ async fn main() -> Result<()> {
             let db = open_db(&dir, &cfg)?;
             match cmd {
                 UserCmd::Set { name, scope } => {
-                    if !ocl_protocol::config::valid_name(&name) {
+                    if !moocher_protocol::config::valid_name(&name) {
                         anyhow::bail!("user names are [a-z0-9-]{{1,48}}");
                     }
                     let s = db::Scope::parse(&scope).context("scope must be read, operate or admin")?;
@@ -187,7 +187,7 @@ async fn main() -> Result<()> {
                 }
                 UserCmd::List => {
                     for (n, s, t, l) in db.users() {
-                        println!("{n}\t{s}\t{}{}", if t { "totp" } else { "password" }, if l > ocl_protocol::model::now_ms() { "\tLOCKED" } else { "" });
+                        println!("{n}\t{s}\t{}{}", if t { "totp" } else { "password" }, if l > moocher_protocol::model::now_ms() { "\tLOCKED" } else { "" });
                     }
                 }
                 UserCmd::Rm { name } => {
@@ -258,7 +258,7 @@ fn read_password() -> Result<String> {
 async fn run(dir: PathBuf, cfg: SupervisorConfig) -> Result<()> {
     let db = open_db(&dir, &cfg)?;
     if db.tokens()?.is_empty() {
-        anyhow::bail!("no API tokens exist; run `ocl-supervisor init` first");
+        anyhow::bail!("no API tokens exist; run `moocher-hub init` first");
     }
     // Every node is "disconnected" until it attaches again.
     for mut n in db.nodes() {
@@ -276,7 +276,7 @@ async fn run(dir: PathBuf, cfg: SupervisorConfig) -> Result<()> {
         if s.report.state.is_live() {
             // Until its node re-attaches we cannot know; the hello reconciles it.
             let mut s = s;
-            s.report.state = ocl_protocol::model::SessionState::Unreachable;
+            s.report.state = moocher_protocol::model::SessionState::Unreachable;
             sup.db.put_session(&s)?;
         }
     }
@@ -303,8 +303,8 @@ async fn run(dir: PathBuf, cfg: SupervisorConfig) -> Result<()> {
             let ca = pki::Ca::open(&data.join("pki"))?;
             let names = if sup.cfg.public_names.is_empty() { pki::default_names() } else { sup.cfg.public_names.clone() };
             let (chain, key) = ca.link_cert(&names)?;
-            let ca_der = ocl_protocol::tls::certs_from_pem(&ca.cert_pem)?;
-            let tls = ocl_protocol::tls::link_server(ocl_protocol::tls::certs_from_pem(&chain)?, ocl_protocol::tls::key_from_pem(&key)?, &ca_der)?;
+            let ca_der = moocher_protocol::tls::certs_from_pem(&ca.cert_pem)?;
+            let tls = moocher_protocol::tls::link_server(moocher_protocol::tls::certs_from_pem(&chain)?, moocher_protocol::tls::key_from_pem(&key)?, &ca_der)?;
             tracing::info!(listen = %listen, names = ?names, ca_fingerprint = %ca.fingerprint(), "remote node link (mTLS) enabled");
             let _ = sup.ca.set(ca);
             let incoming = tlslink::incoming(&listen, tls).await?;
@@ -344,7 +344,7 @@ async fn run(dir: PathBuf, cfg: SupervisorConfig) -> Result<()> {
         tokio::spawn(attach::serve(sup.clone(), l, attach_tls));
     }
     if sup.db.users().is_empty() {
-        tracing::warn!("no web UI user yet: create one with `ocl-supervisor user set <name>`");
+        tracing::warn!("no web UI user yet: create one with `moocher-hub user set <name>`");
     }
     let api = web::serve(listener, api::router(sup.clone()), api_tls);
 
@@ -361,7 +361,7 @@ async fn run(dir: PathBuf, cfg: SupervisorConfig) -> Result<()> {
     }
     tokio::spawn(sup.clone().watch_library());
     tokio::spawn(sup.clone().housekeeping_loop());
-    sup.audit(&state::Actor::System, "supervisor.start", "-", serde_json::json!({"version": ocl_protocol::VERSION}), true);
+    sup.audit(&state::Actor::System, "supervisor.start", "-", serde_json::json!({"version": moocher_protocol::VERSION}), true);
     tracing::info!(api = %api_listen, link = %sock.display(), "supervisor running");
     let sup2: Arc<state::Sup> = sup.clone();
     tokio::select! {

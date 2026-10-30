@@ -1,4 +1,4 @@
-//! `ocl tui`: the dashboard's core views in a terminal (over SSH, too).
+//! `moo tui`: the dashboard's core views in a terminal (over SSH, too).
 //!
 //! Views: instances, questions, tasks & halts, nodes. Keys are shown in the
 //! footer: `1`–`4` or Tab switch views, ↑/↓ select, Enter shows details,
@@ -8,8 +8,8 @@
 use crate::Api;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ocl_protocol::api::Overview;
-use ocl_protocol::model::*;
+use moocher_protocol::api::Overview;
+use moocher_protocol::model::*;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -101,7 +101,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         })
         .collect();
     let sel = VIEWS.iter().position(|(v, _)| *v == app.view).unwrap_or(0);
-    f.render_widget(Tabs::new(titles).select(sel).block(Block::default().borders(Borders::ALL).title(" opencode-cluster ")).highlight_style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)), chunks[0]);
+    f.render_widget(Tabs::new(titles).select(sel).block(Block::default().borders(Borders::ALL).title(" moocher ")).highlight_style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)), chunks[0]);
     let mut ts = TableState::default();
     ts.select(Some(app.sel.min(app.rows().saturating_sub(1))));
     let hl = Style::default().add_modifier(Modifier::REVERSED);

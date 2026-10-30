@@ -5,8 +5,8 @@
 //! `node.key` (0600), `node.crt`, `ca.crt`, `node.json` (name, expiry).
 
 use anyhow::{anyhow, bail, Context, Result};
-use ocl_protocol::model::{now_ms, Ts};
-use ocl_protocol::tls;
+use moocher_protocol::model::{now_ms, Ts};
+use moocher_protocol::tls;
 use rcgen::{CertificateParams, KeyPair, PKCS_ED25519};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -73,7 +73,7 @@ impl Pki {
 
     pub fn client_config(&self) -> Result<Arc<rustls::ClientConfig>> {
         if !self.exists() {
-            bail!("no node certificate in {} — enroll this machine first: opencode-node join https://<hub>:7443 --token <join token>", self.dir.display());
+            bail!("no node certificate in {} — enroll this machine first: moocher-node join https://<hub>:7443 --token <join token>", self.dir.display());
         }
         let read = |f: &str| std::fs::read_to_string(self.dir.join(f)).with_context(|| format!("reading {}", self.dir.join(f).display()));
         let ca = tls::certs_from_pem(&read("ca.crt")?)?;
@@ -138,14 +138,14 @@ pub struct Enrolled {
     pub expires_at: Ts,
 }
 
-/// `opencode-node join`: enroll with a one-time join token.
+/// `moocher-node join`: enroll with a one-time join token.
 pub async fn join(pki: &Pki, url: &str, token: &str) -> Result<Enrolled> {
     let t = tls::JoinToken::parse(token)?;
     let (key_pem, csr_pem) = new_key_and_csr()?;
     let ch = tls_channel(url, Arc::new(tls::pinned_ca_client(&t.ca_fingerprint)?)).await?;
-    let mut client = ocl_protocol::proto::node_link_client::NodeLinkClient::new(ch);
+    let mut client = moocher_protocol::proto::node_link_client::NodeLinkClient::new(ch);
     let r = client
-        .enroll(ocl_protocol::proto::EnrollRequest { token: t.secret.clone(), csr_pem })
+        .enroll(moocher_protocol::proto::EnrollRequest { token: t.secret.clone(), csr_pem })
         .await
         .map_err(|s| anyhow!("enrollment refused: {}", s.message()))?
         .into_inner();

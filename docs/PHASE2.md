@@ -9,7 +9,7 @@ Design: [PHASE1_5.md](./PHASE1_5.md). Operations: [RUNBOOK.md](./RUNBOOK.md). Co
 | Piece | Where | Notes |
 |---|---|---|
 | Cluster CA, link TLS | `supervisor/src/{pki,tlslink}.rs`, `shared-protocol/src/tls.rs` | Ed25519 CA (rcgen), TLS 1.3 (rustls/ring). The link certificate covers `public_names` and is reissued when they change. The TLS listener puts peer address + client-cert fingerprint into every gRPC call. |
-| Enrollment and admission | `supervisor/src/nodes.rs`, `node-daemon/src/pki.rs` | Join tokens `ocljoin.<secret>.<CA fingerprint>` (single use, 15 min, bound to name + role). CA pinning on first contact. CSR issuance (the key stays on the node). Approval, revocation, renewal at 2/3 of the lifetime. Source allowlist for relays (or all nodes). |
+| Enrollment and admission | `supervisor/src/nodes.rs`, `node-daemon/src/pki.rs` | Join tokens `moojoin.<secret>.<CA fingerprint>` (single use, 15 min, bound to name + role). CA pinning on first contact. CSR issuance (the key stays on the node). Approval, revocation, renewal at 2/3 of the lifetime. Source allowlist for relays (or all nodes). |
 | Relay nodes and `via_node` | `node-daemon/src/relay.rs`, `supervisor/src/link.rs` (`Tunnel` RPC) | keyproxy → local SOCKS5 (password) → `Tunnel{Dial}` → hub → `OpenTunnel` → relay connects from its IP (or `egress_bind`) → `Tunnel{Accept}` → spliced. `relay_ports` / `relay_allow_hosts` limits. `role: relay` needs no Podman. |
 | Egress IPs | `node-daemon/src/egress.rs` | Per route: the hub-observed address or an `ip_echo` probe through that route. One HTTP client per route, shared by all sessions. |
 | Quotas and failover | `node-daemon/src/quota.rs`, `gateway.rs`, `supervisor/src/quotas.rs` | Buckets per provider × IP/key/account. Learned from rate-limit headers (OpenAI/Groq, Anthropic, OpenRouter), `retry-after`, Gemini `retryDelay`, and 429s; configured fixed/rolling windows with wall-clock resets; overrides. Persisted, merged across nodes. Route plans with failover; the new `parked` state. |
@@ -17,7 +17,7 @@ Design: [PHASE1_5.md](./PHASE1_5.md). Operations: [RUNBOOK.md](./RUNBOOK.md). Co
 | Placement | `supervisor/src/placement.rs` | Score = capacity, quota headroom, provider latency, locality, link RTT (weights configurable). Exhausted nodes are skipped. The reason is stored per session. `cluster_list_nodes` tool. |
 | Templates and preamble | `supervisor/src/templates.rs`, `node-daemon/src/{cfgstore,manager}.rs` | Hub `templates/` + `preambles/cluster.md` pushed to nodes and cached. Secret aliases via node `secrets:`. `instances.max`, `overridable`. Layered rendered preamble, readable per session. `hub_templates: false` opt-out. |
 | Resource stats | `node-daemon/src/stats.rs`, `supervisor/src/resources.rs` | Host + instance CPU/memory/pids/disk every 10 s (cgroup v2 or `/proc`). An hour in memory, minute samples for 7 days. Soft `container.disk` limit, sized `/tmp`. |
-| CLI | `cli/` | `ocl node invite/approve/revoke/forget/probe`, `ocl allow`, `ocl quotas`, `ocl ips`, `ocl quota set/clear`, `ocl route set/clear`, `ocl templates`, `ocl stats`, `ocl show --preamble`, spawn `--append/--budget/--route`. |
+| CLI | `cli/` | `moo node invite/approve/revoke/forget/probe`, `moo allow`, `moo quotas`, `moo ips`, `moo quota set/clear`, `moo route set/clear`, `moo templates`, `moo stats`, `moo show --preamble`, spawn `--append/--budget/--route`. |
 | E2E suites | `tests/e2e/` | Six suites, 103 checks, rerunnable on one machine. (The Phase 2 report first said 109: the counter also counted each suite's "ALL PASSED" line; fixed in Phase 3.) |
 
 ## Verified (each was run, not just compiled)
@@ -28,20 +28,20 @@ All six suites passed back to back (`tests/e2e/run-all.sh`). The Phase 1 demo (`
 |---|---|
 | Remote enrollment with a credential | A worker joins with a token; `node.key` is 0600 on the node. The node is `pending` until approved, then connects and runs a session; the hub records its source IP. |
 | Tokens and CA pinning | A reused token is refused. A token with the wrong CA fingerprint is refused before anything is sent. |
-| Relay allowlist (your request) | A relay join from a non-allowed IP is refused and allowed once `ocl allow add` covers it. Removing the entry disconnects the relay immediately and keeps it out. Workers are unaffected under `enforce_for: relay`. Spawning on a relay is refused. |
+| Relay allowlist (your request) | A relay join from a non-allowed IP is refused and allowed once `moo allow add` covers it. Removing the entry disconnects the relay immediately and keeps it out. Workers are unaffected under `enforce_for: relay`. Spawning on a relay is refused. |
 | Revocation and renewal | A revoked node is disconnected and cannot reconnect. Renewal (forced by backdating) issues a new certificate, and the node reconnects with it. |
 | `via_node` egress | The provider saw **only** the relay's address (127.0.0.2 via `egress_bind`), and the real key was injected on the worker. The hub counted the relayed bytes. |
 | Relay failure handling | With the relay refusing the port, the session showed `retrying (attempt 1, next in 2s): … relay-2: port 8099 is not in this relay's relay_ports [443]`. Once the port was allowed, it finished the turn by itself. |
-| Usage per IP for keyless providers | `ocl quotas`: `mock ip 127.0.0.1 requests 4/4 EXHAUSTED resets in 34s (header)`. The hub's per-IP counts equal the provider's own counts. Tokens are attributed per IP. |
-| Agents sharing an IP | `ocl ips` → `127.0.0.1 nodes hub,worker-b`. |
+| Usage per IP for keyless providers | `moo quotas`: `mock ip 127.0.0.1 requests 4/4 EXHAUSTED resets in 34s (header)`. The hub's per-IP counts equal the provider's own counts. Tokens are attributed per IP. |
+| Agents sharing an IP | `moo ips` → `127.0.0.1 nodes hub,worker-b`. |
 | Failover to another IP when the allowance runs out | Mid-turn the direct allowance (4 requests) ran out; the remaining requests went out via the relay (`{'127.0.0.1': 4, '127.0.0.2': 3}`). A `route.failover` event was recorded, and later `route.restored`. |
-| Time left until reset, and setting it yourself | Reset countdowns are learned from headers. `ocl quota set mock --scope-id 127.0.0.2 --remaining 0 --resets-at +20s` was written to the node's `overrides.yaml`, and `ocl quota clear` removed it. |
+| Time left until reset, and setting it yourself | Reset countdowns are learned from headers. `moo quota set mock --scope-id 127.0.0.2 --remaining 0 --resets-at +20s` was written to the node's `overrides.yaml`, and `moo quota clear` removed it. |
 | Parking | With both IPs exhausted the session was `parked` (`resets in 16s: waiting for the mock allowance on every route: …`). It resumed by itself after the reset and finished the queued request: the docstring was in the file. |
 | Placement uses links and quotas | A new builder went to worker-b, not the hub, though the hub had more free slots: `skipped hub 0.59 (… quota 0.00) [every route's mock allowance is used up (resets in 34s)]`. Link RTT is shown for every node (3–5 ms locally). |
 | Accounts behind API keys | The template's alias, mapped with `account: demo-account`, was counted as `account:demo-account` (7 requests, 19 146 tokens). |
-| Templates on demand | `ocl templates` shows the template is runnable on worker-b only, and gives the hub's reason (`secret alias does not resolve on this node`). A budget above the cap and an unlisted route are refused. A second live instance is refused (`instances.max: 1`). The cached library contains no secret value. Edits reach the nodes within 10 s, and `hub_templates: false` drops them. |
+| Templates on demand | `moo templates` shows the template is runnable on worker-b only, and gives the hub's reason (`secret alias does not resolve on this node`). A budget above the cap and an unlisted route are refused. A second live instance is refused (`instances.max: 1`). The cached library contains no secret value. Edits reach the nodes within 10 s, and `hub_templates: false` drops them. |
 | Preamble | The rendered instructions contain the hub preamble with the instance id, template, node, budget override, tools and the spawner's `role_append`, with no unrendered variables. |
-| Container-level info and restrictions | `ocl stats`: per instance CPU % (e.g. 7.4), memory against its limit (234M/1024M), processes and disk. Host totals for every node. Per-session history (10 s and per-minute). An agent with `container.disk: 1m` was interrupted with `disk limit exceeded: 116.5 MiB used of 1.0 MiB`. |
+| Container-level info and restrictions | `moo stats`: per instance CPU % (e.g. 7.4), memory against its limit (234M/1024M), processes and disk. Host totals for every node. Per-session history (10 s and per-minute). An agent with `container.disk: 1m` was interrupted with `disk limit exceeded: 116.5 MiB used of 1.0 MiB`. |
 | Supervisor restart with remote nodes | The supervisor was killed mid-turn for 15 s. The node buffered events, reconnected over mTLS and replayed them. The session ended `idle` with 3/3 todos and 24 138 tokens. Quota counts (7 calls) and the audit chain survived. |
 | Phase 1 fix: stopped sessions stay stopped | Covered by a regression test (`late_report_does_not_revive_stopped_session`), and by the demo ending with every session `stopped`. |
 
@@ -89,8 +89,8 @@ Release builds, idle and connected, measured with `/proc/<pid>/status` VmRSS (bu
 
 | Process | RSS |
 |---|---|
-| `ocl-supervisor` | 12.4 MB |
-| `opencode-node` (worker) | 14.3 MB (hub's own node: 14.0 MB) |
-| `opencode-node` (relay, `role: relay`) | 12.3 MB |
+| `moocher-hub` | 12.4 MB |
+| `moocher-node` (worker) | 14.3 MB (hub's own node: 14.0 MB) |
+| `moocher-node` (relay, `role: relay`) | 12.3 MB |
 
 OpenCode itself: ~420 MB per session (unchanged from Phase 1). Its home directory takes ~120 MB on disk per instance, mostly provider packages; keep that in mind when choosing `container.disk`.

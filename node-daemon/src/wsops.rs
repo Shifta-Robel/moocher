@@ -1,13 +1,13 @@
 //! Workspace <-> artifact operations on this node: snapshots, three-way
 //! merges of incoming snapshots, placing artifacts, and putting agent files.
-//! All file access inside a workspace goes through `ocl_protocol::archive`'s
+//! All file access inside a workspace goes through `moocher_protocol::archive`'s
 //! link-safe helpers (agents control what is in there).
 
 use crate::cas::{Cas, PutInfo};
 use crate::store::Store;
 use anyhow::{anyhow, bail, Context, Result};
-use ocl_protocol::archive::{self, Manifest};
-use ocl_protocol::model::ArtifactMeta;
+use moocher_protocol::archive::{self, Manifest};
+use moocher_protocol::model::ArtifactMeta;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,7 +37,7 @@ impl WsOps {
     pub fn dir_of(&self, label: &str) -> Result<PathBuf> {
         let ws = self.data_root.join("workspaces");
         if let Some(n) = label.strip_prefix("shared:") {
-            if !ocl_protocol::config::valid_name(n) {
+            if !moocher_protocol::config::valid_name(n) {
                 bail!("bad workspace name {n:?}");
             }
             return Ok(ws.join(format!("shared-{n}")));

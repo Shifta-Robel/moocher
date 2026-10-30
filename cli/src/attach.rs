@@ -1,4 +1,4 @@
-//! `ocl attach <session>`: OpenCode's terminal UI for a cluster instance.
+//! `moo attach <session>`: OpenCode's terminal UI for a cluster instance.
 //!
 //! Gets a one-time ticket, redeems it for the attach cookie, and runs a small
 //! proxy on 127.0.0.1 that adds the cookie to every request (WebSocket
@@ -16,7 +16,7 @@ type Body = http_body_util::combinators::BoxBody<bytes::Bytes, Box<dyn std::erro
 
 pub async fn run(http: &reqwest::Client, ticket_url: &str, port: u16, launch: bool) -> Result<()> {
     let r = http.get(ticket_url).send().await.context("redeeming the attach ticket")?;
-    let set = r.headers().get_all("set-cookie").iter().filter_map(|v| v.to_str().ok()).find(|v| v.starts_with("ocl_attach=")).map(String::from);
+    let set = r.headers().get_all("set-cookie").iter().filter_map(|v| v.to_str().ok()).find(|v| v.starts_with("moo_attach=")).map(String::from);
     let Some(set) = set else { bail!("the hub did not accept the ticket ({})", r.status()) };
     let cookie = set.split(';').next().unwrap_or("").to_string();
     let base = reqwest::Url::parse(ticket_url)?;
@@ -36,7 +36,7 @@ pub async fn run(http: &reqwest::Client, ticket_url: &str, port: u16, launch: bo
     });
     let url = format!("http://{local}");
     eprintln!("attached through {origin}; local address {url}");
-    let oc = std::env::var("OCL_OPENCODE_BIN").unwrap_or_else(|_| "opencode".into());
+    let oc = std::env::var("MOO_OPENCODE_BIN").unwrap_or_else(|_| "opencode".into());
     if launch && which(&oc) {
         // The proxy adds the hub's cookie; OpenCode needs no password of its own here.
         let status = tokio::process::Command::new(&oc).arg("attach").arg(&url).env("OPENCODE_SERVER_PASSWORD", "unused").status().await?;

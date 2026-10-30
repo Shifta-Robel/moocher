@@ -1,4 +1,4 @@
-//! opencode-node — one per machine. See docs/ARCHITECTURE.md §2.
+//! moocher-node — one per machine. See docs/ARCHITECTURE.md §2.
 
 mod attach;
 mod cas;
@@ -22,15 +22,15 @@ mod wsops;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use ocl_protocol::link::NodeEvent;
+use moocher_protocol::link::NodeEvent;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "opencode-node", version, about = "opencode-cluster node daemon")]
+#[command(name = "moocher-node", version, about = "moocher node daemon")]
 struct Cli {
     /// Config directory (node.yaml, agents/, providers.yaml, routes.yaml).
-    #[arg(long, env = "OCL_CONFIG_DIR", global = true)]
+    #[arg(long, env = "MOO_CONFIG_DIR", global = true)]
     config_dir: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
@@ -48,17 +48,17 @@ enum Cmd {
         out: PathBuf,
     },
     /// Enroll this machine with a hub using a one-time join token
-    /// (from `ocl node invite <name>` or the web UI).
+    /// (from `moo node invite <name>` or the web UI).
     Join {
         /// The hub's link address, e.g. https://hub.example:7443
         url: String,
-        #[arg(long, env = "OCL_JOIN_TOKEN", hide_env_values = true)]
+        #[arg(long, env = "MOO_JOIN_TOKEN", hide_env_values = true)]
         token: String,
     },
 }
 
 fn default_dir() -> PathBuf {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".opencode-cluster")).unwrap_or_else(|| PathBuf::from("/etc/opencode-cluster"))
+    moocher_protocol::config::default_config_dir()
 }
 
 #[tokio::main]
@@ -66,14 +66,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("OCL_LOG").unwrap_or_else(|_| "info".into()))
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("MOO_LOG").unwrap_or_else(|_| "info".into()))
         .with_current_span(false)
         .init();
     let dir = cli.config_dir.unwrap_or_else(default_dir);
     match cli.cmd {
         Cmd::Schema { out } => {
             std::fs::create_dir_all(&out)?;
-            for (name, schema) in ocl_protocol::config::schemas() {
+            for (name, schema) in moocher_protocol::config::schemas() {
                 std::fs::write(out.join(format!("{name}.schema.json")), serde_json::to_vec_pretty(&schema)?)?;
             }
             println!("wrote schemas to {}", out.display());
@@ -85,13 +85,13 @@ async fn main() -> Result<()> {
     }
 }
 
-fn pki_dir(dir: &std::path::Path, node: Option<&ocl_protocol::config::NodeConfig>) -> PathBuf {
+fn pki_dir(dir: &std::path::Path, node: Option<&moocher_protocol::config::NodeConfig>) -> PathBuf {
     node.and_then(|n| n.pki_dir.clone()).unwrap_or_else(|| dir.join("pki"))
 }
 
 async fn join(dir: &std::path::Path, url: &str, token: &str) -> Result<()> {
     let node_yaml = dir.join("node.yaml");
-    let existing: Option<ocl_protocol::config::NodeConfig> = if node_yaml.exists() { Some(ocl_protocol::config::load_yaml(&node_yaml)?) } else { None };
+    let existing: Option<moocher_protocol::config::NodeConfig> = if node_yaml.exists() { Some(moocher_protocol::config::load_yaml(&node_yaml)?) } else { None };
     let pki = pki::Pki::new(pki_dir(dir, existing.as_ref()));
     let e = pki::join(&pki, url, token).await?;
     println!("enrolled as node {:?} (role {}), certificate valid until {}", e.node, e.role, fmt_ts(e.expires_at));
@@ -116,9 +116,9 @@ async fn join(dir: &std::path::Path, url: &str, token: &str) -> Result<()> {
         }
     }
     if e.status == "pending" {
-        println!("The node is pending approval. On the hub: ocl node approve {}", e.node);
+        println!("The node is pending approval. On the hub: moo node approve {}", e.node);
     }
-    println!("Start it with: opencode-node --config-dir {} run   (or enable the systemd unit)", dir.display());
+    println!("Start it with: moocher-node --config-dir {} run   (or enable the systemd unit)", dir.display());
     Ok(())
 }
 
@@ -176,7 +176,7 @@ async fn run(dir: PathBuf) -> Result<()> {
     }
     let rt = runtime::Runtime::new(snap.node.runtime.kind, &snap.node.runtime.podman, snap.node.runtime.opencode_bin.clone())?;
     let supervisor = snap.node.supervisor.clone();
-    let relay_only = snap.node.role == ocl_protocol::config::NodeRole::Relay;
+    let relay_only = snap.node.role == moocher_protocol::config::NodeRole::Relay;
     let pki = Arc::new(pki::Pki::new(pki_dir(&dir, Some(&snap.node))));
     if supervisor.starts_with("https://") {
         pki.client_config().context("loading the node certificate")?;
@@ -190,7 +190,7 @@ async fn run(dir: PathBuf) -> Result<()> {
     let dialer = relay::Dialer::start(node_name.clone(), link.clone()).await?;
     let egress = Arc::new(egress::Egress::new(cfg.clone(), Some(dialer), link.clone()));
     let quotas = Arc::new(quota::Quotas::new(&node_name, store.clone()));
-    let cache_max = ocl_protocol::model::parse_size(&cfg.get().node.artifact_cache).unwrap_or(2 << 30);
+    let cache_max = moocher_protocol::model::parse_size(&cfg.get().node.artifact_cache).unwrap_or(2 << 30);
     let cas = Arc::new(cas::Cas::new(data_dir.join("cas"), link.clone(), &node_name, cache_max)?);
     let files = Arc::new(wsops::WsOps::new(cas, store.clone(), data_dir.clone(), rt.chown_target()));
     let deps = gateway::GatewayDeps { cfg: cfg.clone(), link: link.clone(), egress: egress.clone(), quotas: quotas.clone(), files };
@@ -210,7 +210,7 @@ async fn run(dir: PathBuf) -> Result<()> {
         let (link, quotas, reprobe) = (link.clone(), quotas.clone(), reprobe.clone());
         tokio::spawn(async move {
             while let Some(s) = reloads.recv().await {
-                let agents = if s.node.role == ocl_protocol::config::NodeRole::Relay { vec![] } else { s.agent_infos() };
+                let agents = if s.node.role == moocher_protocol::config::NodeRole::Relay { vec![] } else { s.agent_infos() };
                 link.emit(NodeEvent::Agents { agents });
                 quotas.touch();
                 reprobe.notify_one();
@@ -239,7 +239,7 @@ async fn run(dir: PathBuf) -> Result<()> {
             loop {
                 iv.tick().await;
                 let (host, instances) = mgr.collect_stats().await;
-                link.send_live(&ocl_protocol::link::NodeMsg::Stats { host, instances }).await;
+                link.send_live(&moocher_protocol::link::NodeMsg::Stats { host, instances }).await;
             }
         });
     }

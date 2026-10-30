@@ -1,9 +1,9 @@
 {
-  "name": "ocl-web",
+  "name": "moo-web",
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "opencode-cluster operator dashboard (SolidJS + Tailwind + Kobalte)",
+  "description": "moocher operator dashboard (SolidJS + Tailwind + Kobalte)",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",

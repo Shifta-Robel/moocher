@@ -12,7 +12,7 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use ocl_protocol::link::TunnelOpen;
+use moocher_protocol::link::TunnelOpen;
 use std::path::PathBuf;
 
 /// What every request on an attach connection must present.
@@ -25,7 +25,7 @@ pub struct Guard {
 impl Guard {
     fn allows<B>(&self, req: &Request<B>) -> bool {
         use sha2::Digest;
-        if ocl_protocol::model::now_ms() > self.expires_at {
+        if moocher_protocol::model::now_ms() > self.expires_at {
             return false;
         }
         req.headers()
@@ -33,7 +33,7 @@ impl Guard {
             .iter()
             .filter_map(|v| v.to_str().ok())
             .flat_map(|v| v.split(';'))
-            .filter_map(|kv| kv.trim().strip_prefix("ocl_attach="))
+            .filter_map(|kv| kv.trim().strip_prefix("moo_attach="))
             .any(|c| hex::encode(sha2::Sha256::digest(c.as_bytes())) == self.cookie_sha256)
     }
 }
@@ -80,7 +80,7 @@ async fn forward(mut req: Request<Incoming>, sock: PathBuf, auth: String) -> Res
             .filter_map(|v| v.to_str().ok())
             .flat_map(|v| v.split(';'))
             .map(str::trim)
-            .filter(|kv| !kv.is_empty() && !kv.starts_with("ocl_attach="))
+            .filter(|kv| !kv.is_empty() && !kv.starts_with("moo_attach="))
             .map(String::from)
             .collect();
         h.remove(hyper::header::COOKIE);

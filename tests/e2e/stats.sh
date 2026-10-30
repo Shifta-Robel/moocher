@@ -16,7 +16,7 @@ wait_for 60 "instance stats arrive (memory, processes, disk)" bash -c "$O stats 
 wait_for 30 "CPU% from the second sample on" bash -c "$O stats --json | python3 -c 'import sys,json;s=[i for i in json.load(sys.stdin)[\"instances\"] if i[\"session\"]==\"$SID\"];sys.exit(0 if s and s[0][\"cpu_pct\"] is not None else 1)'"
 $O stats --json | python3 -c 'import sys,json;h={x["node"] for x in json.load(sys.stdin)["hosts"]};sys.exit(0 if {"hub","worker-b"}<=h else 1)' && pass "both hosts report memory/disk" || fail "both hosts report memory/disk"
 $O stats | sed 's/^/  /'
-wait_for 30 "per-session history builds up" bash -c "curl -s -H 'Authorization: Bearer $OCL_TOKEN' http://127.0.0.1:7700/api/v1/sessions/$SID/stats | python3 -c 'import sys,json;d=json.load(sys.stdin);sys.exit(0 if len(d[\"recent\"])>=3 and len(d[\"minutes\"])>=1 else 1)'"
+wait_for 30 "per-session history builds up" bash -c "curl -s -H 'Authorization: Bearer $MOO_TOKEN' http://127.0.0.1:7700/api/v1/sessions/$SID/stats | python3 -c 'import sys,json;d=json.load(sys.stdin);sys.exit(0 if len(d[\"recent\"])>=3 and len(d[\"minutes\"])>=1 else 1)'"
 
 say "soft disk limit (tiny: container.disk 1m)"
 TID=$($O spawn tiny --node worker-b -p "Write greet(name) in greet.py with pytest tests." --json | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')

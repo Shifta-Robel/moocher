@@ -5,7 +5,7 @@
 # quotas cannot work.
 ENROLL_YAML=$'artifacts: { retain: 1d }\nevents: { retain: 30d }'
 source "$(dirname "$0")/lib.sh"
-SUP="$BIN/ocl-supervisor"
+SUP="$BIN/moocher-hub"
 EXP="$W/hub/supervisor/exports"
 lines() { cat "$EXP"/events-*.jsonl.zst 2>/dev/null > "$W/all.zst"; "$SUP" --config-dir "$W/hub" events-cat "$W/all.zst" | wc -l; }
 hk() { $O housekeeping --json "$@"; }
@@ -67,7 +67,7 @@ disk_enforce: hard
 runtime: { kind: process, opencode_bin: $OC, run_dir: $(run_dir hard) }
 EOF
 set +e
-timeout 20 "$BIN/opencode-node" --config-dir "$W/hard" run > "$W/hard.log" 2>&1
+timeout 20 "$BIN/moocher-node" --config-dir "$W/hard" run > "$W/hard.log" 2>&1
 RC=$?
 set -e
 [ "$RC" != 0 ] && [ "$RC" != 124 ] && grep -q "disk_enforce: hard needs" "$W/hard.log" && pass "refused: $(grep -o 'disk_enforce: hard needs[^"]*' "$W/hard.log" | head -1)" || fail "hard mode refused (rc $RC): $(tail -2 "$W/hard.log")"

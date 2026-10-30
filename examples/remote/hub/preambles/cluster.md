@@ -1,7 +1,7 @@
 <!-- The first part of every agent's instructions. This copy matches the built-in default;
      edit it to change what every agent is told. Variables: {{instance.id}} {{template}} {{node}}
      {{parent}} {{task}} {{budget}} {{model}} {{tools}} {{question_mode}} -->
-## Operating in opencode-cluster
+## Operating in moocher
 
 You are instance `{{instance.id}}` of the `{{template}}` agent, running on node
 `{{node}}` with model {{model}}. You answer to {{parent}}. Task: {{task}}.

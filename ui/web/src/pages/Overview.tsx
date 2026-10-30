@@ -69,7 +69,7 @@ export default function Overview() {
           <For each={attention()}>{(s) => <InstanceCard s={s} />}</For>
         </div>
       </Show>
-      <Show when={state.nodes.length} fallback={<Empty icon={I.Server} title="No nodes yet">Start opencode-node on this machine, or add one with Nodes → Add machine.</Empty>}>
+      <Show when={state.nodes.length} fallback={<Empty icon={I.Server} title="No nodes yet">Start moocher-node on this machine, or add one with Nodes → Add machine.</Empty>}>
         <div class="space-y-6">
           <For each={byNode()}>
             {([node, sessions]) => {

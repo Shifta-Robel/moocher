@@ -10,7 +10,7 @@
 //! ignoring whatever the CSR asked for.
 
 use anyhow::{Context, Result};
-use ocl_protocol::model::Ts;
+use moocher_protocol::model::Ts;
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
     SerialNumber, PKCS_ED25519,
@@ -64,7 +64,7 @@ impl Ca {
             let key = KeyPair::generate_for(&PKCS_ED25519)?;
             let mut p = CertificateParams::default();
             p.distinguished_name = DistinguishedName::new();
-            p.distinguished_name.push(DnType::CommonName, "opencode-cluster CA");
+            p.distinguished_name.push(DnType::CommonName, "moocher CA");
             p.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
             p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign, KeyUsagePurpose::DigitalSignature];
             let now = OffsetDateTime::now_utc();
@@ -85,8 +85,8 @@ impl Ca {
     }
 
     pub fn fingerprint(&self) -> String {
-        let der = ocl_protocol::tls::certs_from_pem(&self.cert_pem).expect("own CA parses");
-        ocl_protocol::tls::fingerprint(&der[0])
+        let der = moocher_protocol::tls::certs_from_pem(&self.cert_pem).expect("own CA parses");
+        moocher_protocol::tls::fingerprint(&der[0])
     }
 
     /// Server certificate for the link listener (chain PEM = leaf + CA, key PEM).
@@ -105,7 +105,7 @@ impl Ca {
             let key = KeyPair::generate_for(&PKCS_ED25519)?;
             let mut p = CertificateParams::new(names.to_vec())?;
             p.distinguished_name = DistinguishedName::new();
-            p.distinguished_name.push(DnType::CommonName, "opencode-cluster supervisor");
+            p.distinguished_name.push(DnType::CommonName, "moocher supervisor");
             p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
             p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
             p.use_authority_key_identifier_extension = true;
@@ -126,7 +126,7 @@ impl Ca {
     /// Sign a node CSR. Only the CSR's public key is used.
     pub fn issue_node(&self, node: &str, csr_pem: &str, days: u32) -> Result<Issued> {
         let csr = CertificateSigningRequestParams::from_pem(csr_pem).context("invalid CSR")?;
-        let mut p = CertificateParams::new(vec![format!("{node}.node.opencode-cluster")])?;
+        let mut p = CertificateParams::new(vec![format!("{node}.node.moocher")])?;
         p.distinguished_name = DistinguishedName::new();
         p.distinguished_name.push(DnType::CommonName, node);
         p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
@@ -140,7 +140,7 @@ impl Ca {
         p.serial_number = Some(sn);
         let expires_at = ts(p.not_after);
         let signed = CertificateSigningRequestParams { params: p, public_key: csr.public_key }.signed_by(&self.cert, &self.key)?;
-        Ok(Issued { fingerprint: ocl_protocol::tls::fingerprint(signed.der()), cert_pem: signed.pem(), serial: serial_hex, expires_at })
+        Ok(Issued { fingerprint: moocher_protocol::tls::fingerprint(signed.der()), cert_pem: signed.pem(), serial: serial_hex, expires_at })
     }
 }
 
@@ -159,7 +159,7 @@ pub fn default_names() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ocl_protocol::model::now_ms;
+    use moocher_protocol::model::now_ms;
 
     #[test]
     fn ca_issues_verifiable_node_certs() {
@@ -177,18 +177,18 @@ mod tests {
         assert!(issued.expires_at > now_ms() + 29 * 86_400_000);
 
         // The issued cert chains to the CA and identifies the node by our name, not the CSR's.
-        let leaf = ocl_protocol::tls::certs_from_pem(&issued.cert_pem).unwrap().remove(0);
-        let ca_der = ocl_protocol::tls::certs_from_pem(&ca.cert_pem).unwrap().remove(0);
+        let leaf = moocher_protocol::tls::certs_from_pem(&issued.cert_pem).unwrap().remove(0);
+        let ca_der = moocher_protocol::tls::certs_from_pem(&ca.cert_pem).unwrap().remove(0);
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca_der).unwrap();
-        let v = rustls::server::WebPkiClientVerifier::builder_with_provider(std::sync::Arc::new(roots), ocl_protocol::tls::provider()).build().unwrap();
+        let v = rustls::server::WebPkiClientVerifier::builder_with_provider(std::sync::Arc::new(roots), moocher_protocol::tls::provider()).build().unwrap();
         v.verify_client_cert(&leaf, &[], rustls_pki_types::UnixTime::now()).expect("chains to CA");
         let parsed = CertificateParams::from_ca_cert_pem(&issued.cert_pem).unwrap();
         let cn = parsed.distinguished_name.get(&DnType::CommonName).cloned();
         assert!(matches!(cn, Some(rcgen::DnValue::Utf8String(ref s)) if s == "worker-b") || format!("{cn:?}").contains("worker-b"));
-        assert_eq!(issued.fingerprint, ocl_protocol::tls::fingerprint(&leaf));
+        assert_eq!(issued.fingerprint, moocher_protocol::tls::fingerprint(&leaf));
 
         let (chain, _key) = again.link_cert(&["localhost".into(), "127.0.0.1".into()]).unwrap();
-        assert_eq!(ocl_protocol::tls::certs_from_pem(&chain).unwrap().len(), 2);
+        assert_eq!(moocher_protocol::tls::certs_from_pem(&chain).unwrap().len(), 2);
     }
 }

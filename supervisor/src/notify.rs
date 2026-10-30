@@ -11,8 +11,8 @@ use aes_gcm::aead::{Aead, KeyInit};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine;
-use ocl_protocol::config::{NotificationsConfig, NotifyRule};
-use ocl_protocol::model::{now_ms, Notification};
+use moocher_protocol::config::{NotificationsConfig, NotifyRule};
+use moocher_protocol::model::{now_ms, Notification};
 use p256::ecdsa::signature::Signer;
 use p256::elliptic_curve::sec1::ToSec1Point;
 use serde_json::json;
@@ -148,7 +148,7 @@ impl Notifier {
                 use hmac::{Hmac, Mac};
                 let mut m = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret.as_bytes()).expect("hmac");
                 m.update(&bytes);
-                req = req.header("X-OCL-Signature", format!("sha256={}", hex::encode(m.finalize().into_bytes())));
+                req = req.header("X-Moo-Signature", format!("sha256={}", hex::encode(m.finalize().into_bytes())));
             }
             let req = req.body(bytes);
             tokio::spawn(async move {
@@ -282,7 +282,7 @@ mod tests {
         let mut cfg = NotificationsConfig::default();
         assert!(Notifier::channels_for(&cfg, &n("x", "info"), 600).is_empty(), "default: info stays in-app");
         assert_eq!(Notifier::channels_for(&cfg, &n("x", "warning"), 600).len(), 3);
-        cfg.quiet_hours = Some(ocl_protocol::config::QuietHours { from: "22:00".into(), to: "07:00".into() });
+        cfg.quiet_hours = Some(moocher_protocol::config::QuietHours { from: "22:00".into(), to: "07:00".into() });
         assert!(Notifier::channels_for(&cfg, &n("x", "warning"), 23 * 60).is_empty(), "quiet at 23:00");
         assert!(Notifier::channels_for(&cfg, &n("x", "warning"), 6 * 60 + 59).is_empty(), "quiet at 06:59");
         assert_eq!(Notifier::channels_for(&cfg, &n("x", "warning"), 7 * 60).len(), 3);

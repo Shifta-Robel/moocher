@@ -1,9 +1,9 @@
 [package]
-name = "ocl-protocol"
+name = "moocher-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Shared config schema, domain types and node<->supervisor protocol for opencode-cluster"
+description = "Shared config schema, domain types and node<->supervisor protocol for moocher"
 
 [dependencies]
 serde.workspace = true

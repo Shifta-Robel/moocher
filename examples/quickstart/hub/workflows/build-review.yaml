@@ -1,4 +1,4 @@
-apiVersion: ocl/v1
+apiVersion: moo/v1
 kind: Workflow
 name: build-review
 description: Builder implements, reviewer approves or sends it back.

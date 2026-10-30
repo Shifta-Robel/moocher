@@ -10,7 +10,7 @@ Re-ran on a fresh machine (no Podman available there, so with `runtime: process`
 
 | Finding | Action |
 |---|---|
-| With `runtime: process`, workflow checks run on the host, so `python3 -m pytest` fails unless pytest is installed there. The first run reported `build:Fail` for that reason only. | QUICKSTART now says so. Phase 2: `opencode-node check` warns when a check's command is not on the host's `PATH` under `runtime: process`. |
+| With `runtime: process`, workflow checks run on the host, so `python3 -m pytest` fails unless pytest is installed there. The first run reported `build:Fail` for that reason only. | QUICKSTART now says so. Phase 2: `moocher-node check` warns when a check's command is not on the host's `PATH` under `runtime: process`. |
 | In one of two runs, the builder that got the mid-run message stayed `idle` after its task finished instead of `stopped`. Looks like a race between "task complete → stop sessions" and the queued message starting a new step. | Phase 2 bug: stop must apply to sessions spawned by the task even when a step starts after the stop is issued. Add a regression test. |
 
 Container isolation was not re-checked on that machine (Phase 1 evidence stands).
@@ -31,7 +31,7 @@ Agent YAMLs already behave as templates. Three additions make them usable by the
 
 ```yaml
 # hub: templates/py-builder.yaml   (or node: agents/py-builder.yaml)
-apiVersion: ocl/v1
+apiVersion: moo/v1
 kind: Agent
 name: py-builder
 provider:
@@ -58,7 +58,7 @@ secrets:
 ```
 
 - **Hub library:** `templates/` on the hub is pushed to nodes on connect. A node offers a template only when it can resolve every secret alias. The key itself still never leaves that node.
-- **Spawning:** `POST /api/v1/instances {template, node?, overrides, parent?, task?}`, `ocl spawn`, the web UI's **New instance** sheet, and the MCP tool `cluster_spawn_agent(template, prompt, overrides)`. Overrides outside `overridable` are rejected and audited.
+- **Spawning:** `POST /api/v1/instances {template, node?, overrides, parent?, task?}`, `moo spawn`, the web UI's **New instance** sheet, and the MCP tool `cluster_spawn_agent(template, prompt, overrides)`. Overrides outside `overridable` are rejected and audited.
 - **Warm pool (deferred):** `instances.warm: 1` would keep one booted container per template to hide the cold start. Pre-seeding OpenCode's model catalog cut that start from ~35 s to ~4 s, so the pool was deferred (PHASE5.md).
 
 ## 3. Egress IPs, quotas and reset times
@@ -126,7 +126,7 @@ route:
 
 ## 4. Proxy-only machines and the source allowlist
 
-- **Proxy-only node:** `node.yaml: role: relay`. It runs `opencode-node --relay-only`, with no Podman and no agents, at about 10 MB RSS. It dials out to the hub like any node and serves `via_node` tunnels. It automatically becomes a route `via-<name>`, which any agent can list in `failover`.
+- **Proxy-only node:** `node.yaml: role: relay`. It runs `moocher-node --relay-only`, with no Podman and no agents, at about 10 MB RSS. It dials out to the hub like any node and serves `via_node` tunnels. It automatically becomes a route `via-<name>`, which any agent can list in `failover`.
 - **Allowlist:** enrollment and every relay connection are checked against **allowed source CIDRs**. They are seeded from `supervisor.yaml: enrollment.allowed_sources` and then edited in **Nodes → Allowed IPs** (admin scope, re-authentication, audited).
   - A relay machine whose IP drops off the list is disconnected, and its routes are marked unavailable.
   - The same list can optionally apply to all nodes (`enforce_for: relay | all`).
@@ -218,7 +218,7 @@ Each card shows:
 - the escalation notes added on the way up;
 - what is blocked.
 
-Answer in place (choices as buttons, free text, or "let the agent decide"). The answer goes straight to the asker, and every agent that escalated it sees it too. The inbox is also exposed as `GET /api/v1/questions` and `ocl questions` / `ocl answer`.
+Answer in place (choices as buttons, free text, or "let the agent decide"). The answer goes straight to the asker, and every agent that escalated it sees it too. The inbox is also exposed as `GET /api/v1/questions` and `moo questions` / `moo answer`.
 
 ## 7. Health: dead agents, offline machines, provider status
 
@@ -306,7 +306,7 @@ The UI shows each instance's rendered preamble under **What it was told**.
 
 ## 12. Containers: resource tracking and limits
 
-- **Per instance**, every 10 s: `podman stats` (CPU %, memory used/limit, pids, block I/O) for the node's `ocl.session` containers in one call. Every 60 s: workspace and home disk usage. Also restart count, OOM kills and uptime.
+- **Per instance**, every 10 s: `podman stats` (CPU %, memory used/limit, pids, block I/O) for the node's `moo.session` containers in one call. Every 60 s: workspace and home disk usage. Also restart count, OOM kills and uptime.
   - Stats stream as a downsampled time series: 10 s for an hour, then 1 min for 7 days.
   - **Host totals** are reported too: RAM, disk, load and reserved headroom.
 - **Limits** in the template:
@@ -357,7 +357,7 @@ The bundle budget stays below 150 KB gzipped. Pages are built mobile-first: bott
 - **Templates:** list, and **New instance**.
 - **Nodes & proxies:** health, host stats, link metrics, **Add machine** (join token), **Allowed IPs**.
 - **Artifacts, Notifications, Audit.**
-- **TUI** (`ocl tui`, ratatui): the same core views over the same API.
+- **TUI** (`moo tui`, ratatui): the same core views over the same API.
 
 ### 13d. Open an instance in OpenCode's own web UI
 
@@ -368,9 +368,9 @@ Verified on 1.19.4: `opencode serve` serves OpenCode's web app at `/`, with asse
   1. **Open in OpenCode** calls `POST /api/v1/instances/{id}/attach`, which returns a one-time ticket that expires in 60 s.
   2. The attach origin exchanges the ticket for an `HttpOnly` cookie, valid for 8 h, that says which instance to show.
   3. One browser shows one attached instance at a time. Clicking **Open in OpenCode** on another instance switches to it.
-- **Traffic path:** the browser talks to the supervisor; the supervisor uses a **tunnel stream** on the node's gRPC link; the node goes over UDS through `ocl-bridge` to `opencode serve`. The node adds the container's OpenCode password, so the password never reaches the browser. The `via_node` relays use the same tunnel mechanism.
+- **Traffic path:** the browser talks to the supervisor; the supervisor uses a **tunnel stream** on the node's gRPC link; the node goes over UDS through `moo-bridge` to `opencode serve`. The node adds the container's OpenCode password, so the password never reaches the browser. The `via_node` relays use the same tunnel mechanism.
 - **While attached:** telemetry continues, since the node still follows `/event`. What you type is just another prompt. The card shows `attached by operator`, and the attach is audited.
-- **Terminal:** `ocl attach <instance>` forwards a local port through the same tunnel and runs `opencode attach http://127.0.0.1:<port>`.
+- **Terminal:** `moo attach <instance>` forwards a local port through the same tunnel and runs `opencode attach http://127.0.0.1:<port>`.
 
 ### 13e. Hosting and login on your domain
 

@@ -1,32 +1,32 @@
-# opencode-cluster hub: the supervisor (API, dashboard, node links, artifacts).
+# moocher hub: the supervisor (API, dashboard, node links, artifacts).
 #
-#   install -m 0644 deploy/systemd/ocl-supervisor.service /etc/systemd/system/
-#   useradd --system --home-dir /var/lib/ocl --shell /usr/sbin/nologin ocl
-#   systemctl enable --now ocl-supervisor
+#   install -m 0644 deploy/systemd/moocher-hub.service /etc/systemd/system/
+#   useradd --system --home-dir /var/lib/moo --shell /usr/sbin/nologin moo
+#   systemctl enable --now moocher-hub
 #
-# Config and state live in /var/lib/ocl/hub (supervisor.yaml, agents/, …;
+# Config and state live in /var/lib/moo/hub (supervisor.yaml, agents/, …;
 # the database under hub/supervisor/). Set in supervisor.yaml:
-#   link_socket: /run/ocl-hub/link.sock      # the hub's own node connects here
+#   link_socket: /run/moo-hub/link.sock      # the hub's own node connects here
 [Unit]
-Description=opencode-cluster supervisor
-Documentation=file:///usr/share/doc/opencode-cluster/RUNBOOK.md
+Description=moocher supervisor
+Documentation=file:///usr/share/doc/moocher/RUNBOOK.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=exec
-User=ocl
-Group=ocl
-ExecStart=/usr/local/bin/ocl-supervisor --config-dir /var/lib/ocl/hub run
+User=moo
+Group=moo
+ExecStart=/usr/local/bin/moocher-hub --config-dir /var/lib/moo/hub run
 Restart=on-failure
 RestartSec=5s
 # Node links reconnect on their own; give in-flight requests a moment.
 TimeoutStopSec=20s
 Environment=RUST_LOG=info
 
-StateDirectory=ocl ocl/hub
+StateDirectory=moo moo/hub
 StateDirectoryMode=0750
-RuntimeDirectory=ocl-hub
+RuntimeDirectory=moo-hub
 RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=restart
 UMask=0027

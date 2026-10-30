@@ -13,16 +13,16 @@
 
 use crate::state::{truncate, Actor, Sup};
 use anyhow::{anyhow, bail, Result};
-use ocl_protocol::api::{AnswerRequest, StreamEvent};
-use ocl_protocol::link::NodeCommand;
-use ocl_protocol::model::*;
+use moocher_protocol::api::{AnswerRequest, StreamEvent};
+use moocher_protocol::link::NodeCommand;
+use moocher_protocol::model::*;
 use serde_json::json;
 use std::sync::Arc;
 
 pub const OPERATOR: &str = "operator";
 
 /// Raise importance by rule; never lower it. Returns (importance, reasons, operator_only).
-pub fn classify(cfg: &ocl_protocol::config::QuestionsConfig, kind: QuestionKind, text: &str, asked: Importance) -> (Importance, Vec<String>, bool) {
+pub fn classify(cfg: &moocher_protocol::config::QuestionsConfig, kind: QuestionKind, text: &str, asked: Importance) -> (Importance, Vec<String>, bool) {
     let t = text.to_lowercase();
     let mut imp = asked;
     let mut why = vec![];
@@ -147,7 +147,7 @@ impl Sup {
         let (importance, raised_because, operator_only) = classify(&self.cfg.questions, kind, &format!("{text}\n{}", context.as_deref().unwrap_or("")), asked);
         let now = now_ms();
         let mut q = Question {
-            id: ocl_protocol::new_id("q"),
+            id: moocher_protocol::new_id("q"),
             kind,
             asker: asker.report.id.clone(),
             asker_agent: asker.report.agent.clone(),
@@ -543,7 +543,7 @@ mod tests {
 
     #[test]
     fn rules_only_raise() {
-        let cfg = ocl_protocol::config::QuestionsConfig::default();
+        let cfg = moocher_protocol::config::QuestionsConfig::default();
         let (i, why, op) = classify(&cfg, QuestionKind::Ask, "Should I rm -rf the build dir?", Importance::Low);
         assert_eq!(i, Importance::Vital);
         assert!(why.iter().any(|w| w.contains("rm -rf")));

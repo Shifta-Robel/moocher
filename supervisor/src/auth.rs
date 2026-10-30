@@ -17,7 +17,7 @@ use crate::state::{Actor, Sup};
 use anyhow::{anyhow, bail, Result};
 use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
-use ocl_protocol::model::{now_ms, Ts};
+use moocher_protocol::model::{now_ms, Ts};
 use serde_json::json;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -143,7 +143,7 @@ pub fn totp_step(secret_b32: &str, code: &str, now_s: i64) -> Option<i64> {
 }
 
 pub fn otpauth_uri(user: &str, secret: &str) -> String {
-    format!("otpauth://totp/opencode-cluster:{user}?secret={secret}&issuer=opencode-cluster&digits=6&period=30")
+    format!("otpauth://totp/moocher:{user}?secret={secret}&issuer=moocher&digits=6&period=30")
 }
 
 // --------------------------------------------------------------- logins
@@ -303,7 +303,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = crate::db::Db::open(&dir.path().join("t.db")).unwrap();
         db.put_user("admin", &hash_password("correct horse battery").unwrap(), Scope::Admin).unwrap();
-        let mut cfg = ocl_protocol::config::SupervisorConfig::default();
+        let mut cfg = moocher_protocol::config::SupervisorConfig::default();
         cfg.login.max_failures = 3;
         let sup = Sup::new(db, cfg, dir.path().into());
         let ip: IpAddr = "192.0.2.1".parse().unwrap();

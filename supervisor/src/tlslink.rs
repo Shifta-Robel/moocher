@@ -82,7 +82,7 @@ pub async fn incoming(listen: &str, cfg: rustls::ServerConfig) -> Result<Receive
             tokio::spawn(async move {
                 match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(tcp)).await {
                     Ok(Ok(tls)) => {
-                        let cert = tls.get_ref().1.peer_certificates().and_then(|c| c.first()).map(|c| ocl_protocol::tls::fingerprint(c));
+                        let cert = tls.get_ref().1.peer_certificates().and_then(|c| c.first()).map(|c| moocher_protocol::tls::fingerprint(c));
                         let _ = tx.send(Ok(TlsConn { inner: tls, peer: LinkPeer { addr, cert } })).await;
                     }
                     Ok(Err(e)) => tracing::info!(peer = %addr, error = %e, "link TLS handshake failed"),

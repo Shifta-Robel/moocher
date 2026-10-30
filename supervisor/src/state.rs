@@ -5,10 +5,10 @@
 use crate::db::Db;
 use crate::link::Registry;
 use anyhow::{anyhow, bail, Result};
-use ocl_protocol::api::*;
-use ocl_protocol::config::{SupervisorConfig, WorkflowConfig, WorkspaceMode, WorkspaceSpec};
-use ocl_protocol::link::*;
-use ocl_protocol::model::*;
+use moocher_protocol::api::*;
+use moocher_protocol::config::{SupervisorConfig, WorkflowConfig, WorkspaceMode, WorkspaceSpec};
+use moocher_protocol::link::*;
+use moocher_protocol::model::*;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -85,7 +85,7 @@ pub struct SpawnOpts {
     pub step: Option<String>,
     pub role: SessionRole,
     pub extra_instructions: Option<String>,
-    pub overrides: ocl_protocol::config::SpawnOverrides,
+    pub overrides: moocher_protocol::config::SpawnOverrides,
     /// Resume elsewhere: the dead session this one replaces.
     pub replaces: Option<String>,
 }
@@ -186,7 +186,7 @@ impl Sup {
     }
 
     pub fn workflows(&self) -> Vec<WorkflowConfig> {
-        ocl_protocol::config::load_dir::<WorkflowConfig>(&self.config_dir.join("workflows"))
+        moocher_protocol::config::load_dir::<WorkflowConfig>(&self.config_dir.join("workflows"))
             .into_iter()
             .filter_map(|(p, r)| match r {
                 Ok(w) => Some(w),
@@ -240,7 +240,7 @@ impl Sup {
                 why.push_str(&format!("; workspace {name}: {}", notes.join(", ")));
             }
         }
-        let id = ocl_protocol::new_id("s");
+        let id = moocher_protocol::new_id("s");
         let now = now_ms();
         let info = SessionInfo {
             report: SessionReport {
@@ -644,7 +644,7 @@ impl Sup {
                 Ok(json!({"question": q.id, "importance": q.importance, "raised_because": q.raised_because, "holder": q.holder, "note": note}))
             }
             AgentCall::Answer { id, answer } => {
-                let q = self.answer(&actor, &id, ocl_protocol::api::AnswerRequest { answer: Some(answer), choice: None, let_agent_decide: false, reject: false }).await?;
+                let q = self.answer(&actor, &id, moocher_protocol::api::AnswerRequest { answer: Some(answer), choice: None, let_agent_decide: false, reject: false }).await?;
                 Ok(json!({"question": q.id, "status": q.status, "delivered_to": q.asker}))
             }
             AgentCall::Escalate { id, note } => {

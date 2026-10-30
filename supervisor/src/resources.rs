@@ -3,8 +3,8 @@
 //! SQLite for a week.
 
 use crate::state::Sup;
-use ocl_protocol::api::StreamEvent;
-use ocl_protocol::model::*;
+use moocher_protocol::api::StreamEvent;
+use moocher_protocol::model::*;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 

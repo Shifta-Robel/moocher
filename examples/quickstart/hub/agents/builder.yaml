@@ -1,4 +1,4 @@
-apiVersion: ocl/v1
+apiVersion: moo/v1
 kind: Agent
 name: builder
 description: Writes small Python modules with pytest tests.

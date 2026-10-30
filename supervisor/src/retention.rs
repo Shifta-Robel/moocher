@@ -15,8 +15,8 @@
 use crate::state::{Actor, Sup};
 use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
-use ocl_protocol::config::parse_duration_ms;
-use ocl_protocol::model::{now_ms, parse_art_ref, Ts};
+use moocher_protocol::config::parse_duration_ms;
+use moocher_protocol::model::{now_ms, parse_art_ref, Ts};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
@@ -85,7 +85,7 @@ impl Sup {
         self.data_dir.join("exports")
     }
 
-    /// One housekeeping pass, as if it were `as_of` (tests and `ocl housekeeping --as-of`).
+    /// One housekeeping pass, as if it were `as_of` (tests and `moo housekeeping --as-of`).
     pub fn housekeeping(&self, as_of: Ts, dry_run: bool, actor: &Actor) -> Result<Report> {
         let mut r = Report { as_of, dry_run, ..Default::default() };
         let ev = &self.cfg.events;

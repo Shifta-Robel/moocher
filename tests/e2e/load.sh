@@ -10,7 +10,7 @@ MOCK_ARGS="--ip-quota 40 --ip-window 30"
 HUB_NODE_YAML='ip_echo: ["http://127.0.0.1:8099/v1/ip"]'
 ENROLL_YAML="disconnect_grace_secs: 8"
 source "$(dirname "$0")/lib.sh"
-SUP_CMD=("$BIN/ocl-supervisor" --config-dir "$W/hub" run)
+SUP_CMD=("$BIN/moocher-hub" --config-dir "$W/hub" run)
 
 say "hub + worker-a + worker-b, 4 sessions each"
 start_hub
@@ -42,15 +42,15 @@ for n in worker-a worker-b; do
   start_node "$n"
 done
 kill "${PIDS[2]}"; sleep 1 # the hub's node, restarted with max_sessions 4
-"$BIN/opencode-node" --config-dir "$W/hub" run >> "$W/node-hub.log" 2>&1 &
+"$BIN/moocher-node" --config-dir "$W/hub" run >> "$W/node-hub.log" 2>&1 &
 PIDS+=($!)
 for n in hub worker-a worker-b; do wait_for 30 "$n connected" is_connected "$n"; done
 wait_for 30 "every node has lwork" bash -c "[ \$($O agents --json | python3 -c 'import sys,json;print(len({a[\"node\"] for a in json.load(sys.stdin) if a[\"agent\"][\"name\"]==\"lwork\"}))') = 3 ]"
 
 # Peak RSS of the daemons while the scenarios run.
 ( while :; do
-    for p in $(pgrep -f "$BIN/ocl-supervisor --config-dir $W/hub run") ; do echo "sup $(awk '/VmRSS/{print $2}' /proc/$p/status 2>/dev/null)"; done
-    for n in hub worker-a worker-b; do for p in $(pgrep -f "$BIN/opencode-node --config-dir $W/$n run"); do echo "$n $(awk '/VmRSS/{print $2}' /proc/$p/status 2>/dev/null)"; done; done
+    for p in $(pgrep -f "$BIN/moocher-hub --config-dir $W/hub run") ; do echo "sup $(awk '/VmRSS/{print $2}' /proc/$p/status 2>/dev/null)"; done
+    for n in hub worker-a worker-b; do for p in $(pgrep -f "$BIN/moocher-node --config-dir $W/$n run"); do echo "$n $(awk '/VmRSS/{print $2}' /proc/$p/status 2>/dev/null)"; done; done
     sleep 1
   done ) > "$W/rss.log" 2>/dev/null &
 PIDS+=($!)
@@ -159,7 +159,7 @@ say "chaos: the supervisor is killed (-9) under load and restarted after 5 s"
 ids_file sup.ids
 spawn_n sup.ids 6 12
 wait_for 120 "6 running" bash -c '[ "$(running sup.ids)" = 6 ]'
-pkill -9 -f "$BIN/ocl-supervisor --config-dir $W/hub run"
+pkill -9 -f "$BIN/moocher-hub --config-dir $W/hub run"
 sleep 5
 "${SUP_CMD[@]}" >> "$W/supervisor.log" 2>&1 &
 PIDS+=($!)

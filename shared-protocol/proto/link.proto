@@ -3,12 +3,12 @@
 // One long-lived bidirectional stream per node, dialed by the node. The proto
 // layer is deliberately thin: it carries sequence/ack numbers for the
 // telemetry outbox and a JSON payload whose schema is the Rust enums in
-// `ocl_protocol::link` (NodeMsg / SupMsg). Both ends are built from the same
+// `moocher_protocol::link` (NodeMsg / SupMsg). Both ends are built from the same
 // crate, so the domain schema lives in exactly one place while gRPC supplies
 // HTTP/2 multiplexing and flow control. Remote nodes connect over mTLS.
 syntax = "proto3";
 
-package ocl.link.v1;
+package moo.link.v1;
 
 service NodeLink {
   rpc Attach(stream Envelope) returns (stream Envelope);
@@ -29,7 +29,7 @@ message Envelope {
 }
 
 message EnrollRequest {
-  // The secret part of the join token (`ocljoin.<secret>.<ca fingerprint>`).
+  // The secret part of the join token (`moojoin.<secret>.<ca fingerprint>`).
   string token = 1;
   // PEM certificate signing request for a key generated on the node.
   string csr_pem = 2;
@@ -47,7 +47,7 @@ message EnrollReply {
 }
 
 message TunnelFrame {
-  // First frame only, JSON: `{"open": ...}` (see `ocl_protocol::link::TunnelOpen`).
+  // First frame only, JSON: `{"open": ...}` (see `moocher_protocol::link::TunnelOpen`).
   bytes header = 1;
   bytes data = 2;
   // Half-close: no more data from this side.
@@ -70,7 +70,7 @@ message BlobChunk {
 }
 
 message BlobPut {
-  // JSON artifact metadata (`ocl_protocol::model::ArtifactMeta`).
+  // JSON artifact metadata (`moocher_protocol::model::ArtifactMeta`).
   bytes meta = 1;
 }
 

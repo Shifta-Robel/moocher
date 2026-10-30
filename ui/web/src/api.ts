@@ -6,7 +6,7 @@ export class ApiError extends Error {
 }
 
 export function csrf(): string {
-  const c = document.cookie.split(";").map((s) => s.trim()).find((s) => s.startsWith("ocl_csrf="));
+  const c = document.cookie.split(";").map((s) => s.trim()).find((s) => s.startsWith("moo_csrf="));
   return c ? decodeURIComponent(c.slice(9)) : "";
 }
 

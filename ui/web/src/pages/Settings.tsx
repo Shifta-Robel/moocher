@@ -15,7 +15,7 @@ export default function Settings() {
   const [nscope, setNscope] = createSignal("operate");
   return (
     <>
-      <PageHeader title="Settings" subtitle={`opencode-cluster ${state.info?.version ?? ""} · logged in as ${state.info?.user ?? ""} (${state.info?.scope ?? ""})`} />
+      <PageHeader title="Settings" subtitle={`moocher ${state.info?.version ?? ""} · logged in as ${state.info?.user ?? ""} (${state.info?.scope ?? ""})`} />
       <div class="grid gap-4 lg:grid-cols-2">
         <Card class="p-4">
           <h2 class="mb-3 font-semibold">Appearance</h2>
@@ -97,7 +97,7 @@ export default function Settings() {
               </select>
               <Button type="submit">Add / set</Button>
             </form>
-            <p class="mt-2 text-xs text-slate-500">TOTP is set up on the hub: ocl-supervisor user totp &lt;name&gt;.</p>
+            <p class="mt-2 text-xs text-slate-500">TOTP is set up on the hub: moocher-hub user totp &lt;name&gt;.</p>
           </Card>
         </Show>
       </div>

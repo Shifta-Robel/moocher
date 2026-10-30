@@ -2,7 +2,7 @@
 //! same bridge + opencode pair directly on the host (dev/CI only, no isolation).
 
 use anyhow::{bail, Context, Result};
-use ocl_protocol::config::{ContainerSpec, Egress, RuntimeKind};
+use moocher_protocol::config::{ContainerSpec, Egress, RuntimeKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -19,9 +19,9 @@ const PROXY_PORT: u16 = 3128;
 
 #[derive(Debug, Clone)]
 pub struct InstancePaths {
-    /// Host dir with node.sock / oc.sock (mounted at /run/ocl).
+    /// Host dir with node.sock / oc.sock (mounted at /run/moo).
     pub run: PathBuf,
-    /// Generated opencode config (mounted read-only at /etc/ocl).
+    /// Generated opencode config (mounted read-only at /etc/moo).
     pub etc: PathBuf,
     /// OpenCode state, persisted so sessions survive container restarts.
     pub home: PathBuf,
@@ -79,14 +79,14 @@ pub struct Exit {
 }
 
 pub fn container_name(id: &str) -> String {
-    format!("ocl-{id}")
+    format!("moo-{id}")
 }
 
 impl Runtime {
     pub fn new(kind: RuntimeKind, podman: &str, opencode_bin: Option<String>) -> Result<Runtime> {
         let rootless = !is_root();
-        let bridge_bin = std::env::var_os("OCL_BRIDGE").map(PathBuf::from).unwrap_or_else(|| {
-            std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("ocl-bridge"))).unwrap_or_else(|| "ocl-bridge".into())
+        let bridge_bin = std::env::var_os("MOO_BRIDGE").map(PathBuf::from).unwrap_or_else(|| {
+            std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("moo-bridge"))).unwrap_or_else(|| "moo-bridge".into())
         });
         if kind == RuntimeKind::Process {
             tracing::warn!("runtime=process: sessions run WITHOUT container isolation (dev/test only)");
@@ -203,7 +203,7 @@ impl Runtime {
         let name = container_name(s.id);
         let _ = self.podman(&["rm", "-f", &name]).await;
         let mut a: Vec<String> = vec!["run".into(), "-d".into(), "--name".into(), name.clone()];
-        for (k, v) in [("ocl.node", s.node), ("ocl.session", s.id), ("ocl.agent", s.agent)] {
+        for (k, v) in [("moo.node", s.node), ("moo.session", s.id), ("moo.agent", s.agent)] {
             a.push("--label".into());
             a.push(format!("{k}={v}"));
         }
@@ -228,24 +228,24 @@ impl Runtime {
             a.push(format!("--userns=keep-id:uid={CONTAINER_UID},gid={CONTAINER_UID}"));
         }
         let allowlist = s.container.egress == Egress::Allowlist;
-        for (k, v) in opencode_env(s.password, "/etc/ocl").into_iter().chain(if allowlist { proxy_env(PROXY_PORT) } else { vec![] }) {
+        for (k, v) in opencode_env(s.password, "/etc/moo").into_iter().chain(if allowlist { proxy_env(PROXY_PORT) } else { vec![] }) {
             a.push("-e".into());
             a.push(format!("{k}={v}"));
         }
         let p = s.paths;
-        for (host, ctr, ro) in [(&p.run, "/run/ocl", false), (&p.etc, "/etc/ocl", true), (&p.home, "/home/agent", false), (&p.workspace, "/workspace", false)] {
+        for (host, ctr, ro) in [(&p.run, "/run/moo", false), (&p.etc, "/etc/moo", true), (&p.home, "/home/agent", false), (&p.workspace, "/workspace", false)] {
             a.push("-v".into());
             a.push(format!("{}:{}{}", host.display(), ctr, if ro { ":ro" } else { "" }));
         }
         a.push(s.image.into());
         if allowlist {
-            a.extend(["--fwd".into(), format!("tcp:127.0.0.1:{PROXY_PORT}=unix:/run/ocl/proxy.sock")]);
+            a.extend(["--fwd".into(), format!("tcp:127.0.0.1:{PROXY_PORT}=unix:/run/moo/proxy.sock")]);
         }
         a.extend([
             "--fwd".into(),
-            format!("tcp:127.0.0.1:{GATEWAY_PORT}=unix:/run/ocl/node.sock"),
+            format!("tcp:127.0.0.1:{GATEWAY_PORT}=unix:/run/moo/node.sock"),
             "--fwd".into(),
-            format!("unix:/run/ocl/oc.sock=tcp:127.0.0.1:{OPENCODE_PORT}"),
+            format!("unix:/run/moo/oc.sock=tcp:127.0.0.1:{OPENCODE_PORT}"),
             "--".into(),
             "opencode".into(),
             "serve".into(),
@@ -378,14 +378,14 @@ impl Runtime {
         if self.kind == RuntimeKind::Process {
             return Ok(self.procs.lock().unwrap().iter().map(|(id, (pid, _))| Found { id: id.clone(), running: *pid != 0 }).collect());
         }
-        let out = self.podman(&["ps", "-a", "--filter", &format!("label=ocl.node={node}"), "--format", "json"]).await?;
+        let out = self.podman(&["ps", "-a", "--filter", &format!("label=moo.node={node}"), "--format", "json"]).await?;
         let v: serde_json::Value = serde_json::from_str(&out).unwrap_or(serde_json::Value::Array(vec![]));
         Ok(v.as_array()
             .map(|a| {
                 a.iter()
                     .filter_map(|c| {
                         Some(Found {
-                            id: c["Labels"]["ocl.session"].as_str()?.to_string(),
+                            id: c["Labels"]["moo.session"].as_str()?.to_string(),
                             running: c["State"].as_str() == Some("running"),
                         })
                     })
@@ -426,7 +426,7 @@ impl Runtime {
         // With no container, checks run with the host's tools; a missing tool
         // looks like a failed check (e.g. pytest not installed on the host).
         if self.kind == RuntimeKind::Process && (code == 127 || tail.contains("No module named")) {
-            tail.push_str("\n[opencode-cluster] runtime=process runs checks on the host: install the tool there, or use the podman runtime (the agent image has it).");
+            tail.push_str("\n[moocher] runtime=process runs checks on the host: install the tool there, or use the podman runtime (the agent image has it).");
         }
         Ok((code, tail))
     }

@@ -15,20 +15,20 @@ Installed `opencode-ai@1.19.4`, ran `opencode serve`, and dumped `/doc` (OpenAPI
 | Blocked detection | `/api/session/{id}/permission`, `/question` + events | Maps to `blocked`. |
 | Active list | `GET /api/session/active` | Used by reconcile. |
 | Server auth | `OPENCODE_SERVER_PASSWORD` (basic auth) | We set a random password per container anyway (defence in depth behind UDS). |
-| Listen | `--hostname/--port` only. **No unix-socket flag.** | Hence `ocl-bridge`. |
+| Listen | `--hostname/--port` only. **No unix-socket flag.** | Hence `moo-bridge`. |
 
-**Conclusion:** "session control" means using the v2 HTTP API directly. The thinnest possible shim is `ocl-bridge`, and it handles transport only.
+**Conclusion:** "session control" means using the v2 HTTP API directly. The thinnest possible shim is `moo-bridge`, and it handles transport only.
 
 ### Upstream feature requests to file (nice to have, not blocking)
-1. `opencode serve --unix-socket <path>`. This would let us drop half of `ocl-bridge`.
+1. `opencode serve --unix-socket <path>`. This would let us drop half of `moo-bridge`.
 2. A documented stability or deprecation policy for the `/api/*` (v2) surface, with semver on the OpenAPI `info.version` (currently `1.0.0` regardless of release).
 3. Per-session token/cost budget enforcement inside OpenCode. We enforce it in keyproxy, but native support would fail more gracefully.
 4. A provider-level `apiKey` env indirection that is guaranteed not to appear in `/config` responses. This is moot with keyproxy, but would help other users.
 
-## 2. Config store — draft schema (`~/.opencode-cluster/`)
+## 2. Config store — draft schema (`~/.moocher/`)
 
 ```
-~/.opencode-cluster/
+~/.moocher/
   node.yaml              # node identity, supervisor URL, limits, secret backend
   providers.yaml         # provider templates (shipped defaults + overrides)
   routes.yaml            # named egress routes
@@ -40,7 +40,7 @@ Installed `opencode-ai@1.19.4`, ran `opencode serve`, and dumped `/doc` (OpenAPI
 
 ```yaml
 # agents/builder.yaml
-apiVersion: ocl/v1
+apiVersion: moo/v1
 kind: Agent
 name: builder
 description: "Writes Python modules from a spec; small, fast model."
@@ -61,7 +61,7 @@ tools:                           # rendered into OpenCode `permission` config
 plugins: []                      # optional OpenCode plugins (e.g. opencode-plugin-otel)
 container:
   isolation: agent               # agent | session
-  image: ghcr.io/you/ocl-agent:1.19.4
+  image: ghcr.io/you/moocher-agent:1.19.4
   memory: 1g
   cpus: 1.5
   pids: 512
@@ -88,8 +88,8 @@ Hot reload uses `notify` on the config dir.
 
 ## 3. Pre-registration flow
 1. On the hub, the operator writes `nodes/gpu-box.yaml`. It lists the expected agents (name, description, desired count) and placement labels, but **no secrets**.
-2. `ocl node invite gpu-box` prints a one-time enrollment token.
-3. On the worker, run `ocl node enroll --supervisor https://hub:7443 --token …`. This produces the key and CSR, installs the cert, and enables the systemd unit.
+2. `moo node invite gpu-box` prints a one-time enrollment token.
+3. On the worker, run `moo node enroll --supervisor https://hub:7443 --token …`. This produces the key and CSR, installs the cert, and enables the systemd unit.
 4. On connect, the node sends `Hello{node, version, capacity, agents:[{name, config_hash, secret_resolvable: bool}]}`.
 5. The supervisor matches the node against its manifest. Matching agents become **eligible** for orchestration. Mismatches are shown as warnings, for example: "expected `reviewer`, missing", or "secret unresolvable".
 6. On disconnect, sessions move to `unreachable`, not `lost`, with their metadata and history kept. After the grace period (default 10 min) they become `lost` and the workflow's `on_lost` policy applies.
@@ -98,7 +98,7 @@ Hot reload uses `notify` on the config dir.
 
 | Item | RSS |
 |---|---|
-| opencode-node | ~30 MB |
+| moocher-node | ~30 MB |
 | OpenCode container (idle/active) | ~250 / ~450 MB (estimate; to be measured in Phase 1) |
 | Practical ceiling | ~8–10 concurrent sessions with `isolation: agent` and 2 sessions/container |
 
@@ -113,7 +113,7 @@ The Phase 5 load test targets 10 concurrent sessions spread over hub + 2 workers
 | Shared workspace edited by two agents at once | Advisory locks via MCP, and coordination through todos and messages. Cross-node sync uses git, so conflicts are explicit. |
 | Agent marks todos complete without doing the work | Optional hard checks per step. The demo runs `pytest`. |
 | Agent exfiltrates its capability token | The token only works through the node UDS. It is budget-capped and revoked on session end. The container has no network, so the token can't be used anywhere else. |
-| Rootless Podman differences across distros (cgroup v2 delegation for `--memory`) | `ocl doctor` preflight checks cgroup v2, subuid/subgid and the podman version. The runbook covers the fixes. |
+| Rootless Podman differences across distros (cgroup v2 delegation for `--memory`) | `moo doctor` preflight checks cgroup v2, subuid/subgid and the podman version. The runbook covers the fixes. |
 | SQLite contention under load | WAL mode, one writer task, batched event inserts. |
 
 ## 6. Decisions from operator review (2026-10-22)
@@ -123,7 +123,7 @@ The Phase 5 load test targets 10 concurrent sessions spread over hub + 2 workers
 | Web UI framework | **SolidJS** (+ Vite), static build embedded in the supervisor. Mobile-first. |
 | Workspaces | **Configurable** `isolated` / `shared`. Same-node sharing mounts one Podman volume into several containers. Cross-node sharing syncs git bundles through the artifact store. No `podman cp`/SCP anywhere (ARCHITECTURE §6b). |
 | Success signal / LLM judge | **Todo-list based.** Use OpenCode's native todos, roll them up into a shared task board, with optional hard checks. The LLM judge is dropped from v1 (ARCHITECTURE §6a). |
-| Hub hosting agents | ~~Off by default~~ → **On** (operator request in review 2): the hub runs its own `opencode-node` over a local socket (D9). |
+| Hub hosting agents | ~~Off by default~~ → **On** (operator request in review 2): the hub runs its own `moocher-node` over a local socket (D9). |
 | Egress routing | `direct`, **`via_node`** (send LLM calls out through another cluster machine's IP; TLS stays end to end and the key stays put) and `proxy` (any SOCKS/HTTP). WireGuard netns is dropped (D10). |
 
 Later additions (review 2): a **task bucket** with `urgent` / `when_free` / `on_demand` labels and a coordinator "main agent" (ARCHITECTURE §5a), and **adding machines from the web UI** with one-time join tokens (ARCHITECTURE D5).

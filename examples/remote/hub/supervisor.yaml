@@ -3,9 +3,9 @@ api_listen: 127.0.0.1:7700            # operator API; put TLS in front (built-in
 link_listen: 0.0.0.0:7443             # remote nodes connect here (mTLS)
 public_names: [hub.example.org, 203.0.113.10]   # in the link certificate; the first forms the join command
 enrollment:
-  require_approval: true              # new machines wait for `ocl node approve <name>`
+  require_approval: true              # new machines wait for `moo node approve <name>`
   enforce_for: relay                  # relay | all | none: who must come from an allowed source
-  allowed_sources:                    # seeds the list once; then edit with `ocl allow add|rm`
+  allowed_sources:                    # seeds the list once; then edit with `moo allow add|rm`
     - 198.51.100.0/24
     - 192.0.2.44
   token_ttl_secs: 900

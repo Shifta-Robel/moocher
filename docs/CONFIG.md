@@ -1,11 +1,11 @@
 # Configuration reference
 
-All files are YAML in one directory per machine (default `~/.opencode-cluster`, override with `--config-dir` or `OCL_CONFIG_DIR`). The directory is meant to be version-controlled: it contains **secret references, never secrets**.
+All files are YAML in one directory per machine (default `~/.moocher`, override with `--config-dir` or `MOO_CONFIG_DIR`). The directory is meant to be version-controlled: it contains **secret references, never secrets**.
 
-`opencode-node schema --out schemas/` writes JSON Schemas for every file, for editor validation. `opencode-node check` validates the directory and resolves every secret reference without printing it.
+`moocher-node schema --out schemas/` writes JSON Schemas for every file, for editor validation. `moocher-node check` validates the directory and resolves every secret reference without printing it.
 
 ```text
-node.yaml          every machine running opencode-node
+node.yaml          every machine running moocher-node
 supervisor.yaml    hub only
 providers.yaml     optional; merged over built-in providers
 routes.yaml        optional; egress routes
@@ -15,7 +15,7 @@ workflows/*.yaml   hub only
 templates/*.yaml   hub only: agent templates pushed to every node
 preambles/cluster.md  hub only: first part of every agent's instructions
 overrides.yaml     written by the node for live changes from the CLI/UI (not for version control)
-pki/               node key + certificate + hub CA (written by `opencode-node join`)
+pki/               node key + certificate + hub CA (written by `moocher-node join`)
 ```
 
 Complete examples for a hub, a remote worker and a relay are in [`examples/remote/`](../examples/remote/).
@@ -30,7 +30,7 @@ Complete examples for a hub, a remote worker and a relay are in [`examples/remot
 | Key | Default | Meaning |
 |---|---|---|
 | `name` | — | Node name, `[a-z0-9-]{1,48}`, unique in the cluster. Must match the name the node enrolled as. |
-| `supervisor` | — | `unix:///run/ocl/supervisor.sock` (same machine) or `https://hub.example.org:7443` (remote, mTLS; written by `opencode-node join`). |
+| `supervisor` | — | `unix:///run/moo/supervisor.sock` (same machine) or `https://hub.example.org:7443` (remote, mTLS; written by `moocher-node join`). |
 | `role` | `worker` | `worker` runs agents. `relay` runs none and only lends its IP to other nodes (`via_node` routes); it needs no Podman. |
 | `pki_dir` | `<config>/pki` | Node key (0600), certificate and hub CA. |
 | `max_sessions` | `6` | Concurrent live sessions on this node (~420 MB RAM each). |
@@ -48,8 +48,8 @@ Complete examples for a hub, a remote worker and a relay are in [`examples/remot
 | `disk_enforce` | `soft` | How `container.disk` is enforced. `soft`: measured every few seconds; the agent is told at 90% and interrupted at 100%. `hard`: also a filesystem quota over the OpenCode home and the isolated workspace together, so writes past the limit fail (ENOSPC). Needs the data dir on XFS mounted with `prjquota`, or on btrfs, and the node running as root; otherwise the node refuses to start. Shared workspaces stay soft. |
 | `runtime.kind` | `podman` | `podman`, or `process` (dev/CI only: no isolation). |
 | `runtime.podman` | `podman` | Podman binary. |
-| `runtime.image` | `localhost/ocl-agent:1.19.4` | Default agent image. |
-| `runtime.run_dir` | `$XDG_RUNTIME_DIR/ocl` or `/run/ocl` | Per-session socket dirs (0700). |
+| `runtime.image` | `localhost/moocher-agent:1.19.4` | Default agent image. |
+| `runtime.run_dir` | `$XDG_RUNTIME_DIR/moo` or `/run/moo` | Per-session socket dirs (0700). |
 | `runtime.data_dir` | `<config>/data` | Workspaces, OpenCode homes, `node.db` (outbox). |
 | `runtime.opencode_bin` | `opencode` | `process` runtime only. |
 
@@ -58,11 +58,11 @@ Complete examples for a hub, a remote worker and a relay are in [`examples/remot
 | Key | Default | Meaning |
 |---|---|---|
 | `api_listen` | `127.0.0.1:7700` | Dashboard and API. Beyond loopback use `tls:` (below) or a TLS proxy. |
-| `link_socket` | `$XDG_RUNTIME_DIR/ocl/supervisor.sock` or `/run/ocl/supervisor.sock` | Unix socket (0600) for same-machine nodes. |
+| `link_socket` | `$XDG_RUNTIME_DIR/moo/supervisor.sock` or `/run/moo/supervisor.sock` | Unix socket (0600) for same-machine nodes. |
 | `link_listen` | off | TCP address for remote nodes (mTLS), e.g. `0.0.0.0:7443`. |
 | `public_names` | hostname, `localhost`, `127.0.0.1` | Names/IPs remote nodes use for the hub; they go into the link certificate (reissued when they change). The first one forms the join command. |
-| `enrollment.require_approval` | `true` | Enrolled nodes stay `pending` until `ocl node approve <name>`. |
-| `enrollment.allowed_sources` | `[]` | IPs/CIDRs allowed to enroll and connect. Seeds the list on first start; afterwards `ocl allow add|rm` (audited) is authoritative. |
+| `enrollment.require_approval` | `true` | Enrolled nodes stay `pending` until `moo node approve <name>`. |
+| `enrollment.allowed_sources` | `[]` | IPs/CIDRs allowed to enroll and connect. Seeds the list on first start; afterwards `moo allow add|rm` (audited) is authoritative. |
 | `enrollment.enforce_for` | `relay` | Who the list applies to: `relay` (proxy-only nodes), `all`, or `none`. |
 | `enrollment.token_ttl_secs` | `900` | Join token lifetime. Tokens are single use and bound to one node name. |
 | `enrollment.cert_days` | `30` | Node certificate lifetime; nodes renew at two thirds. |
@@ -74,8 +74,8 @@ Complete examples for a hub, a remote worker and a relay are in [`examples/remot
 | `tasks.max_concurrent_tasks` | `2` | Running tasks at once (+1 reserved for `urgent`). |
 | `tasks.idle_grace_secs` | `30` | How long the cluster must be idle before a `when_free` task starts. |
 | `tasks.max_nudges` | `2` | Re-prompts for a coordinator that stops without finishing. |
-| `tasks.enabled` | `true` | Turn the scheduler off (tasks then only start via `ocl task run`). |
-| `questions.mode` | `important_and_vital` | Starting question mode: `ask_me_everything`, `important_and_vital`, `vital_only`, `autonomous` (see USAGE §19). Switch it live with `ocl questions mode <mode> [--task N]`; the live setting wins over this one. |
+| `tasks.enabled` | `true` | Turn the scheduler off (tasks then only start via `moo task run`). |
+| `questions.mode` | `important_and_vital` | Starting question mode: `ask_me_everything`, `important_and_vital`, `vital_only`, `autonomous` (see USAGE §19). Switch it live with `moo questions mode <mode> [--task N]`; the live setting wins over this one. |
 | `questions.answer_timeout_secs` | `300` | An agent that holds a question this long without answering or escalating passes it up automatically. |
 | `questions.vital_keywords` | money, credentials, deleting, irreversible and external actions (see the schema) | Words that raise a question to `vital`. The rules only ever raise importance. |
 | `questions.operator_only_keywords` | `credential`, `password`, `secret`, `api key`, `private key` | Words that make a question operator-only: no agent may answer it, whatever the mode. |
@@ -86,9 +86,9 @@ Complete examples for a hub, a remote worker and a relay are in [`examples/remot
 | `on_death.handoff_factor` | `0.5` | A hand-off to a fresh agent is estimated at this fraction of what was spent. |
 | `on_death.crashloop_deaths` | `3` | This many deaths within 10 minutes is a crash loop: no more automatic recoveries. |
 | `artifacts.max_size` | `2g` | Largest single artifact the hub accepts. Blobs live in `<data_dir>/artifacts/`. |
-| `artifacts.retain` | keep all | Expire artifacts older than this (`90d`). Kept regardless: those tagged with a `keep_tags` tag, and those still referenced (live sessions, open tasks and runs, open halts, checkpoints, shared workspaces, any `art://b3/…` in the config files). Checked hourly; `ocl housekeeping --dry-run` shows what would go. |
-| `artifacts.keep_tags` | `[keep]` | Tags that keep an artifact forever (`ocl artifact put --tag keep`). |
-| `events.export` | `true` | Export the event log by UTC day to `<data_dir>/exports/events-YYYYMMDD.jsonl.zst` (JSON lines; a day's file may hold several zstd frames, which `zstdcat` and `ocl-supervisor events-cat` read as one). |
+| `artifacts.retain` | keep all | Expire artifacts older than this (`90d`). Kept regardless: those tagged with a `keep_tags` tag, and those still referenced (live sessions, open tasks and runs, open halts, checkpoints, shared workspaces, any `art://b3/…` in the config files). Checked hourly; `moo housekeeping --dry-run` shows what would go. |
+| `artifacts.keep_tags` | `[keep]` | Tags that keep an artifact forever (`moo artifact put --tag keep`). |
+| `events.export` | `true` | Export the event log by UTC day to `<data_dir>/exports/events-YYYYMMDD.jsonl.zst` (JSON lines; a day's file may hold several zstd frames, which `zstdcat` and `moocher-hub events-cat` read as one). |
 | `events.retain` | `30d` | Events older than this leave the database. With export on, only exported events are pruned. |
 | `events.export_keep` | keep all | Delete export files older than this. |
 | `tls.cert_file` / `tls.key_file` | off | Serve the dashboard and API over HTTPS with your certificate (PEM chain + key). Replaced files are picked up within a minute. |
@@ -107,7 +107,7 @@ Complete examples for a hub, a remote worker and a relay are in [`examples/remot
 | `notifications.rules` | warning + vital → every configured channel | `[{ kinds: ["question.*", "task.halted"], min_severity: info, channels: [push, ntfy] }]`; first match wins; `[]` channels = in-app only. |
 | `notifications.web_push.subject` | `mailto:operator@localhost` | VAPID contact. The key pair is created on first start (`<data_dir>/vapid.key`). Set `web_push: null` to turn push off. |
 | `notifications.ntfy` | off | `{ url: "https://ntfy.sh/my-topic", token: "env:NTFY_TOKEN" }` |
-| `notifications.webhook` | off | `{ url: "https://…", secret: "file:/etc/ocl/hook-secret" }`: JSON POST, signed `X-OCL-Signature: sha256=<hmac>`. |
+| `notifications.webhook` | off | `{ url: "https://…", secret: "file:/etc/moo/hook-secret" }`: JSON POST, signed `X-Moo-Signature: sha256=<hmac>`. |
 
 Event kinds (for rules): `question.waiting`, `task.done|failed|cancelled`, `task.halted`, `recovery.auto`, `run.passed|failed`, `node.offline`, `node.back`, `quota.exhausted`, `quota.reset`, `budget.80`, `provider.auth_failed`, `provider.down`, `disk.warning`, `usage.mismatch`, `agent.report`, `login.lockout`, `tls.acme_failed`, `test`.
 
@@ -168,7 +168,7 @@ Routes only affect keyproxy's calls to the LLM provider, i.e. which IP the provi
 
 ## overrides.yaml
 
-Written by the node when you change something live (`ocl route set`, `ocl quota set`, later the web UI); hot-reloaded. Delete it to drop every live change.
+Written by the node when you change something live (`moo route set`, `moo quota set`, later the web UI); hot-reloaded. Delete it to drop every live change.
 
 ```yaml
 routes:                      # agent -> route spec, replaces the agent's `route`
@@ -180,7 +180,7 @@ quotas:                      # "this allowance resets at T / has N left"
 ## agents/<name>.yaml
 
 ```yaml
-apiVersion: ocl/v1
+apiVersion: moo/v1
 kind: Agent
 name: builder                       # [a-z0-9-]{1,48}; must be unique on the node
 description: Writes small Python modules with pytest tests.
@@ -206,7 +206,7 @@ tools:                              # rendered into OpenCode's `permission` conf
   cluster: [send_message, read_inbox, list_agents]   # optional allowlist of cluster MCP tools
 plugins: []                         # OpenCode plugins; must already be in the image
 container:
-  image: localhost/ocl-agent:1.19.4 # default: node runtime.image
+  image: localhost/moocher-agent:1.19.4 # default: node runtime.image
   memory: 1g
   cpus: 1.0
   pids: 512
@@ -254,7 +254,7 @@ on_death: { auto_retry: 1, max_auto_cost_usd: 0.50 }   # overrides the superviso
 
 **Retention:** `retain: 24h` keeps the stopped instance's OpenCode home and isolated workspace for 24 h, then removes them. `on_failure` keeps them 24 h only if the instance failed or died, `never` removes them at once, `always` never does. Shared workspaces are never removed by an instance.
 
-Spawning with overrides: `ocl spawn coder --append "…" --budget 2 --route via-relay-de`, the API's `overrides` field, or the `spawn_agent` tool's `role_append` / `budget_usd` / `route`. Anything outside `overridable` is refused.
+Spawning with overrides: `moo spawn coder --append "…" --budget 2 --route via-relay-de`, the API's `overrides` field, or the `spawn_agent` tool's `role_append` / `budget_usd` / `route`. Anything outside `overridable` is refused.
 
 ## templates/ and preambles/ (hub)
 
@@ -267,14 +267,14 @@ Spawning with overrides: `ocl spawn coder --append "…" --budget 2 --route via-
 4. the orchestration briefing (e.g. for coordinators);
 5. the spawner's `role_append`.
 
-Variables are `{{instance.id}}`, `{{template}}`, `{{node}}`, `{{parent}}`, `{{task}}`, `{{budget}}`, `{{model}}`, `{{tools}}`, `{{question_mode}}` and `{{outputs}}`. Read a session's rendered instructions with `ocl show <session> --preamble`.
+Variables are `{{instance.id}}`, `{{template}}`, `{{node}}`, `{{parent}}`, `{{task}}`, `{{budget}}`, `{{model}}`, `{{tools}}`, `{{question_mode}}` and `{{outputs}}`. Read a session's rendered instructions with `moo show <session> --preamble`.
 
-`ask` permissions make a session **blocked**. They become questions (kind `permission`) that go up the chain like any other: answer with `ocl answer <question> once|always|reject`, or directly with `ocl permit <session> <request> once|always|reject`.
+`ask` permissions make a session **blocked**. They become questions (kind `permission`) that go up the chain like any other: answer with `moo answer <question> once|always|reject`, or directly with `moo permit <session> <request> once|always|reject`.
 
 ## workflows/<name>.yaml
 
 ```yaml
-apiVersion: ocl/v1
+apiVersion: moo/v1
 kind: Workflow
 name: build-review
 description: Builder implements, reviewer approves or sends it back.

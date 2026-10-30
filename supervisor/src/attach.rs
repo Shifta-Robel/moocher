@@ -4,7 +4,7 @@
 //!
 //! 1. The dashboard asks `POST /api/v1/sessions/{id}/attach` for a one-time
 //!    ticket (60 s).
-//! 2. The browser opens `<attach origin>/__ocl/attach?ticket=…`; the hub
+//! 2. The browser opens `<attach origin>/__moo/attach?ticket=…`; the hub
 //!    swaps the ticket for an `HttpOnly` cookie (8 h) naming the instance.
 //! 3. Every further connection is checked against that cookie, then spliced
 //!    byte for byte through a tunnel on the node's link to an HTTP proxy on
@@ -13,11 +13,11 @@
 
 use crate::state::{Actor, Sup};
 use anyhow::{anyhow, bail, Result};
-use ocl_protocol::link::NodeCommand;
-use ocl_protocol::model::{now_ms, Ts};
+use moocher_protocol::link::NodeCommand;
+use moocher_protocol::model::{now_ms, Ts};
 #[cfg(test)]
-use ocl_protocol::model::SessionState;
-use ocl_protocol::proto::TunnelFrame;
+use moocher_protocol::model::SessionState;
+use moocher_protocol::proto::TunnelFrame;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -28,7 +28,7 @@ use tonic::{Status, Streaming};
 
 const TICKET_MS: Ts = 60_000;
 const COOKIE_MS: Ts = 8 * 3_600_000;
-const COOKIE: &str = "ocl_attach";
+const COOKIE: &str = "moo_attach";
 
 pub type TunnelEnds = (Streaming<TunnelFrame>, mpsc::Sender<Result<TunnelFrame, Status>>);
 
@@ -66,7 +66,7 @@ impl Sup {
         t.insert(ticket.clone(), (session.into(), actor.to_string(), now + TICKET_MS));
         drop(t);
         self.audit(actor, "session.attach", session, json!({"node": s.report.node}), true);
-        Ok(json!({"url": format!("{base}/__ocl/attach?ticket={ticket}"), "ticket": ticket, "expires_in_s": TICKET_MS / 1000}))
+        Ok(json!({"url": format!("{base}/__moo/attach?ticket={ticket}"), "ticket": ticket, "expires_in_s": TICKET_MS / 1000}))
     }
 
     fn redeem_ticket(&self, ticket: &str) -> Option<(String, String)> {
@@ -86,7 +86,7 @@ impl Sup {
         if !s.report.state.is_live() {
             bail!("session {session} is {}", s.report.state.as_str());
         }
-        let id = ocl_protocol::new_id("a");
+        let id = moocher_protocol::new_id("a");
         let (tx, rx) = oneshot::channel();
         self.attach.pending.lock().unwrap().insert(id.clone(), tx);
         let res = self.nodes.call(&s.report.node, NodeCommand::OpenAttach { id: id.clone(), session: session.into(), cookie_sha256: Some(crate::db::hash_token(cookie)), expires_at: Some(expires_at) }, Duration::from_secs(15)).await;
@@ -129,7 +129,7 @@ pub async fn serve(sup: Arc<Sup>, listener: tokio::net::TcpListener, tls: Option
 /// Where OpenCode's web UI shows this session live: `/<dir>/session/<id>`,
 /// the directory in unpadded URL-safe base64 as the UI encodes it. Without
 /// both (an older node, or OpenCode not started yet), its start page.
-fn session_path(r: &ocl_protocol::model::SessionReport) -> String {
+fn session_path(r: &moocher_protocol::model::SessionReport) -> String {
     use base64::Engine;
     match (&r.directory, &r.opencode_id) {
         (Some(dir), Some(id)) => format!("/{}/session/{id}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(dir)),
@@ -181,7 +181,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(sup: &Arc<Su
         .filter_map(|h| std::str::from_utf8(h.value).ok())
         .flat_map(|v| v.split(';'))
         .find_map(|kv| kv.trim().strip_prefix(&format!("{COOKIE}=")).map(String::from));
-    if let Some(q) = path.strip_prefix("/__ocl/attach") {
+    if let Some(q) = path.strip_prefix("/__moo/attach") {
         let ticket = q.trim_start_matches('?').split('&').find_map(|kv| kv.strip_prefix("ticket=")).unwrap_or("");
         let Some((session, who)) = sup.redeem_ticket(ticket) else {
             return respond(&mut s, "403 Forbidden", "", &page("Link expired", "This link works once and for 60 seconds. Use <b>Open in OpenCode</b> on the dashboard again.")).await;
@@ -253,14 +253,14 @@ mod tests {
     fn ticket_once() {
         let dir = tempfile::tempdir().unwrap();
         let db = crate::db::Db::open(&dir.path().join("t.db")).unwrap();
-        let mut cfg = ocl_protocol::config::SupervisorConfig::default();
+        let mut cfg = moocher_protocol::config::SupervisorConfig::default();
         cfg.attach_listen = Some("127.0.0.1:7444".into());
         let sup = super::Sup::new(db, cfg, dir.path().into());
         let mut r = crate::state::tests_report("s-1");
         r.state = super::SessionState::Idle;
         sup.merge_report(r);
         let v = sup.attach_ticket(&super::Actor::Operator("op".into()), "s-1", Some("hub.example.org:7700"), true).unwrap();
-        assert!(v["url"].as_str().unwrap().starts_with("https://hub.example.org:7444/__ocl/attach?ticket="));
+        assert!(v["url"].as_str().unwrap().starts_with("https://hub.example.org:7444/__moo/attach?ticket="));
         let t = v["ticket"].as_str().unwrap();
         assert!(sup.redeem_ticket(t).is_some());
         assert!(sup.redeem_ticket(t).is_none(), "a ticket works once");

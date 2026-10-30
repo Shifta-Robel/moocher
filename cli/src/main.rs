@@ -1,6 +1,6 @@
-//! ocl — scriptable client for the supervisor API (mirrors the web UI).
+//! moo — scriptable client for the supervisor API (mirrors the web UI).
 //!
-//! Auth: `OCL_TOKEN`, else `~/.opencode-cluster/cli-token`. Server: `OCL_URL`
+//! Auth: `MOO_TOKEN`, else `~/.moocher/cli-token`. Server: `MOO_URL`
 //! (default http://127.0.0.1:7700). Add `--json` to any command for raw output.
 
 mod attach;
@@ -9,19 +9,19 @@ mod tui;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
-use ocl_protocol::api::*;
-use ocl_protocol::model::*;
+use moocher_protocol::api::*;
+use moocher_protocol::model::*;
 use serde_json::{json, Value};
 
 #[derive(Parser)]
-#[command(name = "ocl", version, about = "opencode-cluster CLI")]
+#[command(name = "moo", version, about = "moocher CLI")]
 struct Cli {
-    #[arg(long, env = "OCL_URL", default_value = "http://127.0.0.1:7700", global = true)]
+    #[arg(long, env = "MOO_URL", default_value = "http://127.0.0.1:7700", global = true)]
     url: String,
-    #[arg(long, env = "OCL_TOKEN", hide_env_values = true, global = true)]
+    #[arg(long, env = "MOO_TOKEN", hide_env_values = true, global = true)]
     token: Option<String>,
     /// Extra CA certificate (PEM) to trust for the hub's HTTPS (self-signed or private CA).
-    #[arg(long, env = "OCL_CA_CERT", global = true)]
+    #[arg(long, env = "MOO_CA_CERT", global = true)]
     ca_cert: Option<std::path::PathBuf>,
     /// Print raw JSON.
     #[arg(long, global = true)]
@@ -34,7 +34,7 @@ struct Cli {
 enum Cmd {
     /// Nodes, live sessions, tasks and token totals.
     Status,
-    /// List nodes (same as `ocl node ls`).
+    /// List nodes (same as `moo node ls`).
     Nodes,
     /// Nodes: list, invite (join token), approve, revoke, forget.
     Node {
@@ -346,7 +346,7 @@ enum NodeCmd {
 
 #[derive(Subcommand)]
 enum QuotaCmd {
-    /// e.g. `ocl quota set kilo-free --scope-id 203.0.113.7 --resets-at 03:15 --remaining 0`
+    /// e.g. `moo quota set kilo-free --scope-id 203.0.113.7 --resets-at 03:15 --remaining 0`
     Set {
         provider: String,
         /// An IP, `key:…` or `account:…` (default: every bucket of the provider).
@@ -374,7 +374,7 @@ enum QuotaCmd {
 
 #[derive(Subcommand)]
 enum RouteCmd {
-    /// e.g. `ocl route set worker-a builder --prefer direct --failover via-vps,home-proxy`
+    /// e.g. `moo route set worker-a builder --prefer direct --failover via-vps,home-proxy`
     Set {
         node: String,
         agent: String,
@@ -447,9 +447,8 @@ fn token(cli: &Cli) -> Result<String> {
     if let Some(t) = &cli.token {
         return Ok(t.clone());
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let p = std::path::Path::new(&home).join(".opencode-cluster/cli-token");
-    Ok(std::fs::read_to_string(&p).with_context(|| format!("no OCL_TOKEN and cannot read {}", p.display()))?.trim().to_string())
+    let p = moocher_protocol::config::default_config_dir().join("cli-token");
+    Ok(std::fs::read_to_string(&p).with_context(|| format!("no MOO_TOKEN and cannot read {}", p.display()))?.trim().to_string())
 }
 
 fn ago(ts: i64) -> String {
@@ -529,7 +528,7 @@ fn parse_when(s: &str) -> Result<i64> {
     use chrono::{Local, NaiveTime, TimeZone, Utc};
     let s = s.trim();
     if let Some(d) = s.strip_prefix('+').or_else(|| s.strip_prefix("in ")) {
-        let ms = ocl_protocol::config::parse_duration_ms(d).context("bad duration (e.g. +2h30m)")?;
+        let ms = moocher_protocol::config::parse_duration_ms(d).context("bad duration (e.g. +2h30m)")?;
         return Ok(now_ms() + ms);
     }
     if let Ok(t) = chrono::DateTime::parse_from_rfc3339(s) {
@@ -568,7 +567,7 @@ fn print_tasks(ts: &[Task]) {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    // `ocl events | head` should just stop, like other CLI tools, instead of
+    // `moo events | head` should just stop, like other CLI tools, instead of
     // panicking on a closed stdout.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
@@ -583,7 +582,7 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    // No redirects: `ocl attach` needs the cookie from the ticket's 302 itself.
+    // No redirects: `moo attach` needs the cookie from the ticket's 302 itself.
     let mut hb = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
     if let Some(ca) = &cli.ca_cert {
         let pem = std::fs::read(ca).with_context(|| format!("reading {}", ca.display()))?;
@@ -629,7 +628,7 @@ async fn run(cli: Cli) -> Result<()> {
                 println!("Join token for {} ({}), single use, valid until {}:", name, v["role"].as_str().unwrap_or(""), fmt_ts(v["expires_at"].as_i64().unwrap_or(0)));
                 println!("\n  {}\n", v["command"].as_str().unwrap_or(""));
                 if v["approval_required"].as_bool() == Some(true) {
-                    println!("After it enrolls, approve it with: ocl node approve {name}");
+                    println!("After it enrolls, approve it with: moo node approve {name}");
                 }
             }
             NodeCmd::Approve { name } => {
@@ -1245,7 +1244,7 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 async fn artifact_cmd(api: &Api, cmd: ArtifactCmd, raw: bool) -> Result<()> {
-    use ocl_protocol::archive;
+    use moocher_protocol::archive;
     match cmd {
         ArtifactCmd::Put { path, name, tag, parent } => {
             let meta = std::fs::metadata(&path).with_context(|| format!("{}", path.display()))?;
@@ -1255,7 +1254,7 @@ async fn artifact_cmd(api: &Api, cmd: ArtifactCmd, raw: bool) -> Result<()> {
                 if !skipped.is_empty() {
                     eprintln!("note: skipped {} link(s)/special file(s)", skipped.len());
                 }
-                let tmp = std::env::temp_dir().join(format!("ocl-put-{}.tar.zst", std::process::id()));
+                let tmp = std::env::temp_dir().join(format!("moo-put-{}.tar.zst", std::process::id()));
                 archive::pack(&root, &m, &tmp)?;
                 (tmp, "tree", true)
             } else {
@@ -1307,11 +1306,11 @@ async fn artifact_cmd(api: &Api, cmd: ArtifactCmd, raw: bool) -> Result<()> {
             }
             // Stream to a temporary file next to the destination, verify, then move it in place.
             let to = match (&out, a.kind.as_str()) {
-                (_, "tree") => std::env::temp_dir().join(format!("ocl-get-{}.tar.zst", std::process::id())),
+                (_, "tree") => std::env::temp_dir().join(format!("moo-get-{}.tar.zst", std::process::id())),
                 (Some(o), _) => o.clone(),
                 (None, _) => std::path::PathBuf::from(std::path::Path::new(&a.name).file_name().unwrap_or_default()),
             };
-            let part = to.with_extension("ocl-part");
+            let part = to.with_extension("moo-part");
             let mut f = tokio::fs::File::create(&part).await?;
             let mut h = blake3::Hasher::new();
             let mut n = 0u64;

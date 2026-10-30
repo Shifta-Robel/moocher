@@ -16,9 +16,9 @@
 
 use crate::cfgstore::ConfigStore;
 use crate::link::LinkHandle;
-use ocl_protocol::config::HostPattern;
-use ocl_protocol::link::NodeEvent;
-use ocl_protocol::model::now_ms;
+use moocher_protocol::config::HostPattern;
+use moocher_protocol::link::NodeEvent;
+use moocher_protocol::model::now_ms;
 use serde_json::json;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -209,7 +209,7 @@ impl EgressProxy {
             Ok(a) => a,
             Err(why) => {
                 self.report_denied(&host, port, &why);
-                return reply(&mut c, 403, &format!("[opencode-cluster] egress refused: {why}")).await;
+                return reply(&mut c, 403, &format!("[moocher] egress refused: {why}")).await;
             }
         };
         let mut up = None;
@@ -220,7 +220,7 @@ impl EgressProxy {
             }
         }
         let Some(mut up) = up else {
-            return reply(&mut c, 502, &format!("[opencode-cluster] could not connect to {host}:{port}")).await;
+            return reply(&mut c, 502, &format!("[moocher] could not connect to {host}:{port}")).await;
         };
         tracing::debug!(session = %self.session, host, port, "egress allowed");
         let rest = &buf[end..];

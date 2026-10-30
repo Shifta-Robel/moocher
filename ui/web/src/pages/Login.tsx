@@ -35,7 +35,7 @@ export default function Login() {
       <form onSubmit={submit} class="w-full max-w-sm space-y-4 rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200 dark:bg-slate-900 dark:ring-slate-800">
         <div class="flex items-center gap-2">
           <img src="/icon.svg" class="size-8" alt="" />
-          <h1 class="text-lg font-semibold">opencode-cluster</h1>
+          <h1 class="text-lg font-semibold">moocher</h1>
         </div>
         <Field label="User">
           <input class={inputCls} autocomplete="username" value={user()} onInput={(e) => setUser(e.currentTarget.value)} required autofocus />
