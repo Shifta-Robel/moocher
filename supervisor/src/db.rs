@@ -63,6 +63,8 @@ impl Db {
              CREATE TABLE IF NOT EXISTS nodes(name TEXT PRIMARY KEY, info TEXT NOT NULL, last_seq INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, node TEXT NOT NULL, state TEXT NOT NULL, info TEXT NOT NULL, updated_at INTEGER NOT NULL);
              CREATE INDEX IF NOT EXISTS sessions_node ON sessions(node);
+             CREATE TABLE IF NOT EXISTS held(id INTEGER PRIMARY KEY AUTOINCREMENT, to_session TEXT NOT NULL, from_session TEXT NOT NULL, text TEXT NOT NULL, ts INTEGER NOT NULL);
+             CREATE INDEX IF NOT EXISTS held_to ON held(to_session, id);
              CREATE TABLE IF NOT EXISTS inbox(id INTEGER PRIMARY KEY AUTOINCREMENT, to_session TEXT NOT NULL, from_session TEXT NOT NULL, text TEXT NOT NULL, ts INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY AUTOINCREMENT, rank REAL NOT NULL, status TEXT NOT NULL, info TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, status TEXT NOT NULL, info TEXT NOT NULL, updated_at INTEGER NOT NULL);
@@ -82,6 +84,13 @@ impl Db {
              CREATE TABLE IF NOT EXISTS instance_stats(ts INTEGER NOT NULL, session TEXT NOT NULL, node TEXT NOT NULL, info TEXT NOT NULL);
              CREATE INDEX IF NOT EXISTS instance_stats_session ON instance_stats(session, ts);
              CREATE TABLE IF NOT EXISTS route_stats(node TEXT NOT NULL, route TEXT NOT NULL, provider TEXT NOT NULL, info TEXT NOT NULL, PRIMARY KEY(node, route, provider));
+             CREATE TABLE IF NOT EXISTS observations(hour INTEGER NOT NULL, node TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+                scope_id TEXT NOT NULL, route TEXT NOT NULL, info TEXT NOT NULL, PRIMARY KEY(hour, node, provider, model, scope_id, route));
+             CREATE INDEX IF NOT EXISTS observations_provider ON observations(provider, model, hour);
+             CREATE TABLE IF NOT EXISTS queued_spawns(id TEXT PRIMARY KEY, info TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS provider_events(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, provider TEXT NOT NULL,
+                model TEXT NOT NULL, kind TEXT NOT NULL, info TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS provider_events_provider ON provider_events(provider, model, kind, ts);
              CREATE TABLE IF NOT EXISTS quota_buckets(node TEXT NOT NULL, provider TEXT NOT NULL, scope_id TEXT NOT NULL, kind TEXT NOT NULL,
                 info TEXT NOT NULL, PRIMARY KEY(node, provider, scope_id, kind));
              CREATE TABLE IF NOT EXISTS artifacts(hash TEXT PRIMARY KEY, name TEXT NOT NULL, task_id INTEGER, created_at INTEGER NOT NULL, info TEXT NOT NULL);
@@ -308,6 +317,60 @@ impl Db {
         Ok(())
     }
 
+    /// Hourly rows replace earlier versions of the same hour.
+    pub fn put_observations(&self, rows: &[ObsRow]) -> Result<()> {
+        let mut c = self.c.lock().unwrap();
+        let tx = c.transaction()?;
+        for r in rows {
+            tx.execute(
+                "INSERT INTO observations(hour,node,provider,model,scope_id,route,info) VALUES(?1,?2,?3,?4,?5,?6,?7)
+                 ON CONFLICT(hour,node,provider,model,scope_id,route) DO UPDATE SET info=excluded.info",
+                params![r.hour, r.node, r.provider, r.model, r.scope_id, r.route, serde_json::to_string(r)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn observations(&self, since: Ts, provider: Option<&str>) -> Vec<ObsRow> {
+        match provider {
+            Some(p) => self.json_rows("SELECT info FROM observations WHERE hour >= ?1 AND provider = ?2 ORDER BY hour", params![since, p]),
+            None => self.json_rows("SELECT info FROM observations WHERE hour >= ?1 ORDER BY hour", params![since]),
+        }
+    }
+
+    pub fn add_provider_events(&self, events: &[ProviderEvent]) -> Result<()> {
+        let mut c = self.c.lock().unwrap();
+        let tx = c.transaction()?;
+        for e in events {
+            tx.execute("INSERT INTO provider_events(ts,provider,model,kind,info) VALUES(?1,?2,?3,?4,?5)", params![e.ts, e.provider, e.model, e.kind, serde_json::to_string(e)?])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn put_queued_spawn(&self, id: &str, info: &serde_json::Value) -> Result<()> {
+        self.c.lock().unwrap().execute("INSERT INTO queued_spawns(id,info) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET info=excluded.info", params![id, info.to_string()])?;
+        Ok(())
+    }
+
+    pub fn queued_spawns(&self) -> Vec<serde_json::Value> {
+        self.json_rows("SELECT info FROM queued_spawns", [])
+    }
+
+    pub fn del_queued_spawn(&self, id: &str) -> Result<()> {
+        self.c.lock().unwrap().execute("DELETE FROM queued_spawns WHERE id=?1", params![id])?;
+        Ok(())
+    }
+
+    /// Newest first.
+    pub fn provider_events(&self, provider: Option<&str>, kind: Option<&str>, limit: i64) -> Vec<ProviderEvent> {
+        self.json_rows(
+            "SELECT info FROM provider_events WHERE (?1 IS NULL OR provider = ?1) AND (?2 IS NULL OR kind = ?2) ORDER BY ts DESC, id DESC LIMIT ?3",
+            params![provider, kind, limit],
+        )
+    }
+
     pub fn route_stats(&self) -> Vec<RouteStat> {
         self.json_rows("SELECT info FROM route_stats ORDER BY node, route, provider", [])
     }
@@ -401,6 +464,36 @@ impl Db {
 
     pub fn sessions_on(&self, node: &str) -> Vec<SessionInfo> {
         self.json_rows("SELECT info FROM sessions WHERE node=?1", params![node])
+    }
+
+    // -------------------------------------------------------------- held
+
+    pub fn held_push(&self, to: &str, from: &str, text: &str) -> Result<()> {
+        self.c.lock().unwrap().execute("INSERT INTO held(to_session,from_session,text,ts) VALUES(?1,?2,?3,?4)", params![to, from, text, now_ms()])?;
+        Ok(())
+    }
+
+    pub fn held(&self, to: &str) -> Result<Vec<crate::held::Held>> {
+        let c = self.c.lock().unwrap();
+        let mut st = c.prepare("SELECT id, from_session, text, ts FROM held WHERE to_session=?1 ORDER BY id")?;
+        let rows = st.query_map(params![to], |r| Ok(crate::held::Held { id: r.get(0)?, from: r.get(1)?, text: r.get(2)?, ts: r.get(3)? }))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn held_count(&self, to: &str) -> u32 {
+        self.c.lock().unwrap().query_row("SELECT COUNT(*) FROM held WHERE to_session=?1", params![to], |r| r.get(0)).unwrap_or(0)
+    }
+
+    /// Forget what was delivered: those up to `up_to`, not any that came since.
+    pub fn held_clear(&self, to: &str, up_to: i64) -> Result<()> {
+        self.c.lock().unwrap().execute("DELETE FROM held WHERE to_session=?1 AND id<=?2", params![to, up_to])?;
+        Ok(())
+    }
+
+    /// A replacement inherits what its predecessor had not received, in order.
+    pub fn held_move(&self, from: &str, to: &str) -> Result<()> {
+        self.c.lock().unwrap().execute("UPDATE held SET to_session=?2 WHERE to_session=?1", params![from, to])?;
+        Ok(())
     }
 
     // ------------------------------------------------------------- inbox

@@ -32,6 +32,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Ask the manager about the cluster (needs `manager.agent` in supervisor.yaml).
+    Ask { question: Vec<String> },
     /// Nodes, live sessions, tasks and token totals.
     Status,
     /// List nodes (same as `moo node ls`).
@@ -45,6 +47,18 @@ enum Cmd {
     Allow {
         #[command(subcommand)]
         cmd: AllowCmd,
+    },
+    /// What the cluster has seen of each provider model: speed, errors,
+    /// learned context windows, when credits ran out.
+    Providers {
+        /// Only this provider.
+        provider: Option<String>,
+        /// Look back this many hours.
+        #[arg(long, default_value_t = 24)]
+        hours: i64,
+        /// Recent events (context overflows, credits, auth) instead.
+        #[arg(long)]
+        events: bool,
     },
     /// Provider allowances per IP / key / account, with reset countdowns.
     Quotas {
@@ -92,6 +106,12 @@ enum Cmd {
         /// Use (or create) a shared workspace with this name.
         #[arg(long)]
         shared: Option<String>,
+        /// The specialization of a generic agent (`kind: generic`).
+        #[arg(long)]
+        system_prompt: Option<String>,
+        /// `right_now` may pause less urgent work to make room.
+        #[arg(long)]
+        urgency: Option<String>,
         /// Extra instructions for this instance (template must allow role_append).
         #[arg(long)]
         append: Option<String>,
@@ -277,7 +297,7 @@ enum ArtifactCmd {
 
 #[derive(Subcommand)]
 enum TaskCmd {
-    /// Add a task: labels urgent | when_free | on_demand.
+    /// Add a task: labels right_now | urgent | normal | when_free | on_demand.
     Add {
         title: String,
         #[arg(short, long, default_value = "")]
@@ -360,6 +380,15 @@ enum QuotaCmd {
         resets_at: Option<String>,
         #[arg(long)]
         remaining: Option<u64>,
+        /// Calibrate a provider unit (with `--used`): `--unit neurons --used 4210`
+        /// is what the provider's dashboard shows for the current window.
+        #[arg(long, requires = "used")]
+        unit: Option<String>,
+        #[arg(long, requires = "unit")]
+        used: Option<f64>,
+        /// With `--unit`: which model's pool (`per_model` units).
+        #[arg(long, requires = "unit")]
+        model: Option<String>,
         #[arg(long)]
         note: Option<String>,
     },
@@ -592,6 +621,13 @@ async fn run(cli: Cli) -> Result<()> {
     let raw = cli.json;
     let out = |v: &Value| println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
     match cli.cmd {
+        Cmd::Ask { question } => {
+            let v = api.post("/manager/ask", json!({"question": question.join(" ")})).await?;
+            println!("{}", v["answer"].as_str().unwrap_or(""));
+            for l in v["links"].as_array().into_iter().flatten() {
+                println!("  -> {} ({})", l["path"].as_str().unwrap_or(""), l["label"].as_str().unwrap_or(""));
+            }
+        }
         Cmd::Status => {
             let v = api.get("/overview").await?;
             if raw {
@@ -670,6 +706,57 @@ async fn run(cli: Cli) -> Result<()> {
                     q.nodes.join(","),
                     q.sessions.join(",")
                 );
+                for r in q.unit.iter().flat_map(|u| &u.rates) {
+                    let name = q.unit.as_ref().map_or("unit", |u| u.name.as_str());
+                    println!("    {}: {:.1} {name}/Mtok, 1 {name} buys ~{:.0} tokens ({})", r.model, r.units_per_mtok, 1e6 / r.units_per_mtok, r.source);
+                }
+            }
+        }
+        Cmd::Providers { provider, hours, events } => {
+            let q = provider.as_deref().map(|p| format!("&provider={p}")).unwrap_or_default();
+            if events {
+                let v = api.get(&format!("/providers/events?limit=50{q}")).await?;
+                if raw {
+                    return Ok(out(&v));
+                }
+                for e in v.as_array().into_iter().flatten() {
+                    let d = &e["detail"];
+                    let what = match e["kind"].as_str().unwrap_or("") {
+                        "context_overflow" => d["limit"].as_u64().map(|l| format!("window {l} tokens")).unwrap_or_else(|| "no limit named".into()),
+                        _ => d["message"].as_str().unwrap_or("").chars().take(80).collect(),
+                    };
+                    println!("{} {:<18} {:<34} {:<10} {}", ago(e["ts"].as_i64().unwrap_or(0)), e["kind"].as_str().unwrap_or(""), format!("{}/{}", e["provider"].as_str().unwrap_or(""), e["model"].as_str().unwrap_or("")), e["node"].as_str().unwrap_or(""), what);
+                }
+                return Ok(());
+            }
+            let v = api.get(&format!("/providers/stats?hours={hours}{q}")).await?;
+            if raw {
+                return Ok(out(&v));
+            }
+            println!("{:<40} {:>7} {:>6} {:>9} {:>9} {:>8} {:>10} {:<24}", "MODEL", "CALLS", "ERR%", "1ST BYTE", "p95", "TOK/S", "COST", "LEARNED");
+            for m in v["models"].as_array().into_iter().flatten() {
+                let secs = |k: &str| m[k].as_f64().map(|t| format!("≤{:.1}s", t / 1000.0)).unwrap_or("-".into());
+                let l = &m["learned"];
+                let mut learned = vec![];
+                if let Some(c) = l["context"].as_u64() {
+                    learned.push(format!("window {c}"));
+                }
+                if let Some(ts) = l["last_credits_exhausted"].as_i64() {
+                    learned.push(format!("out of credits {}", ago(ts)));
+                }
+                let errs: Vec<String> = m["errors"].as_object().into_iter().flatten().map(|(k, n)| format!("{k}:{n}")).collect();
+                println!(
+                    "{:<40} {:>7} {:>5.1}% {:>9} {:>9} {:>8} {:>10} {:<24} {}",
+                    format!("{}/{}", m["provider"].as_str().unwrap_or(""), m["model"].as_str().unwrap_or("")),
+                    m["requests"],
+                    m["error_rate"].as_f64().unwrap_or(0.0) * 100.0,
+                    secs("ttft_ms_p50"),
+                    secs("ttft_ms_p95"),
+                    m["tokens_per_s_mean"].as_f64().map(|t| format!("{t:.0}")).unwrap_or("-".into()),
+                    format!("${:.4}", m["cost_usd"].as_f64().unwrap_or(0.0)),
+                    learned.join(", "),
+                    errs.join(" ")
+                );
             }
         }
         Cmd::Stats => {
@@ -725,10 +812,10 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Cmd::Quota { cmd } => match cmd {
-            QuotaCmd::Set { provider, scope_id, node, resets_at, remaining, note } => {
+            QuotaCmd::Set { provider, scope_id, node, resets_at, remaining, unit, used, model, note } => {
                 let resets_at = resets_at.as_deref().map(parse_when).transpose()?;
                 let v = api
-                    .post("/quotas/override", json!({"provider": provider, "scope_id": scope_id, "node": node, "resets_at": resets_at, "remaining": remaining, "note": note}))
+                    .post("/quotas/override", json!({"provider": provider, "scope_id": scope_id, "node": node, "resets_at": resets_at, "remaining": remaining, "unit": unit, "used": used, "model": model, "note": note}))
                     .await?;
                 if raw {
                     return Ok(out(&v));
@@ -889,11 +976,15 @@ async fn run(cli: Cli) -> Result<()> {
                 println!("last output:\n{t}");
             }
         }
-        Cmd::Spawn { agent, prompt, node, title, shared, append, budget, route, coordinator } => {
+        Cmd::Spawn { agent, prompt, node, title, shared, system_prompt, urgency, append, budget, route, coordinator } => {
+            let urgency = urgency.as_deref().map(|u| TaskLabel::parse(u).context("urgency must be right_now, urgent, normal or when_free")).transpose()?;
             let ws = shared.map(|n| json!({"mode": "shared", "name": n}));
             let mut ov = serde_json::Map::new();
             if let Some(a) = append {
                 ov.insert("role_append".into(), json!(a));
+            }
+            if let Some(p) = system_prompt {
+                ov.insert("system_prompt".into(), json!(p));
             }
             if let Some(b) = budget {
                 ov.insert("budget_usd".into(), json!(b));
@@ -902,7 +993,7 @@ async fn run(cli: Cli) -> Result<()> {
                 ov.insert("route".into(), json!(r));
             }
             let role = if coordinator { "coordinator" } else { "worker" };
-            let v = api.post("/sessions", json!({"agent": agent, "prompt": prompt, "node": node, "title": title, "workspace": ws, "overrides": ov, "role": role})).await?;
+            let v = api.post("/sessions", json!({"agent": agent, "prompt": prompt, "node": node, "title": title, "workspace": ws, "urgency": urgency, "overrides": ov, "role": role})).await?;
             if raw {
                 return Ok(out(&v));
             }
@@ -933,7 +1024,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Task { cmd } => match cmd {
             TaskCmd::Add { title, body, label, tag, question_mode } => {
-                let l = TaskLabel::parse(&label).context("label must be urgent, when_free or on_demand")?;
+                let l = TaskLabel::parse(&label).context("label must be right_now, urgent, normal, when_free or on_demand")?;
                 let qm = question_mode.as_deref().map(|m| QuestionMode::parse(m).context("question mode must be ask_me_everything, important_and_vital, vital_only or autonomous")).transpose()?;
                 let v = api.post("/tasks", json!({"title": title, "body": body, "label": l, "tags": tag, "question_mode": qm})).await?;
                 if raw {

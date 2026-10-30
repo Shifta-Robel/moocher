@@ -8,6 +8,12 @@ already exist after the most recent user message. Step kinds:
 
     {"tool": "write", "args": {...}}   -> one tool call
     {"text": "..."}                    -> final text, ends the turn
+    {"text": "...", "usage": {"cost": 60}, "headers": {"x-neurons": 7}}
+                                       -> extra numbers in the usage, extra response
+                                          headers (streamed answers)
+    {"error": {"status": 400, "body": {...}}, "times": 1}
+                                       -> answer with that HTTP error, the first
+                                          `times` times only (then it is skipped)
     any step may add "delay": seconds  -> sleep before answering (to demo steering)
 
 A script may instead be ``{"phases": [{"match": "text", "steps": [...]}, ...]}``:
@@ -42,6 +48,7 @@ IP_QUOTA = 0
 IP_WINDOW = 60
 WINDOWS = {}  # client ip -> [window start, count]
 STATS = {"chat": 0, "rate_limited": 0, "by_ip": {}}  # since start (the log keeps 50)
+ERRORS_SENT = {}  # (model, phase, step index) -> how often that error step answered
 
 
 def est_tokens(obj):
@@ -90,9 +97,15 @@ def next_step(model, messages):
         steps = steps or [{"text": "mock: no phase matched"}]
     else:
         steps = script
-    if done >= len(steps):
+    # Error steps that have answered `times` times are gone.
+    phase = json.dumps(steps)[:200]
+    live = [(i, st) for i, st in enumerate(steps) if "error" not in st or ERRORS_SENT.get((model, phase, i), 0) < st.get("times", 1)]
+    if done >= len(live):
         return {"text": "done."}
-    return render(steps[done], ctx)
+    i, step = live[done]
+    if "error" in step:
+        ERRORS_SENT[(model, phase, i)] = ERRORS_SENT.get((model, phase, i), 0) + 1
+    return render(step, ctx)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -152,7 +165,8 @@ class Handler(BaseHTTPRequestHandler):
         self._rl = {}
         body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))) or b"{}")
         LOG.append({"path": self.path, "auth": self.headers.get("authorization"), "model": body.get("model"), "client": self.client_address[0],
-                    "stream": bool(body.get("stream")), "include_usage": bool((body.get("stream_options") or {}).get("include_usage"))})
+                    "stream": bool(body.get("stream")), "include_usage": bool((body.get("stream_options") or {}).get("include_usage")),
+                    "messages": body.get("messages", [])})
         if not self.path.endswith("/chat/completions"):
             return self._json(404, {"error": "not found"})
         if REQUIRE_KEY and self.headers.get("authorization") != f"Bearer {REQUIRE_KEY}":
@@ -177,6 +191,9 @@ class Handler(BaseHTTPRequestHandler):
         step = next_step(model, messages)
         if step.get("delay"):
             time.sleep(float(step["delay"]))
+        if "error" in step:
+            e = step["error"]
+            return self._json(int(e.get("status", 500)), e.get("body", {"error": {"message": "mock error"}}))
         cid = "chatcmpl-" + uuid.uuid4().hex[:12]
         prompt_tokens = est_tokens(messages)
         if "tool" in step:
@@ -189,7 +206,7 @@ class Handler(BaseHTTPRequestHandler):
             finish = "stop"
         completion_tokens = est_tokens(delta)
         usage = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                 "total_tokens": prompt_tokens + completion_tokens}
+                 "total_tokens": prompt_tokens + completion_tokens, **step.get("usage", {})}
         if not body.get("stream"):
             msg = {k: v for k, v in delta.items()}
             return self._json(200, {"id": cid, "object": "chat.completion", "created": int(time.time()), "model": model,
@@ -197,6 +214,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         for k, v in self._rl.items():
             self.send_header(k, v)
+        for k, v in step.get("headers", {}).items():
+            self.send_header(k, str(v))
         self.send_header("content-type", "text/event-stream")
         self.send_header("cache-control", "no-cache")
         self.send_header("connection", "close")

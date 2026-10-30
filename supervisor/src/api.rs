@@ -126,11 +126,15 @@ pub fn router(sup: Arc<Sup>) -> Router {
         .route("/nodes/{name}/routes", post(route_override))
         .route("/nodes/{name}/probe", post(probe_egress))
         .route("/quotas", get(quotas))
+        .route("/providers/stats", get(provider_stats))
+        .route("/providers/events", get(provider_events))
         .route("/quotas/override", post(quota_override))
         .route("/egress", get(egress))
         .route("/allowed-sources", get(allowed_sources).post(add_allowed_source))
         .route("/allowed-sources/remove", post(remove_allowed_source))
         .route("/agents", get(agents))
+        .route("/agents/availability", get(availability))
+        .route("/spawn-queue", get(spawn_queue))
         .route("/sessions", get(sessions).post(spawn))
         .route("/sessions/{id}", get(session).delete(stop))
         .route("/sessions/{id}/message", post(message))
@@ -180,6 +184,8 @@ pub fn router(sup: Arc<Sup>) -> Router {
         .route("/users", get(users).post(add_user))
         .route("/users/{name}", axum::routing::delete(delete_user))
         .route("/nodes/{name}/routes/promote", post(promote_route))
+        .route("/manager", get(manager_status))
+        .route("/manager/ask", post(manager_ask))
         .route("/info", get(info));
     Router::new()
         .nest("/api/v1", api)
@@ -263,6 +269,34 @@ async fn quotas(State(sup): S) -> Json<Vec<QuotaView>> {
     Json(sup.quota_views())
 }
 
+#[derive(Deserialize)]
+struct ProvQ {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    hours: Option<i64>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+async fn provider_stats(State(sup): S, Query(q): Query<ProvQ>) -> Json<Value> {
+    Json(sup.provider_stats(q.hours.unwrap_or(24).clamp(1, 24 * 90), q.provider.as_deref()))
+}
+
+async fn provider_events(State(sup): S, Query(q): Query<ProvQ>) -> Json<Vec<ProviderEvent>> {
+    Json(sup.db.provider_events(q.provider.as_deref(), q.kind.as_deref(), q.limit.unwrap_or(100).clamp(1, 2000)))
+}
+
+async fn availability(State(sup): S) -> Json<Vec<Value>> {
+    Json(sup.availability())
+}
+
+async fn spawn_queue(State(sup): S) -> Json<Vec<crate::spawnq::QueuedSpawn>> {
+    Json(sup.queued_spawns())
+}
+
 async fn egress(State(sup): S) -> Json<EgressView> {
     Json(sup.egress_view())
 }
@@ -310,7 +344,7 @@ async fn session(State(sup): S, Path(id): Path<String>) -> R<SessionInfo> {
 async fn spawn(State(sup): S, Extension(c): Extension<Caller>, Json(r): Json<SpawnRequest>) -> R<SessionInfo> {
     c.need(Scope::Operate)?;
     let s = sup
-        .spawn(&c.actor(), SpawnOpts { agent: r.agent, prompt: r.prompt, node: r.node, title: r.title, workspace: r.workspace, overrides: r.overrides, role: r.role, ..Default::default() })
+        .spawn(&c.actor(), SpawnOpts { agent: r.agent, prompt: r.prompt, node: r.node, title: r.title, workspace: r.workspace, overrides: r.overrides, role: r.role, urgency: r.urgency, ..Default::default() })
         .await?;
     Ok(Json(s))
 }
@@ -872,6 +906,15 @@ async fn promote_route(State(sup): S, Extension(c): Extension<Caller>, Path(node
 }
 
 /// What the UI needs to know about this hub.
+async fn manager_status(State(sup): S) -> Json<Value> {
+    Json(sup.manager_status())
+}
+
+async fn manager_ask(State(sup): S, Extension(c): Extension<Caller>, Json(r): Json<crate::manager::Ask>) -> R<Value> {
+    c.need(Scope::Operate)?;
+    Ok(Json(sup.manager_ask(&c.actor(), r).await?))
+}
+
 async fn info(State(sup): S, Extension(c): Extension<Caller>) -> Json<Value> {
     Json(json!({
         "version": moocher_protocol::VERSION,

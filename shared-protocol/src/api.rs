@@ -20,6 +20,9 @@ pub struct SpawnRequest {
     /// (spawn_agent, stop_session, ...) without a task.
     #[serde(default)]
     pub role: SessionRole,
+    /// `right_now` may pause other work; default `normal`.
+    #[serde(default)]
+    pub urgency: Option<TaskLabel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +160,20 @@ pub struct QuotaView {
     pub routes: Vec<String>,
     pub sessions: Vec<String>,
     pub updated_at: Ts,
+    /// Set on provider units; see `QuotaBucket::unit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<UnitInfo>,
+}
+
+impl QuotaView {
+    /// Does an agent on `model` draw from this? Requests do; a unit does unless
+    /// it is another model's pool. (Token buckets are informational.)
+    pub fn gates(&self, model: &str) -> bool {
+        match &self.unit {
+            Some(u) => u.model.as_deref().is_none_or(|m| m == model),
+            None => self.kind == "requests",
+        }
+    }
 }
 
 /// Egress IPs and who shares each one.
@@ -191,6 +208,14 @@ pub struct QuotaOverrideRequest {
     pub resets_at: Option<Ts>,
     #[serde(default)]
     pub remaining: Option<u64>,
+    /// Calibrate a provider unit: how much of it the provider says is used
+    /// in the current window (see `quota.units`).
+    #[serde(default)]
+    pub unit: Option<String>,
+    #[serde(default)]
+    pub used: Option<f64>,
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default)]
     pub note: Option<String>,
     #[serde(default)]

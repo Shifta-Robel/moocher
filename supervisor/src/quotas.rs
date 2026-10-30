@@ -28,9 +28,22 @@ impl Sup {
                 let latest = bs.iter().max_by_key(|b| b.updated_at).cloned().unwrap();
                 let exhausted: Vec<&QuotaBucket> = bs.iter().filter(|b| b.exhausted && b.resets_at.is_none_or(|r| r > now)).collect();
                 let used: u64 = bs.iter().map(|b| b.used).sum();
+                let unit = latest.unit.clone().map(|mut u| {
+                    u.used = bs.iter().filter_map(|b| b.unit.as_ref()).map(|x| x.used).sum();
+                    u.limit = bs.iter().filter_map(|b| b.unit.as_ref()?.limit).fold(None, |m: Option<f64>, x| Some(m.map_or(x, |m| m.max(x))));
+                    u.remaining = u.limit.map(|l| (l - u.used).max(0.0));
+                    // What each model costs, from whichever node saw it last.
+                    let mut newest = bs.clone();
+                    newest.sort_by_key(|b| b.updated_at);
+                    let rates: BTreeMap<String, UnitModelRate> = newest.iter().filter_map(|b| b.unit.as_ref()).flat_map(|x| x.rates.iter().map(|r| (r.model.clone(), r.clone()))).collect();
+                    u.rates = rates.into_values().collect();
+                    u
+                });
                 let limit = bs.iter().filter_map(|b| b.limit).max();
                 // Counted buckets share the allowance: what is left is the limit minus everyone's use.
-                let remaining = if latest.source == "config" || latest.source == "counted" {
+                let remaining = if let Some(u) = &unit {
+                    u.remaining.map(|r| r.floor() as u64)
+                } else if latest.source == "config" || latest.source == "counted" {
                     limit.map(|l| l.saturating_sub(used))
                 } else {
                     latest.remaining
@@ -52,6 +65,7 @@ impl Sup {
                     routes: bs.iter().flat_map(|b| b.routes.iter().map(move |r| format!("{}/{r}", b.node))).collect::<BTreeSet<_>>().into_iter().collect(),
                     sessions: bs.iter().flat_map(|b| b.sessions.iter().cloned()).filter(|s| live.contains(s)).collect::<BTreeSet<_>>().into_iter().collect(),
                     updated_at: latest.updated_at,
+                    unit,
                 }
             })
             .collect()
@@ -84,8 +98,58 @@ impl Sup {
         EgressView { ips, shared: by_ip.into_values().collect() }
     }
 
+    /// "The provider's dashboard says `used`": one pool, on the node that used
+    /// it last. The other nodes' counts stay, so the merged total comes out right.
+    async fn calibrate_unit(&self, actor: &Actor, r: &QuotaOverrideRequest, unit: &str, used: f64) -> Result<Value> {
+        if !used.is_finite() || used < 0.0 {
+            bail!("used must be a number, 0 or more");
+        }
+        if r.clear || r.resets_at.is_some() || r.remaining.is_some() {
+            bail!("unit + used cannot be combined with clear, resets_at or remaining");
+        }
+        let mine: Vec<QuotaBucket> = self
+            .db
+            .quotas()
+            .into_iter()
+            .filter(|b| b.provider == r.provider && r.scope_id.as_ref().is_none_or(|s| *s == b.scope_id))
+            .filter(|b| b.unit.as_ref().is_some_and(|u| u.name == unit && u.model.as_ref().is_none_or(|m| r.model.as_ref().is_none_or(|w| w == m))))
+            .collect();
+        let pools: BTreeSet<(String, String)> = mine.iter().map(|b| (b.scope_id.clone(), b.kind.clone())).collect();
+        if pools.is_empty() {
+            bail!("no node reports {unit} for {} yet (it appears after the first call)", r.provider);
+        }
+        if pools.len() > 1 {
+            let names: Vec<String> = pools.iter().map(|(s, k)| format!("{s} {k}")).collect();
+            bail!("{unit} has several pools, choose one with scope_id / model: {}", names.join(", "));
+        }
+        let target = match &r.node {
+            Some(n) => mine.iter().find(|b| &b.node == n).ok_or_else(|| anyhow::anyhow!("{n} does not report {unit} for {}", r.provider))?,
+            None => mine.iter().max_by_key(|b| b.updated_at).unwrap(),
+        };
+        let others: f64 = mine.iter().filter(|b| b.node != target.node).filter_map(|b| b.unit.as_ref()).map(|u| u.used).sum();
+        let ov = QuotaOverride {
+            provider: r.provider.clone(),
+            scope_id: Some(target.scope_id.clone()),
+            resets_at: None,
+            remaining: None,
+            unit: Some(unit.to_string()),
+            used: Some((used - others).max(0.0)),
+            model: target.unit.as_ref().and_then(|u| u.model.clone()),
+            note: r.note.clone(),
+            set_by: Some(actor.to_string()),
+        };
+        self.nodes.call(&target.node, NodeCommand::SetQuota { ov, clear: false }, CMD_TIMEOUT).await?;
+        Ok(json!({"nodes": [target.node], "scope_id": target.scope_id, "kind": target.kind}))
+    }
+
     pub async fn set_quota_override(&self, actor: &Actor, r: QuotaOverrideRequest) -> Result<Value> {
         let res: Result<Value> = async {
+            if r.unit.is_some() != r.used.is_some() {
+                bail!("calibrating a unit needs both unit and used");
+            }
+            if let (Some(unit), Some(used)) = (&r.unit, r.used) {
+                return self.calibrate_unit(actor, &r, unit, used).await;
+            }
             let targets: Vec<String> = match &r.node {
                 Some(n) => vec![n.clone()],
                 None => {
@@ -93,7 +157,7 @@ impl Sup {
                         .db
                         .quotas()
                         .into_iter()
-                        .filter(|b| b.provider == r.provider && r.scope_id.as_ref().is_none_or(|s| *s == b.scope_id))
+                        .filter(|b| b.provider == r.provider && b.unit.is_none() && r.scope_id.as_ref().is_none_or(|s| *s == b.scope_id))
                         .map(|b| b.node)
                         .collect();
                     if reporting.is_empty() {
@@ -103,13 +167,16 @@ impl Sup {
                 }
             };
             if !r.clear && r.resets_at.is_none() && r.remaining.is_none() {
-                bail!("set resets_at and/or remaining (or clear)");
+                bail!("set resets_at and/or remaining (or clear, or unit + used)");
             }
             let ov = QuotaOverride {
                 provider: r.provider.clone(),
                 scope_id: r.scope_id.clone(),
                 resets_at: r.resets_at,
                 remaining: r.remaining,
+                unit: None,
+                used: None,
+                model: None,
                 note: r.note.clone(),
                 set_by: Some(actor.to_string()),
             };

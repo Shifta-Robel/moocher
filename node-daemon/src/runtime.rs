@@ -104,6 +104,10 @@ impl Runtime {
     }
 
     /// Files written into workspaces must belong to the container user (rootful Podman).
+    pub fn git_runner(&self, cfg: crate::cfgstore::ConfigStore) -> crate::gitops::GitRunner {
+        crate::gitops::GitRunner::new(self.kind, self.podman.clone(), self.rootless, cfg)
+    }
+
     pub fn chown_target(&self) -> Option<u32> {
         (self.kind == RuntimeKind::Podman && !self.rootless).then_some(CONTAINER_UID)
     }
@@ -232,6 +236,10 @@ impl Runtime {
             a.push("-e".into());
             a.push(format!("{k}={v}"));
         }
+        for (k, v) in crate::manager::read_git_env(&s.paths.etc) {
+            a.push("-e".into());
+            a.push(format!("{k}={v}"));
+        }
         let p = s.paths;
         for (host, ctr, ro) in [(&p.run, "/run/moo", false), (&p.etc, "/etc/moo", true), (&p.home, "/home/agent", false), (&p.workspace, "/workspace", false)] {
             a.push("-v".into());
@@ -290,6 +298,9 @@ impl Runtime {
             .stdout(log.try_clone()?)
             .stderr(log);
         for (k, v) in opencode_env(s.password, &p.etc.display().to_string()) {
+            cmd.env(k, v);
+        }
+        for (k, v) in crate::manager::read_git_env(&p.etc) {
             cmd.env(k, v);
         }
         let child = cmd.spawn().with_context(|| format!("starting {}", self.bridge_bin.display()))?;

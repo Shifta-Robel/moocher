@@ -24,7 +24,7 @@ use moocher_protocol::api::StreamEvent;
 use moocher_protocol::config::{DeathPolicy, WorkspaceMode, WorkspaceSpec};
 use moocher_protocol::link::NodeCommand;
 use moocher_protocol::model::*;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -426,7 +426,7 @@ impl Sup {
         let id = &s.report.id;
         let mut notes = vec![];
         let workspace = match s.report.workspace.as_deref() {
-            Some(w) if w.starts_with("shared:") => Some(WorkspaceSpec { mode: WorkspaceMode::Shared, name: Some(w[7..].to_string()), seed: None }),
+            Some(w) if w.starts_with("shared:") => Some(WorkspaceSpec { mode: WorkspaceMode::Shared, name: Some(w[7..].to_string()), seed: None, branch: None }),
             _ => {
                 // Isolated: snapshot the dead volume if its node is up, else the checkpoint.
                 let label = format!("isolated:{id}");
@@ -451,7 +451,7 @@ impl Sup {
                         }
                     },
                 };
-                Some(WorkspaceSpec { mode: WorkspaceMode::Isolated, name: None, seed })
+                Some(WorkspaceSpec { mode: WorkspaceMode::Isolated, name: None, seed, branch: None })
             }
         };
         let todos: Vec<String> = s.report.todos.iter().map(|t| format!("- [{}] {}", t.status, t.content)).collect();
@@ -479,6 +479,8 @@ impl Sup {
                     run_id: s.run_id.clone(),
                     step: s.step.clone(),
                     role: s.role,
+                    urgency: s.urgency,
+                    overrides: s.overrides.clone(),
                     replaces: Some(id.clone()),
                     ..Default::default()
                 },
@@ -505,6 +507,9 @@ impl Sup {
             c.parent = Some(new.report.id.clone());
             self.save_session(&c);
         }
+        let _ = self.db.held_move(id, &new.report.id);
+        self.save_session(&self.session(id)?);
+        self.save_session(&self.session(&new.report.id)?);
         Ok(new)
     }
 
@@ -528,7 +533,7 @@ impl Sup {
             outputs: cp
                 .as_ref()
                 .and_then(|c| c.workspace_ref.clone())
-                .map(|r| HarvestedOutput { pattern: "(checkpoint)".into(), path: ".".into(), reference: r, size: 0, kind: "tree".into(), to: "artifact".into(), dest: None, delivered: None })
+                .map(|r| HarvestedOutput { pattern: "(checkpoint)".into(), path: ".".into(), reference: r, size: 0, kind: "tree".into(), to: "artifact".into(), dest: None, merge: Default::default(), delivered: None })
                 .into_iter()
                 .collect(),
             transcript_ref: cp.as_ref().and_then(|c| c.transcript_ref.clone()),
@@ -562,11 +567,23 @@ impl Sup {
                 }
                 continue;
             };
-            // Files keep their workspace path by default; trees already hold relative paths.
-            let dest = o.dest.clone().unwrap_or_else(|| if o.kind == "tree" { String::new() } else { o.path.clone() });
-            match self.nodes.call(&node, NodeCommand::PlaceArtifact { workspace: ws.clone(), reference: o.reference.clone(), dest: dest.clone() }, LONG).await {
+            // Files keep their workspace path by default; trees already hold
+            // relative paths; history goes into the repository at the root.
+            let dest = o.dest.clone().unwrap_or_else(|| if o.kind == "tree" || o.kind == "git" { String::new() } else { o.path.clone() });
+            match self.nodes.call(&node, NodeCommand::PlaceArtifact { workspace: ws.clone(), reference: o.reference.clone(), dest: dest.clone(), merge: o.merge }, LONG).await {
+                Ok(v) if o.kind == "git" => o.delivered = Some(format!("{ws} on {node}: {}", git_outcome(&v))),
                 Ok(_) => o.delivered = Some(format!("{ws} on {node}: {dest}")),
                 Err(e) => o.delivered = Some(format!("delivery to {ws} on {node} failed: {e:#}")),
+            }
+        }
+        // The parent hears what landed in its workspace.
+        let to_parent: Vec<String> = h.outputs.iter().filter(|o| o.to == "parent_workspace").filter_map(|o| Some(format!("- {} ({}): {}", o.path_label(), o.kind, o.delivered.as_deref()?))).collect();
+        if let Some(parent) = s.as_ref().and_then(|s| s.parent.clone()).filter(|_| !to_parent.is_empty()) {
+            if self.db.session(&parent).is_some_and(|p| p.report.state.is_live() || self.holds_messages(&p)) {
+                let msg = format!("[cluster] Session {} handed back its work ({}):\n{}", h.session, h.trigger, to_parent.join("\n"));
+                if let Err(e) = self.message(&Actor::System, &parent, &msg, Delivery::Queue).await {
+                    tracing::warn!(parent, error = %e, "could not tell the parent about the hand-back");
+                }
             }
         }
         let _ = self.db.add_harvest(&h);
@@ -588,6 +605,25 @@ impl Sup {
             .or_else(|| sessions.iter().find(|s| s.report.workspace.as_deref() == Some(label)).map(|s| s.report.node.clone()))
             .filter(|n| self.nodes.connected(n))
     }
+}
+
+/// One line from a node's git import report (`PlaceArtifact` of a bundle).
+fn git_outcome(v: &Value) -> String {
+    let remote = v["remote"].as_str().unwrap_or("?");
+    let mut parts = vec![];
+    for r in v["git"].as_array().into_iter().flatten() {
+        for l in r["lines"].as_array().into_iter().flatten().filter_map(|l| l.as_str()) {
+            let (k, rest) = l.split_once(' ').unwrap_or((l, ""));
+            parts.push(match k {
+                "merged" => format!("merged into the checked-out branch ({})", if rest.is_empty() { "merge commit" } else { rest }),
+                "notmerged" => format!("not merged: {rest}"),
+                "cloned" => "a new repository with its history".to_string(),
+                "error" => format!("error: {rest}"),
+                _ => continue,
+            });
+        }
+    }
+    format!("branches fetched as refs/remotes/{remote}/*; {}", if parts.is_empty() { "nothing else done".into() } else { parts.join("; ") })
 }
 
 fn ago(ts: Ts) -> String {

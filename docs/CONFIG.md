@@ -45,6 +45,7 @@ Complete examples for a hub, a remote worker and a relay are in [`examples/remot
 | `labels` | `{}` | Free-form, shown in the UI. |
 | `checkpoint_every_turns` | `3` | Send a checkpoint (workspace snapshot + transcript) to the hub every N finished turns, so a session can resume on another machine if this one is lost. `0` turns it off. |
 | `artifact_cache` | `2g` | Local artifact cache (`<data>/cas`); least recently used blobs are dropped beyond it. |
+| `git` | — | Same as the hub's `git:`; used only when the hub sends none (e.g. `hub_templates: false`). |
 | `disk_enforce` | `soft` | How `container.disk` is enforced. `soft`: measured every few seconds; the agent is told at 90% and interrupted at 100%. `hard`: also a filesystem quota over the OpenCode home and the isolated workspace together, so writes past the limit fail (ENOSPC). Needs the data dir on XFS mounted with `prjquota`, or on btrfs, and the node running as root; otherwise the node refuses to start. Shared workspaces stay soft. |
 | `runtime.kind` | `podman` | `podman`, or `process` (dev/CI only: no isolation). |
 | `runtime.podman` | `podman` | Podman binary. |
@@ -71,7 +72,9 @@ Complete examples for a hub, a remote worker and a relay are in [`examples/remot
 | `disconnect_grace_secs` | `600` | A disconnected node's sessions stay `unreachable` this long, then become `lost`. |
 | `tasks.coordinator_agent` | `coordinator` | Agent profile used as the "main agent" for tasks. |
 | `tasks.coordinator_node` | any | Pin coordinators to a node. |
-| `tasks.max_concurrent_tasks` | `2` | Running tasks at once (+1 reserved for `urgent`). |
+| `tasks.max_concurrent_tasks` | `2` | Running tasks at once (+1 reserved for `urgent`; `right_now` ignores it). |
+| `tasks.coordinator_agent_right_now` | `coordinator_agent` | Coordinator for `right_now` tasks, e.g. a stronger model. |
+| `tasks.preempt_operator_sessions` | `false` | `right_now` work may also pause sessions started by hand. |
 | `tasks.idle_grace_secs` | `30` | How long the cluster must be idle before a `when_free` task starts. |
 | `tasks.max_nudges` | `2` | Re-prompts for a coordinator that stops without finishing. |
 | `tasks.enabled` | `true` | Turn the scheduler off (tasks then only start via `moo task run`). |
@@ -108,8 +111,19 @@ Complete examples for a hub, a remote worker and a relay are in [`examples/remot
 | `notifications.web_push.subject` | `mailto:operator@localhost` | VAPID contact. The key pair is created on first start (`<data_dir>/vapid.key`). Set `web_push: null` to turn push off. |
 | `notifications.ntfy` | off | `{ url: "https://ntfy.sh/my-topic", token: "env:NTFY_TOKEN" }` |
 | `notifications.webhook` | off | `{ url: "https://…", secret: "file:/etc/moo/hook-secret" }`: JSON POST, signed `X-Moo-Signature: sha256=<hmac>`. |
+| `git.name` / `git.email` | `moocher agent` / `agent@moocher.invalid` | Author and committer of every agent commit, on every node (pushed with the template library). |
+| `git.notes` | `true` | Add a note to every agent commit in `refs/notes/moo`: `moocher-agent`, `-session`, `-model`, `-node`, `-task`, `-parent`. Commit messages are left alone. |
 
 Event kinds (for rules): `question.waiting`, `task.done|failed|cancelled`, `task.halted`, `recovery.auto`, `run.passed|failed`, `node.offline`, `node.back`, `quota.exhausted`, `quota.reset`, `budget.80`, `provider.auth_failed`, `provider.down`, `disk.warning`, `usage.mismatch`, `agent.report`, `login.lockout`, `tls.acme_failed`, `test`.
+
+### The manager — `manager:`
+
+```yaml
+manager:
+  agent: gen-fast   # whose provider, model and key it uses; off when unset
+```
+
+The agent must be on a connected node and use an OpenAI-style or Anthropic provider. See "The manager" in USAGE.md.
 
 ## providers.yaml
 
@@ -139,10 +153,38 @@ providers:
       learn: [headers, http_429]   # default
 ```
 
+- **Provider units:** see below.
 - **Buckets** are (provider, scope id, kind). The scope id is the route's egress IP (`ip`), a hash of the key (`key`), or the key's `account` label (`account`).
 - **Learning:** keyproxy reads `x-ratelimit-{limit,remaining,reset}-{requests,tokens}` (OpenAI, Groq and most compatible gateways), `anthropic-ratelimit-*`, unsuffixed `x-ratelimit-*` (OpenRouter), `retry-after` and Gemini's `retryDelay`. A 429 marks the bucket exhausted until its reset.
 - **Windows:** `window` takes `90s`, `5m`, `5h`, `1d` or `1h30m`; `at` is `HH:MM`; `tz` is `UTC` or an offset such as `+02:00`.
 - **Persistence:** buckets survive node restarts (`node.db`) and are merged across nodes at the hub, so two machines behind one IP share a keyless bucket.
+
+#### Provider units — `quota.units`
+
+For providers that meter in a unit of their own (neurons, pollen, credits), where a token costs a different amount on each model:
+
+```yaml
+providers:
+  my-provider:
+    quota:
+      units:
+        neurons:                     # any name
+          limits: [{ max: 10000, window: 1d, at: "00:00", tz: UTC }]   # same windows as above; max may be fractional
+          per_model: false           # true: every model has its own pool (default: all share one, per key / IP / account)
+          header: x-neurons          # the cost of a call, from a response header…
+          usage_field: cost          # …or a number in the usage the provider reports (`usage.cost`; dots go deeper)
+          per_mtok:                  # starting estimate, in units per million tokens
+            default: { input: 25000, output: 200000 }
+            big-model: { input: 90000, output: 400000 }
+```
+
+The figures above are placeholders: take them from your provider's price list. All fields except the name are optional.
+
+- **The cost of a call**, best source first: what the provider says (`header`, `usage_field`); the rate learned for that model; `per_mtok`. With none of these a call counts as 0 until you calibrate.
+- **What a unit buys** is learned per model, whether pools are shared or not, and shown by `moo quotas` and the dashboard. Measured rates follow the provider's recent figures.
+- **Calibrating:** `moo quota set my-provider --unit neurons --used 4210` (add `--model` for a `per_model` pool, `--scope-id` if there are several keys or IPs) tells the node what the provider's dashboard shows for the current window. It sets the counters and works out the rates from the tokens counted in the window (the first limit's window, if there are several). Usage from outside moocher on the same key makes such rates too high. Rates the provider reports itself are not changed.
+- **When a pool is used up,** keyproxy skips the route and fails over or parks, like any allowance; placement and `list_agents` treat agents on those models as waiting. A `per_model` pool holds back only its model. Estimated counts can be wrong in either direction, so a pool may hold back early or late until calibrated; the bucket's source says `estimated`, `calibrated` or `measured`.
+- **Across nodes,** the hub adds up the nodes' counts for what it shows and for placement, and a calibration accounts for the other nodes' counts. Each node's keyproxy enforces a limit from its own count only, so two nodes sharing one key can overshoot before placement steers away.
 
 **Built-in providers:**
 - **BYOK:** `openrouter`, `groq`, `openai`, `anthropic`, `gemini`.
@@ -241,6 +283,7 @@ outputs:                            # collected when the instance stops, dies, i
   - { path: "dist/*.whl", to: artifact, name: wheels }   # a glob matching several files -> one tree
   - { path: build/, to: task_workspace }                  # a directory -> a tree
   - { path: notes.md, to: "workspace:shared-notes" }      # any shared workspace
+  - { git: true, to: parent_workspace }                   # the repository's history (branches, tags, notes)
 transcript: true                    # also keep the conversation as an artifact
 retain: 24h                         # volumes kept after the end: a duration, on_failure, always or never
 on_death: { auto_retry: 1, max_auto_cost_usd: 0.50 }   # overrides the supervisor's on_death
@@ -251,10 +294,34 @@ on_death: { auto_retry: 1, max_auto_cost_usd: 0.50 }   # overrides the superviso
 - `dest:` is a path in the destination workspace. For a file it is the new path (a trailing `/` means "into this directory"); for a tree, the directory it is unpacked under. Default: the same relative path.
 - A pattern that matches nothing is reported as missing in the harvest, not as an error.
 - Every output is stored as an artifact (with lineage to what the instance fetched), whatever its destination.
+- `git: true` hands back history instead of files: every branch and tag of the repository at `path` (default: the workspace root) plus the `refs/notes/moo` notes, as a git bundle. The destination repository (at `dest`, default its root) fetches the branches as `refs/remotes/<session>/…`. `merge:` decides what happens to its checked-out branch: `ff` (default) fast-forwards it to the instance's HEAD when that is possible and no local change is in the way; `merge` merges (and aborts on conflicts); `none` only fetches. A destination directory that is empty becomes a clone; one with files but no repository is left alone. The parent gets a message saying what happened.
 
 **Retention:** `retain: 24h` keeps the stopped instance's OpenCode home and isolated workspace for 24 h, then removes them. `on_failure` keeps them 24 h only if the instance failed or died, `never` removes them at once, `always` never does. Shared workspaces are never removed by an instance.
 
 Spawning with overrides: `moo spawn coder --append "…" --budget 2 --route via-relay-de`, the API's `overrides` field, or the `spawn_agent` tool's `role_append` / `budget_usd` / `route`. Anything outside `overridable` is refused.
+
+### Generic agents and costly models
+
+A generic agent is just a model. Its spawner decides what it is:
+
+```yaml
+# agents/gen-fast.yaml (or templates/ on the hub)
+name: gen-fast
+kind: generic
+provider: { id: groq, model: some-model, key: { secret: groq } }
+```
+
+`system_prompt` is required when spawning it (`cluster_spawn_agent`, `moo spawn gen-fast --system-prompt "…"`, the API's `overrides`, the dashboard) and refused for other agents. It takes the role prompt's place: the cluster preamble still tells the agent what it is and what it has. Tools, limits and budgets come from this file with the usual defaults, and `limits`, `tools` etc. can be set here too; a spawner cannot widen them. `kind: generic` cannot have `role.system_prompt`, `system_prompt_file` or `preamble`.
+
+Keep a costly agent for urgent work with `min_urgency`:
+
+```yaml
+name: big-brain
+provider: { id: anthropic, model: some-costly-model, key: { secret: anthropic } }
+min_urgency: right_now      # or urgent, normal
+```
+
+Agents working at a lower urgency see it as `reserved` in `cluster_list_agents` and are refused if they try. Coordinators of `right_now` tasks are told it is open to them. You can always start it by hand. It works on generic agents too.
 
 ## templates/ and preambles/ (hub)
 

@@ -5,6 +5,7 @@ import * as I from "../icons";
 import { auth } from "../api";
 import { state } from "../store";
 import { cx } from "../util";
+import ManagerPanel from "./ManagerPanel";
 import { Toasts } from "./ui";
 
 type Theme = "system" | "light" | "dark";
@@ -33,6 +34,7 @@ const NAV = [
   { href: "/instances", label: "Instances", icon: I.Boxes, mobile: true },
   { href: "/questions", label: "Questions", icon: I.CircleHelp, mobile: true, badge: () => state.questions.length },
   { href: "/tasks", label: "Tasks", icon: I.ListChecks, mobile: true, badge: () => state.halts.length },
+  { href: "/work", label: "Work map", icon: I.Network },
   { href: "/quotas", label: "Quotas", icon: I.Gauge },
   { href: "/templates", label: "Templates", icon: I.Layers },
   { href: "/nodes", label: "Nodes & proxies", icon: I.Server },
@@ -169,6 +171,7 @@ export default function Layout(p: { children?: JSX.Element }) {
           </div>
         </div>
       </Show>
+      <ManagerPanel />
       <Toasts />
     </div>
   );

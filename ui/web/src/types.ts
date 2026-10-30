@@ -13,6 +13,7 @@ export interface Session {
   context_tokens?: number; dead_reason?: string | null; turns?: number;
   title?: string | null; task_id?: number | null; parent?: string | null; run_id?: string | null; step?: string | null;
   verdict?: string | null; role?: string; placement?: string | null; waiting_on?: string[]; deaths?: number;
+  urgency?: string | null; preempted?: { by: string; at: number } | null; held?: number;
   replaces?: string | null; prompt?: string | null; attached_by?: string | null; attached_until?: number | null;
 }
 
@@ -20,6 +21,7 @@ export interface AgentInfo {
   name: string; description: string; provider: string; model: string; tier: string; secret_ok: boolean;
   errors: string[]; routes: string[]; source: string; max_instances?: number | null;
   overridable: { role_append: boolean; budget_usd?: number | null; routes: string[] };
+  generic?: boolean; min_urgency?: string | null;
   price_in_per_mtok?: number;
 }
 
@@ -30,7 +32,7 @@ export interface NodeInfo {
 }
 
 export interface Task {
-  id: number; title: string; body: string; label: "urgent" | "when_free" | "on_demand"; rank: number;
+  id: number; title: string; body: string; label: "right_now" | "urgent" | "normal" | "when_free" | "on_demand"; rank: number;
   status: "queued" | "running" | "done" | "failed" | "cancelled" | "halted"; tags: string[];
   coordinator_session?: string | null; result?: string | null; notes: string[]; created_at: number;
   started_at?: number | null; finished_at?: number | null; question_mode?: string | null;
@@ -59,6 +61,7 @@ export interface Quota {
   provider: string; scope: string; scope_id: string; kind: string; limit?: number | null; used: number;
   remaining?: number | null; resets_at?: number | null; exhausted: boolean; source: string; window?: string | null;
   nodes: string[]; routes: string[]; sessions: string[]; updated_at: number;
+  unit?: { name: string; model?: string | null; used: number; limit?: number | null; remaining?: number | null; rates: { model: string; units_per_mtok: number; source: string }[] } | null;
 }
 
 export interface Artifact {

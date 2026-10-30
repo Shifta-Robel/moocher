@@ -57,6 +57,13 @@ pub enum NodeEvent {
     Quotas { buckets: Vec<QuotaBucket> },
     /// Provider latency per route (full snapshot, at most once a minute).
     RouteStats { stats: Vec<RouteStat> },
+    /// What keyproxy saw of providers: hourly rows (absolute values for their
+    /// hour, so a resend replaces) and notable events since the last report.
+    Observations {
+        rows: Vec<crate::model::ObsRow>,
+        #[serde(default)]
+        events: Vec<crate::model::ProviderEvent>,
+    },
     /// OpenCode is waiting on someone: its `question` tool or an `ask` permission.
     QuestionAsked {
         session: String,
@@ -171,6 +178,9 @@ pub enum NodeCommand {
         templates: Vec<crate::config::AgentConfig>,
         #[serde(default)]
         preamble: Option<String>,
+        /// Commit identity and notes for every agent.
+        #[serde(default)]
+        git: Option<crate::config::GitConfig>,
         hash: String,
     },
     /// The rendered instructions a session was started with.
@@ -192,8 +202,15 @@ pub enum NodeCommand {
     /// Merge a snapshot into this node's copy of a workspace (three-way, by
     /// file, against the last state both sides saw). Replies `{applied, conflicts}`.
     ApplyWorkspace { workspace: String, reference: String, #[serde(default)] from_node: Option<String> },
-    /// Put an artifact into a workspace at `dest` (a file path, or a directory for trees).
-    PlaceArtifact { workspace: String, reference: String, dest: String },
+    /// Put an artifact into a workspace at `dest` (a file path, a directory
+    /// for trees, the repository for git bundles, which `merge` applies to).
+    PlaceArtifact {
+        workspace: String,
+        reference: String,
+        dest: String,
+        #[serde(default)]
+        merge: crate::config::GitMerge,
+    },
     /// Start a dead or halted instance again from its kept volumes, then send `prompt`.
     Restart { session: String, prompt: String },
     /// Interrupt, harvest, and stop the container but keep it (state `halted`).
@@ -212,8 +229,20 @@ pub enum NodeCommand {
         #[serde(default)]
         expires_at: Option<Ts>,
     },
+    /// One model call with `agent`'s provider, key, routes and allowances, for
+    /// the manager. Messages and tools in OpenAI chat form; replies
+    /// `{content, tool_calls, usage}`.
+    ManagerChat { agent: String, system: String, messages: Vec<serde_json::Value>, tools: Vec<serde_json::Value> },
     /// Write the live route override of `agent` into its YAML file and drop the override.
     PromoteRoute { agent: String, by: String },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IfBusy {
+    #[default]
+    Fail,
+    Wait,
 }
 
 /// Cluster tools available to agents over MCP. `from_session` is added by the node.
@@ -237,8 +266,22 @@ pub enum AgentCall {
         title: Option<String>,
         #[serde(default)]
         share_workspace: bool,
+        /// Start from a copy of the caller's workspace, its git history
+        /// included, on a new branch `agent/<agent>/<session>`.
+        #[serde(default)]
+        fork_workspace: bool,
         #[serde(default)]
         overrides: crate::config::SpawnOverrides,
+        /// When no node can take it right now: `fail` (default) or `wait`
+        /// (queued on the hub; the caller is messaged when it starts).
+        #[serde(default)]
+        if_busy: IfBusy,
+        /// With `wait`: give up after this long (default one hour).
+        #[serde(default)]
+        wait_max_s: Option<u64>,
+        /// Lower than the caller's own urgency (it cannot go higher).
+        #[serde(default)]
+        urgency: Option<crate::model::TaskLabel>,
     },
     Stop { session: String },
     TaskGet,

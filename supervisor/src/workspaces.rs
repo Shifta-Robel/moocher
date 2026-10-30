@@ -78,14 +78,24 @@ impl Sup {
         self.ws_add_node(name, node);
         let conflicts: Vec<String> = serde_json::from_value(r["conflicts"].clone()).unwrap_or_default();
         self.log("workspace.synced", Some(node), None, json!({"workspace": name, "from": from, "ref": reference, "report": r}));
-        if !conflicts.is_empty() {
-            // Tell the agents working in this copy which files need a look.
+        let diverged: Vec<String> = serde_json::from_value(r["diverged"].clone()).unwrap_or_default();
+        if !conflicts.is_empty() || !diverged.is_empty() {
+            // Tell the agents working in this copy what needs a look.
             let label = format!("shared:{name}");
-            let msg = format!(
-                "[cluster] Workspace sync from {} brought changes that conflict with yours in: {}. Your versions were kept; theirs are next to them as `<file>.theirs`. Reconcile them and delete the .theirs files.",
-                from.unwrap_or("the hub"),
-                conflicts.join(", ")
-            );
+            let src = from.unwrap_or("the hub");
+            let mut msg = String::from("[cluster]");
+            if !conflicts.is_empty() {
+                msg.push_str(&format!(
+                    " Workspace sync from {src} brought changes that conflict with yours in: {}. Your versions were kept; theirs are next to them as `<file>.theirs`. Reconcile them and delete the .theirs files.",
+                    conflicts.join(", ")
+                ));
+            }
+            if !diverged.is_empty() {
+                msg.push_str(&format!(
+                    " Git branches committed on both machines since the last sync: {}. Theirs are `refs/remotes/moo-{src}/<branch>`; merge them into yours (`git merge moo-{src}/<branch>`).",
+                    diverged.join(", ")
+                ));
+            }
             for s in self.db.sessions_on(node).into_iter().filter(|s| s.report.state.is_live() && s.report.workspace.as_deref() == Some(&label)) {
                 let _ = self.message(&Actor::System, &s.report.id, &msg, Delivery::Queue).await;
             }

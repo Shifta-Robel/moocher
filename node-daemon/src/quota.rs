@@ -73,7 +73,7 @@ pub struct Target {
 
 /// Effective quota settings for a provider.
 pub fn spec_for(p: &ProviderDef) -> QuotaSpec {
-    p.quota.clone().unwrap_or(QuotaSpec { scope: None, limits: vec![], learn: vec![QuotaLearn::Headers, QuotaLearn::Http429] })
+    p.quota.clone().unwrap_or(QuotaSpec { scope: None, limits: vec![], learn: vec![QuotaLearn::Headers, QuotaLearn::Http429], units: Default::default() })
 }
 
 pub fn default_scope(p: &ProviderDef, has_key: bool) -> QuotaScope {
@@ -96,7 +96,7 @@ pub fn scope_id(scope: QuotaScope, node: &str, route: &str, ip: Option<&str>, se
 }
 
 /// Start of the fixed window containing `now`, and its length.
-fn fixed_window(l: &QuotaLimit, now: Ts) -> Option<(Ts, Ts)> {
+pub(crate) fn fixed_window(l: &QuotaLimit, now: Ts) -> Option<(Ts, Ts)> {
     let len = parse_duration_ms(&l.window)?.max(1000);
     let anchor = match &l.at {
         Some(at) => {
@@ -280,6 +280,22 @@ impl Quotas {
         until
     }
 
+    /// The provider said the account is out of credits: treat the allowance
+    /// as used up until `until`.
+    pub fn exhaust_until(&self, t: &Target, until: Ts) {
+        let now = now_ms();
+        let mut m = self.buckets.lock().unwrap();
+        let b = m.entry((t.provider.clone(), t.scope_id.clone(), QuotaKind::Requests)).or_insert_with(|| Bucket { scope: t.scope.as_str().into(), ..Default::default() });
+        b.exhausted_until = Some(until);
+        b.learned_remaining = Some(0);
+        b.learned_reset = Some(until);
+        b.learned_at = now;
+        b.learned_source = "credits".into();
+        b.updated_at = now;
+        drop(m);
+        self.touch();
+    }
+
     pub fn record_request(&self, t: &Target, route: &str, session: &str, limits: &[QuotaLimit]) {
         self.add(t, route, session, limits, QuotaKind::Requests, 1);
     }
@@ -390,6 +406,7 @@ impl Quotas {
                 routes: b.routes.iter().cloned().collect(),
                 sessions: b.sessions.iter().filter(|(_, ts)| now - **ts < 600_000).map(|(s, _)| s.clone()).collect(),
                 updated_at: b.updated_at,
+                unit: None,
             };
             // Configured limit (the tightest one).
             for l in &limits {
@@ -534,7 +551,7 @@ mod tests {
         let u = q.observe(&t3, 429, &hm(&[("retry-after", "120")]), b"", &[QuotaLearn::Headers, QuotaLearn::Http429]).unwrap();
         assert!(q.exhausted(&t3, &[], &[], now_ms()).is_some_and(|x| x == u));
         // Overrides: "0 left until T" exhausts; snapshot shows the override.
-        let ov = QuotaOverride { provider: "kilo-free".into(), scope_id: Some("198.51.100.9".into()), resets_at: Some(now_ms() + 3_600_000), remaining: Some(0), note: None, set_by: None };
+        let ov = QuotaOverride { provider: "kilo-free".into(), scope_id: Some("198.51.100.9".into()), resets_at: Some(now_ms() + 3_600_000), remaining: Some(0), unit: None, used: None, model: None, note: None, set_by: None };
         assert!(q.exhausted(&t2, &limits, std::slice::from_ref(&ov), now_ms()).is_some());
         q.record_request(&t2, "via-vps", "s-2", &limits);
         let mut pl = BTreeMap::new();

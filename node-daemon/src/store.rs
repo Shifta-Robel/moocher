@@ -37,8 +37,13 @@ impl Store {
              CREATE TABLE IF NOT EXISTS outbox(seq INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS quota(provider TEXT NOT NULL, scope_id TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL,
                PRIMARY KEY(provider, scope_id, kind));
+             CREATE TABLE IF NOT EXISTS unit_pools(provider TEXT NOT NULL, scope_id TEXT NOT NULL, unit TEXT NOT NULL, model TEXT NOT NULL, body TEXT NOT NULL,
+                 PRIMARY KEY(provider, scope_id, unit, model));
              CREATE TABLE IF NOT EXISTS ws_base(label TEXT PRIMARY KEY, manifest TEXT NOT NULL, reference TEXT NOT NULL, digest TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS reap(id TEXT PRIMARY KEY, at INTEGER NOT NULL, paths TEXT NOT NULL);",
+             CREATE TABLE IF NOT EXISTS reap(id TEXT PRIMARY KEY, at INTEGER NOT NULL, paths TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS obs(hour INTEGER NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, scope_id TEXT NOT NULL, route TEXT NOT NULL,
+               body TEXT NOT NULL, PRIMARY KEY(hour, provider, model, scope_id, route));
+             CREATE TABLE IF NOT EXISTS learned_context(provider TEXT NOT NULL, model TEXT NOT NULL, tokens INTEGER NOT NULL, PRIMARY KEY(provider, model));",
         )?;
         #[cfg(unix)]
         {
@@ -46,6 +51,39 @@ impl Store {
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         }
         Ok(Store { conn: Mutex::new(conn) })
+    }
+
+    /// Observation rows of hours starting at or after `since` (older ones are dropped).
+    pub fn obs_rows(&self, since: i64) -> Vec<moocher_protocol::model::ObsRow> {
+        let c = self.conn.lock().unwrap();
+        let _ = c.execute("DELETE FROM obs WHERE hour < ?1", params![since]);
+        let Ok(mut st) = c.prepare("SELECT body FROM obs WHERE hour >= ?1") else { return vec![] };
+        st.query_map(params![since], |r| r.get::<_, String>(0)).map(|rows| rows.filter_map(|r| r.ok()).filter_map(|b| serde_json::from_str(&b).ok()).collect()).unwrap_or_default()
+    }
+
+    pub fn put_obs_row(&self, r: &moocher_protocol::model::ObsRow) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO obs(hour,provider,model,scope_id,route,body) VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(hour,provider,model,scope_id,route) DO UPDATE SET body=excluded.body",
+            params![r.hour, r.provider, r.model, r.scope_id, r.route, serde_json::to_string(r)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn learned_contexts(&self) -> Vec<((String, String), u64)> {
+        let c = self.conn.lock().unwrap();
+        let Ok(mut st) = c.prepare("SELECT provider, model, tokens FROM learned_context") else { return vec![] };
+        st.query_map([], |r| Ok(((r.get::<_, String>(0)?, r.get::<_, String>(1)?), r.get::<_, i64>(2)? as u64)))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn put_learned_context(&self, provider: &str, model: &str, tokens: u64) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO learned_context(provider,model,tokens) VALUES(?1,?2,?3) ON CONFLICT(provider,model) DO UPDATE SET tokens=excluded.tokens",
+            params![provider, model, tokens as i64],
+        )?;
+        Ok(())
     }
 
     pub fn put_instance(&self, row: &InstanceRow) -> Result<()> {
@@ -99,6 +137,26 @@ impl Store {
             tx.execute(
                 "INSERT INTO quota(provider,scope_id,kind,body) VALUES(?1,?2,?3,?4) ON CONFLICT(provider,scope_id,kind) DO UPDATE SET body=excluded.body",
                 params![p, s, k, b],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn unit_rows(&self) -> Result<Vec<(String, String, String, String, String)>> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c.prepare("SELECT provider, scope_id, unit, model, body FROM unit_pools")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.filter_map(|r| r.ok()).collect();
+        Ok(rows)
+    }
+
+    pub fn put_unit_rows(&self, rows: &[(String, String, String, String, String)]) -> Result<()> {
+        let mut c = self.conn.lock().unwrap();
+        let tx = c.transaction()?;
+        for (p, s, u, m, b) in rows {
+            tx.execute(
+                "INSERT INTO unit_pools(provider,scope_id,unit,model,body) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(provider,scope_id,unit,model) DO UPDATE SET body=excluded.body",
+                params![p, s, u, m, b],
             )?;
         }
         tx.commit()?;

@@ -1,6 +1,7 @@
 // Drives the dashboard in headless Chromium. Usage:
 //   node ui-check.mjs <hub url> <user> <password> <question asker session> <shot dir>
 // Needs PW_DIR (a directory with node_modules/playwright).
+// PW_CHROMIUM names another Chromium to use.
 const pw = await import(`${process.env.PW_DIR}/node_modules/playwright/index.mjs`);
 const { chromium } = pw.default ?? pw;
 const [hub, user, password, asker, shots] = process.argv.slice(2);
@@ -15,7 +16,8 @@ const step = async (what, f) => {
   }
 };
 
-const browser = await chromium.launch();
+const launch = () => chromium.launch(process.env.PW_CHROMIUM ? { executablePath: process.env.PW_CHROMIUM, args: ["--no-sandbox", "--disable-gpu", "--single-process", "--no-zygote"] } : {});
+const browser = await launch();
 const ctx = await browser.newContext({ viewport: { width: 1280, height: 860 } });
 const page = await ctx.newPage();
 const errors = [];
@@ -135,7 +137,9 @@ await step("dark mode via the theme toggle", async () => {
 });
 
 await step("phone layout: bottom tab bar, no sidebar, activity rows expand, no page scrolls sideways", async () => {
-  const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, storageState: await ctx.storageState() });
+  // Its own browser: a single-process Chromium cannot hold a second context.
+  const phoneBrowser = await launch();
+  const phone = await phoneBrowser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, storageState: await ctx.storageState() });
   const p = await phone.newPage();
   await p.goto(hub + "/instances/" + sid);
   const tabs = p.locator("nav[aria-label=main]").last();
@@ -157,7 +161,7 @@ await step("phone layout: bottom tab bar, no sidebar, activity rows expand, no p
     if (o > 1) wide.push(`${r} by ${o}px`);
   }
   if (wide.length) throw new Error(`pages scroll sideways: ${wide.join(", ")}`);
-  await phone.close();
+  await phoneBrowser.close();
 });
 
 await step("logout returns to the login page", async () => {

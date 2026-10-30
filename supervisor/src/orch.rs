@@ -1,8 +1,11 @@
 //! Orchestration: workflow runs (turn-based handoffs) and the task bucket.
 //!
 //! Task bucket semantics (operator-facing):
+//! * `right_now` — started at once, ignoring the cap; less urgent work is paused
+//!                 for room (preempt.rs) and nothing lower starts meanwhile.
 //! * `urgent`    — started as soon as a task slot is free (one extra slot beyond
 //!                 `max_concurrent_tasks` is reserved for urgent work).
+//! * `normal`    — started when below `max_concurrent_tasks`.
 //! * `when_free` — started only when no task is running and every session in
 //!                 the cluster has been idle for `idle_grace_secs`.
 //! * `on_demand` — never started automatically; the operator presses Run.
@@ -36,6 +39,15 @@ the work through them where it helps, or yourself if it is small.
    results with `cluster_session_status`, reply with `cluster_send_message`.
 5. Finish with `cluster_task_complete` (summary of the outcome) or
    `cluster_task_fail` (reason). Do not stop before calling one of them.
+
+Agents with `generic: true` in `cluster_list_agents` are just a model: give them
+a `system_prompt` in `cluster_spawn_agent` saying who they are and how to work.
+"#;
+
+const RIGHT_NOW_BRIEFING: &str = r#"
+This task is `right_now`: the operator needs it done immediately. Less urgent
+work is paused to make room for what you start, and costly models reserved for
+such work are open to you. Prefer them for the hard parts. Budgets still apply.
 "#;
 
 impl Sup {
@@ -72,7 +84,7 @@ impl Sup {
                 last_text.as_deref().map(|t| truncate(t, 3000)).unwrap_or_else(|| "(no text)".into())
             );
             if let Ok(p) = self.session(&parent) {
-                if p.report.state.is_live() {
+                if p.report.state.is_live() || self.holds_messages(&p) {
                     if let Err(e) = self.message(&Actor::System, &parent, &msg, Delivery::Queue).await {
                         tracing::warn!(parent, error = %e, "could not notify parent session");
                     }
@@ -162,7 +174,7 @@ impl Sup {
                     prompt: Some(prompt),
                     node,
                     title: Some(format!("{} · {}", wf.name, step.name)),
-                    workspace: Some(wf.workspace.clone().unwrap_or(WorkspaceSpec { mode: WorkspaceMode::Shared, name: Some(run.workspace.clone()), seed: None })),
+                    workspace: Some(wf.workspace.clone().unwrap_or(WorkspaceSpec { mode: WorkspaceMode::Shared, name: Some(run.workspace.clone()), seed: None, branch: None })),
                     task_id: run.task_id,
                     run_id: Some(run.id.clone()),
                     step: Some(step.name.clone()),
@@ -428,14 +440,14 @@ impl Sup {
                     .spawn(
                         actor,
                         SpawnOpts {
-                            agent: sched.coordinator_agent.clone(),
+                            agent: if t.label == TaskLabel::RightNow { sched.coordinator_agent_right_now.clone().unwrap_or_else(|| sched.coordinator_agent.clone()) } else { sched.coordinator_agent.clone() },
                             prompt: Some(prompt),
                             node: sched.coordinator_node.clone(),
                             title: Some(format!("task #{} coordinator", t.id)),
-                            workspace: Some(WorkspaceSpec { mode: WorkspaceMode::Shared, name: Some(format!("task-{}", t.id)), seed: None }),
+                            workspace: Some(WorkspaceSpec { mode: WorkspaceMode::Shared, name: Some(format!("task-{}", t.id)), seed: None, branch: None }),
                             task_id: Some(t.id),
                             role: SessionRole::Coordinator,
-                            extra_instructions: Some(COORDINATOR_BRIEFING.into()),
+                            extra_instructions: Some(if t.label == TaskLabel::RightNow { format!("{COORDINATOR_BRIEFING}{RIGHT_NOW_BRIEFING}") } else { COORDINATOR_BRIEFING.into() }),
                             ..Default::default()
                         },
                     )
@@ -556,8 +568,27 @@ impl Sup {
         let running = tasks.iter().filter(|t| t.status == TaskStatus::Running).count() as u32;
         let max = self.cfg.tasks.max_concurrent_tasks;
         let mut started = 0;
+        for t in tasks.iter().filter(|t| t.status == TaskStatus::Queued && t.label == TaskLabel::RightNow) {
+            if self.start_task(&Actor::System, t.id).await.is_ok() {
+                started += 1;
+            }
+        }
+        // Short of room for right_now work: nothing lower starts.
+        let starved = self.db.tasks().iter().any(|t| t.label == TaskLabel::RightNow && t.status == TaskStatus::Queued) || self.queued_spawns().iter().any(|q| q.urgency == TaskLabel::RightNow);
+        if starved {
+            *idle_since = None;
+            return;
+        }
         for t in tasks.iter().filter(|t| t.status == TaskStatus::Queued && t.label == TaskLabel::Urgent) {
             if running + started >= max + 1 {
+                break;
+            }
+            if self.start_task(&Actor::System, t.id).await.is_ok() {
+                started += 1;
+            }
+        }
+        for t in tasks.iter().filter(|t| t.status == TaskStatus::Queued && t.label == TaskLabel::Normal) {
+            if running + started >= max {
                 break;
             }
             if self.start_task(&Actor::System, t.id).await.is_ok() {

@@ -35,6 +35,10 @@ impl SessionState {
     pub fn is_live(self) -> bool {
         matches!(self, SessionState::Starting | SessionState::Idle | SessionState::Running | SessionState::Blocked | SessionState::Parked)
     }
+    /// Not able to take a message now, but it may run again: the hub holds its messages.
+    pub fn may_return(self) -> bool {
+        matches!(self, SessionState::Starting | SessionState::Halted | SessionState::Dead | SessionState::Unreachable | SessionState::Lost)
+    }
     pub fn as_str(self) -> &'static str {
         match self {
             SessionState::Starting => "starting",
@@ -215,6 +219,28 @@ pub struct SessionInfo {
     pub attached_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attached_until: Option<Ts>,
+    /// Set when it runs at another urgency than its task (or has no task).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub urgency: Option<TaskLabel>,
+    /// Paused to make room for `right_now` work; resumed when that is done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preempted: Option<Preempted>,
+    /// What its spawner set for this instance, for a replacement if it dies.
+    #[serde(default, skip_serializing_if = "crate::config::SpawnOverrides::is_empty")]
+    pub overrides: crate::config::SpawnOverrides,
+    /// Messages the hub holds until it runs again (it gets them in one digest).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub held: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Preempted {
+    pub by: String,
+    pub at: Ts,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,6 +275,12 @@ pub struct AgentInfo {
     pub max_instances: Option<u32>,
     #[serde(default)]
     pub overridable: crate::config::Overridable,
+    /// `kind: generic`: no specialization of its own, the spawner gives its system prompt.
+    #[serde(default)]
+    pub generic: bool,
+    /// Costly models: agents can only start it from work at least this urgent.
+    #[serde(default)]
+    pub min_urgency: Option<TaskLabel>,
     /// USD per million input / output tokens (0 for keyless providers): used
     /// to estimate what a recovery would cost.
     #[serde(default)]
@@ -257,6 +289,9 @@ pub struct AgentInfo {
     pub price_out_per_mtok: f64,
     #[serde(default)]
     pub on_death: Option<crate::config::DeathPolicy>,
+    /// Configured context window (tokens).
+    #[serde(default)]
+    pub context: Option<u64>,
 }
 
 fn default_source() -> String {
@@ -280,6 +315,118 @@ pub struct RouteStat {
     #[serde(default)]
     pub tunnel_setup_ms: Option<f64>,
     pub updated_at: Ts,
+}
+
+/// Upper bounds of the latency histogram buckets (ms); one more bucket holds the rest.
+pub const OBS_MS_BUCKETS: [f64; 10] = [100.0, 200.0, 400.0, 800.0, 1600.0, 3200.0, 6400.0, 12800.0, 25600.0, 51200.0];
+/// Upper bounds of the output speed buckets (tokens/s).
+pub const OBS_TPS_BUCKETS: [f64; 8] = [5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0, 640.0];
+
+/// A histogram over fixed buckets, with the sum for the mean.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Hist {
+    #[serde(default)]
+    pub counts: Vec<u64>,
+    #[serde(default)]
+    pub sum: f64,
+    #[serde(default)]
+    pub n: u64,
+}
+
+impl Hist {
+    pub fn add(&mut self, bounds: &[f64], v: f64) {
+        if self.counts.len() != bounds.len() + 1 {
+            self.counts = vec![0; bounds.len() + 1];
+        }
+        let i = bounds.iter().position(|b| v <= *b).unwrap_or(bounds.len());
+        self.counts[i] += 1;
+        self.sum += v;
+        self.n += 1;
+    }
+    pub fn merge(&mut self, o: &Hist) {
+        if self.counts.len() < o.counts.len() {
+            self.counts.resize(o.counts.len(), 0);
+        }
+        for (i, c) in o.counts.iter().enumerate() {
+            self.counts[i] += c;
+        }
+        self.sum += o.sum;
+        self.n += o.n;
+    }
+    pub fn mean(&self) -> Option<f64> {
+        (self.n > 0).then(|| self.sum / self.n as f64)
+    }
+    /// The bucket bound below which `q` (0..1) of the values fall (the last
+    /// bucket reports twice the largest bound).
+    pub fn quantile(&self, bounds: &[f64], q: f64) -> Option<f64> {
+        let total: u64 = self.counts.iter().sum();
+        if total == 0 {
+            return None;
+        }
+        let want = (q * total as f64).ceil().max(1.0) as u64;
+        let mut acc = 0;
+        for (i, c) in self.counts.iter().enumerate() {
+            acc += c;
+            if acc >= want {
+                return Some(bounds.get(i).copied().unwrap_or_else(|| bounds.last().copied().unwrap_or(0.0) * 2.0));
+            }
+        }
+        None
+    }
+}
+
+/// One hour of calls to one provider model, from one node, scope and route.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ObsRow {
+    /// Start of the hour (unix ms).
+    pub hour: Ts,
+    pub node: String,
+    pub provider: String,
+    pub model: String,
+    /// The quota scope id: egress IP, key hash or account.
+    pub scope_id: String,
+    pub route: String,
+    pub requests: u64,
+    pub ok: u64,
+    /// Failures by class: `rate_limited`, `credits`, `context_overflow`,
+    /// `auth`, `client`, `server`, `unreachable`.
+    #[serde(default)]
+    pub errors: std::collections::BTreeMap<String, u64>,
+    /// Time from sending to the first byte of the answer.
+    #[serde(default)]
+    pub ttft_ms: Hist,
+    /// Output tokens per second after the first byte.
+    #[serde(default)]
+    pub tokens_per_s: Hist,
+    /// Whole call.
+    #[serde(default)]
+    pub duration_ms: Hist,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cost_usd: f64,
+}
+
+/// Something worth remembering about a provider.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderEvent {
+    pub ts: Ts,
+    pub node: String,
+    pub provider: String,
+    pub model: String,
+    #[serde(default)]
+    pub scope_id: String,
+    #[serde(default)]
+    pub route: String,
+    #[serde(default)]
+    pub session: Option<String>,
+    /// `context_overflow`, `credits_exhausted`, `rate_limited`, `auth_failed`.
+    pub kind: String,
+    /// Kind-specific: `limit` (tokens, when the provider said), `status`, `message`.
+    #[serde(default)]
+    pub detail: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,6 +493,31 @@ pub struct EgressIp {
     pub observed_at: Ts,
 }
 
+/// A provider unit's pool (neurons, pollen, credits, …).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnitInfo {
+    pub name: String,
+    /// The model, for a `per_model` pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub used: f64,
+    #[serde(default)]
+    pub limit: Option<f64>,
+    #[serde(default)]
+    pub remaining: Option<f64>,
+    #[serde(default)]
+    pub rates: Vec<UnitModelRate>,
+}
+
+/// What one model costs in a unit, as learned from the provider or a calibration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnitModelRate {
+    pub model: String,
+    pub units_per_mtok: f64,
+    /// `measured` or `calibrated`.
+    pub source: String,
+}
+
 /// One usage counter: a provider allowance for one IP, key or account.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuotaBucket {
@@ -377,6 +549,10 @@ pub struct QuotaBucket {
     #[serde(default)]
     pub sessions: Vec<String>,
     pub updated_at: Ts,
+    /// Set on provider units (`kind` is `unit:<name>[:<model>]`): exact amounts
+    /// (the integers above are rounded) and what the unit buys per model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<UnitInfo>,
 }
 
 // ---------------------------------------------------------------- resources
@@ -431,11 +607,16 @@ pub fn parse_size(s: &str) -> Option<u64> {
 
 // ------------------------------------------------------------------- tasks
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskLabel {
+    /// Start at once, ignoring the task cap; pause less urgent work for room.
+    RightNow,
     /// Start as soon as a slot is free, even if other tasks are running.
     Urgent,
+    /// Start when below `max_concurrent_tasks`.
+    #[default]
+    Normal,
     /// Start only when the cluster has nothing else running.
     WhenFree,
     /// Never start automatically; the operator presses Run.
@@ -445,14 +626,27 @@ pub enum TaskLabel {
 impl TaskLabel {
     pub fn as_str(self) -> &'static str {
         match self {
+            TaskLabel::RightNow => "right_now",
             TaskLabel::Urgent => "urgent",
+            TaskLabel::Normal => "normal",
             TaskLabel::WhenFree => "when_free",
             TaskLabel::OnDemand => "on_demand",
         }
     }
+    /// Higher goes first. `on_demand` only says who starts it: once running it is normal work.
+    pub fn level(self) -> u8 {
+        match self {
+            TaskLabel::WhenFree => 0,
+            TaskLabel::Normal | TaskLabel::OnDemand => 1,
+            TaskLabel::Urgent => 2,
+            TaskLabel::RightNow => 3,
+        }
+    }
     pub fn parse(s: &str) -> Option<TaskLabel> {
         match s {
+            "right_now" | "right-now" => Some(TaskLabel::RightNow),
             "urgent" => Some(TaskLabel::Urgent),
+            "normal" => Some(TaskLabel::Normal),
             "when_free" | "when-free" => Some(TaskLabel::WhenFree),
             "on_demand" | "on-demand" => Some(TaskLabel::OnDemand),
             _ => None,
@@ -769,7 +963,7 @@ pub struct ArtifactMeta {
     pub name: String,
     #[serde(default)]
     pub media_type: String,
-    /// `file`, or `tree` (a directory as tar.zst).
+    /// `file`, `tree` (a directory as tar.zst) or `git` (a git bundle).
     pub kind: String,
     #[serde(default)]
     pub producer: Option<String>,
@@ -819,16 +1013,30 @@ pub struct HarvestedOutput {
     pub path: String,
     pub reference: String,
     pub size: u64,
-    /// `file` or `tree`.
+    /// `file`, `tree` or `git`.
     #[serde(default)]
     pub kind: String,
     /// `artifact`, `parent_workspace`, `task_workspace`, `workspace:<name>`.
     pub to: String,
     #[serde(default)]
     pub dest: Option<String>,
+    /// For `git`: what the destination does with it.
+    #[serde(default)]
+    pub merge: crate::config::GitMerge,
     /// Where it ended up (set by the supervisor when it delivers it).
     #[serde(default)]
     pub delivered: Option<String>,
+}
+
+impl HarvestedOutput {
+    /// The path as shown to people ("." for the workspace root).
+    pub fn path_label(&self) -> &str {
+        if self.path.is_empty() {
+            "."
+        } else {
+            &self.path
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -924,6 +1132,26 @@ pub struct LogEvent {
     #[serde(default)]
     pub session: Option<String>,
     pub data: serde_json::Value,
+}
+
+#[cfg(test)]
+mod obs_tests {
+    use super::*;
+
+    #[test]
+    fn histogram_quantiles() {
+        let mut h = Hist::default();
+        for v in [50.0, 150.0, 150.0, 300.0, 90000.0] {
+            h.add(&OBS_MS_BUCKETS, v);
+        }
+        assert_eq!(h.quantile(&OBS_MS_BUCKETS, 0.5), Some(200.0));
+        assert_eq!(h.quantile(&OBS_MS_BUCKETS, 1.0), Some(102400.0));
+        let mut g = Hist::default();
+        g.merge(&h);
+        g.merge(&h);
+        assert_eq!((g.n, g.counts.iter().sum::<u64>()), (10, 10));
+        assert!(Hist::default().quantile(&OBS_MS_BUCKETS, 0.5).is_none());
+    }
 }
 
 #[cfg(test)]

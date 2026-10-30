@@ -312,7 +312,7 @@ Every agent has these MCP tools (OpenCode shows them as `cluster_*`):
 | `cluster_session_status {session}` | read another agent's todos and last output |
 | `cluster_send_message {to, text, delivery}` | "reviewer s-9a…: files are ready" |
 | `cluster_read_inbox` | pick up stored messages |
-| `cluster_list_agents` | see which profiles exist, and where |
+| `cluster_list_agents` | which agents can start now (`ready`), which wait for a provider allowance (`wait_allowance`, with `wait_s`), which are full (`busy`, with the idle sessions that could be stopped), and what the cluster has observed of each model (§11.1) |
 
 Prompt pattern that works well:
 
@@ -434,7 +434,9 @@ moo task add "Refresh docs" -t docs -t low-risk                                 
 
 | Label | Starts… |
 |---|---|
-| `urgent` | immediately, when a task slot is free (one extra slot is reserved for urgent work) |
+| `right_now` | at once; less urgent sessions are paused for room and resume afterwards |
+| `urgent` | immediately, when a task slot is free (one extra slot is reserved for urgent work); its agents go first in the spawn queue |
+| `normal` | when fewer than `max_concurrent_tasks` tasks are running |
 | `when_free` | only when no task is running **and** all sessions have been idle for `idle_grace_secs` |
 | `on_demand` | only when you run `moo task run <id>` |
 
@@ -450,6 +452,8 @@ moo task ls
 
 moo task order 4 1                  # 4 first, then 1, then everything else as before
 moo task edit 1 --label urgent      # promote
+moo task add "Prod is down" --label right_now   # pauses less urgent work
+moo spawn gen-fast -p "Review auth.py" --system-prompt "You are a security reviewer."   # a generic agent
 moo task edit 4 --body "Cursor-based, default page size 50"
 moo task run 3                      # start an on_demand task now
 moo task cancel 1                   # stops its coordinator and every agent it spawned
@@ -524,6 +528,47 @@ Shared workspaces have no locking. Tell agents (or the coordinator) who owns whi
 Each sync is a file-by-file three-way merge against the last state both sides saw. A file changed on only one side takes that side's version (added, updated or deleted). A file changed on **both** sides keeps the local version, and the incoming one is written next to it as `<file>.theirs`; the agents in that copy are told which files to reconcile. Workflow runs use this too: a step can run on another machine than the previous one (`node:` per step, or placement), and the run's workspace follows it.
 
 **Handing over files without sharing a workspace:** artifacts (§20).
+
+### 9.1 Git repositories in workspaces
+
+Agents commit as one person, set once on the hub:
+
+```yaml
+# supervisor.yaml
+git: { name: Robel, email: robel@example.org }
+```
+
+Every agent commit gets that author and committer. Which agent made it goes into a git note instead of the message:
+
+```bash
+git log --notes=moo -1
+# commit 9f2c…
+# Author: Robel <robel@example.org>
+#     Add the refunds endpoint
+#
+# Notes (moo):
+#     moocher-agent: coder
+#     moocher-session: s-3f9a1c2b7d
+#     moocher-model: gemini/gemini-flash-latest
+#     moocher-node: hub
+#     moocher-task: 7
+#     moocher-parent: s-77ab…
+```
+
+Notes follow amends and rebases (`notes.rewriteRef` is set in the agents' environment). To publish them: `git push origin refs/notes/moo`. A repository's own hooks keep working; the cluster's hook runs them first.
+
+**Across machines,** `.git` is never merged file by file (that corrupts it). A sync carries each repository's history as a git bundle (repositories up to three directories deep; `node_modules`, `target`, `.venv` are skipped) and the receiving copy fetches it as `refs/remotes/moo-<node>/…`, then moves its branches forward where that is a fast-forward: the checked-out branch with its index, so `git status` stays clean. Branches committed on both machines since the last sync stay apart, and the agents there are told to merge `moo-<node>/<branch>`. Checkpoints and `resume_elsewhere` keep the history the same way.
+
+**Fork, work on a branch, hand back.** A coordinator calls `cluster_spawn_agent(…, fork_workspace: true)`: the child starts from a copy of its workspace, history included, on branch `agent/<agent>/<session>`. A child template that ends with
+
+```yaml
+outputs:
+  - { git: true, to: parent_workspace }            # merge: ff (default) | merge | none
+```
+
+brings that branch back when it stops: the parent's repository gets `refs/remotes/<session>/agent/<agent>/<session>`, its checked-out branch is fast-forwarded if it can be, and the parent is told (`[cluster] Session s-… handed back its work: … merged into the checked-out branch (fast-forward)`). If it cannot fast-forward (the parent committed meanwhile), the parent merges it itself.
+
+Git runs inside a throwaway container of the agent image for all of this (no network, the agent's user), never on the host: a repository's config and hooks belong to the agent.
 
 ---
 
@@ -632,6 +677,50 @@ Event kinds you'll see:
 - **Workflow runs:** `run.started`, `run.step`, `run.nudge`, `run.verdict`, `run.finished`
 - **Tasks:** `task.started`, `task.finished`
 - **Nodes:** `node.attached`, `node.detached`, `node.agents`
+- **Providers:** `provider.context_overflow`, `provider.credits_exhausted`, `provider.auth_failed`
+- **Spawn queue:** `spawn.queued`, `spawn.dequeued`, `spawn.expired`, `spawn.cancelled`
+
+### 11.0 Provider units
+
+If a provider meters in neurons, pollen or credits, declare the unit (`quota.units`, [CONFIG.md](./CONFIG.md)) and watch what your tokens cost on each model:
+
+```bash
+moo quotas my-provider
+# my-provider key key:7a72… unit:neurons 62/100 38 12h 34m measured hub
+#     big: 20093.8 neurons/Mtok, 1 neurons buys ~50 tokens (measured)
+#     small: 332.9 neurons/Mtok, 1 neurons buys ~3003 tokens (measured)
+
+# The provider reports nothing? Read its dashboard and tell the cluster:
+moo quota set my-provider --unit neurons --used 4210
+```
+
+The dashboard's Providers & quotas page has the same numbers, with a **calibrate** button on each pool.
+
+### 11.1 What the cluster has learned about providers
+
+keyproxy watches every call it makes and the nodes report it to the hub once a minute, as hourly rows per provider model, key or IP, and route: calls, failures by class (`rate_limited`, `credits`, `context_overflow`, `auth`, `client`, `server`, `unreachable`), time to the first byte, output tokens per second, tokens and cost.
+
+```bash
+moo providers                   # last 24 h, one line per model
+# MODEL                                      CALLS   ERR%  1ST BYTE       p95    TOK/S       COST LEARNED
+# groq/llama-3.3-70b-versatile                 214   1.4%    ≤0.4s     ≤1.6s      310    $0.0000             rate_limited:3
+# gemini/gemini-flash-latest                    88   0.0%    ≤0.8s     ≤3.2s      140    $0.0123
+# cohere/command-a-03-2025                      12  16.7%    ≤1.6s     ≤6.4s       45    $0.0000 window 128000    context_overflow:2
+# openrouter/qwen/qwen3-coder                   40   2.5%    ≤0.8s     ≤1.6s       90    $0.0310 out of credits 2h ago credits:1
+moo providers groq --hours 168  # one provider, a week
+moo providers --events          # context overflows, credits, refused keys, newest first
+```
+
+What it learns and uses:
+- **Context windows.** When a provider refuses a request as too long and names its window ("maximum context length is 32768 tokens"), that window is remembered. New sessions of that model are configured with it if it is smaller than the template's `context:`, so OpenCode compacts before the provider refuses. If the template claims more, you get a notification.
+- **Credits.** A `402`, or an error saying the account is out of credits (`insufficient_quota`, "insufficient credits", …), is recorded with the time, notifies you, and holds that key's allowance back for an hour (the quota shows `source: credits`); a plain rate limit is not mistaken for it.
+- **Speed and reliability** go into `cluster_list_agents` ("first byte ≤0.4 s (p50), 310 tok/s, 1% errors over 214 calls") so agents can pick, and into the dashboard.
+
+`opencode-free` traffic skips keyproxy, so it has no observations.
+
+### 11.2 Spawning when there is no room
+
+A coordinator calling `cluster_spawn_agent` gets an error when no node can take the agent now. With `if_busy: "wait"` (and optionally `wait_max_s`, default one hour) it is queued on the hub instead: it starts as soon as a slot frees up or the allowance resets, and the coordinator gets a message with the new session id (`[cluster] solo (queued as q-…) has started: session s-…`). `cluster_stop_session("q-…")` cancels it. The queue: `curl …/api/v1/spawn-queue`. The agents are told in `cluster_list_agents` whether waiting is worth it, and can ask you with `cluster_ask` instead.
 
 ### Prometheus
 
@@ -1033,6 +1122,7 @@ Templates name the files worth keeping (`outputs:` in CONFIG.md). They are colle
 outputs:
   - { path: report.md, to: parent_workspace, dest: from-builder/report.md }
   - { path: "dist/*.whl", to: artifact, name: wheels }
+  - { git: true, to: parent_workspace }       # its commits, into the parent's repository (§9.1)
 transcript: true
 retain: on_failure
 ```
@@ -1244,3 +1334,44 @@ moocher-hub events-cat …/events-20261024.jsonl.zst     # the same without zstd
 | ~~Web UI (SolidJS, mobile-first), TUI, password login, built-in TLS, Open in OpenCode, notifications~~ | 4 ✔ |
 | ~~Load and chaos tests, Quadlet and systemd units, event export, artifact expiry, keyproxy usage metering, egress allowlists, hard disk quotas~~ | 5 ✔ |
 | Pre-warmed containers (instance boot is ~4 s; see PHASE5.md) | later |
+
+## The manager
+
+The round button at the bottom right of the dashboard, or `moo ask "…"`, puts a question to the manager: what is running where, why something is paused, what a provider has left. Ask it to go somewhere ("take me to the quotas") and the dashboard goes there.
+
+Turn it on by naming an agent whose model it should use, in `supervisor.yaml`:
+
+```yaml
+manager: { agent: gen-fast }
+```
+
+It runs no instance and takes no slot, and calls go through a node's keyproxy, so routes and allowances apply. It keeps nothing: each question reads the cluster again, the conversation stays in the browser tab (the last six messages go along as text so follow-ups make sense), and only the fact of a question and its cost is audited. Its tools only read, and it can send the browser only to dashboard pages. Asking needs the `operate` scope, since it costs money.
+
+## The work map
+
+The **Work map** page draws each task (or workflow run) as a graph of who started whom. Each card shows the agent, state, node (the colored edge and chip), model, start time, cost, why it is paused and how many messages are waiting for it. Dashed lines join a replacement to the session it replaced. `/work#task-12` opens at one task.
+
+## Paused sessions and their messages
+
+A session paused for `right_now` work keeps its conversation, todos and workspace. The turn it was in is cut off: an unfinished model reply is discarded and a running command stops, and it is told so when it resumes.
+
+Messages for a session that is not running (paused, restarting, dead or on an unreachable node) wait at the hub. When it runs again it gets them in one message, oldest first, marked as past events with how old each one is. A replacement inherits them. If the session ends for good they are dropped, and a `message.dropped` event records how many. Sessions show the number waiting, and `message.held` and `message.delivered` events record the rest.
+
+## Generic agents and reserved models
+
+A generic agent is only a model. Whoever starts it says what it should be:
+
+```yaml
+# agents/gen-fast.yaml
+name: gen-fast
+kind: generic
+provider: { id: anthropic, model: some-model, key: { secret: anthropic } }
+```
+
+```bash
+moo spawn gen-fast -p "Review this diff" --system-prompt "You are a careful reviewer."
+```
+
+A coordinator does the same through `cluster_spawn_agent`'s `system_prompt`. The prompt is required for a generic agent and refused for any other. Tools and limits still come from the config, so a spawner cannot widen them.
+
+To keep a costly model for urgent work, add `min_urgency: right_now` (or another level) to its agent. An agent below that level is refused it; you can always start it by hand.

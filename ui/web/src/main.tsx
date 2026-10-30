@@ -10,6 +10,7 @@ import "./index.css";
 // Everything but the first screen loads on demand (small first bundle).
 const Instances = lazy(() => import("./pages/Instances"));
 const Instance = lazy(() => import("./pages/Instance"));
+const Work = lazy(() => import("./pages/Work"));
 const Questions = lazy(() => import("./pages/Questions"));
 const Tasks = lazy(() => import("./pages/Tasks"));
 const Quotas = lazy(() => import("./pages/Quotas"));
@@ -46,6 +47,7 @@ render(
         <Route path="/" component={Overview} />
         <Route path="/instances" component={Instances} />
         <Route path="/instances/:id" component={Instance} />
+        <Route path="/work" component={Work} />
         <Route path="/questions" component={Questions} />
         <Route path="/tasks" component={Tasks} />
         <Route path="/quotas" component={Quotas} />

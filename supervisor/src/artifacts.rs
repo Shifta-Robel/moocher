@@ -131,7 +131,7 @@ impl Sup {
                 size,
                 name: if h.name.is_empty() { hash[..12].to_string() } else { h.name.clone() },
                 media_type: if h.media_type.is_empty() { guess_media(&h.name, &h.kind) } else { h.media_type.clone() },
-                kind: if h.kind == "tree" { "tree".into() } else { "file".into() },
+                kind: if h.kind == "tree" || h.kind == "git" { h.kind.clone() } else { "file".into() },
                 producer,
                 node: node.map(String::from),
                 parents,

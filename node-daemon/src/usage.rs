@@ -27,7 +27,13 @@ pub struct Scanner {
     usage: TokenUsage,
     seen: bool,
     overflow: bool,
+    /// Extra numbers wanted from the provider's usage: (name, dotted path).
+    fields: Vec<(String, String)>,
+    found: Option<Found>,
 }
+
+/// Numbers found for `Meter::watch`, by name.
+pub type Found = std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, f64>>>;
 
 fn n(v: &Value) -> u64 {
     v.as_u64().unwrap_or(0)
@@ -35,7 +41,7 @@ fn n(v: &Value) -> u64 {
 
 impl Scanner {
     pub fn new(api: ApiKind, content_type: &str) -> Scanner {
-        Scanner { api, sse: content_type.contains("event-stream"), buf: vec![], usage: TokenUsage::default(), seen: false, overflow: false }
+        Scanner { api, sse: content_type.contains("event-stream"), buf: vec![], usage: TokenUsage::default(), seen: false, overflow: false, fields: vec![], found: None }
     }
 
     pub fn feed(&mut self, chunk: &[u8]) {
@@ -75,6 +81,15 @@ impl Scanner {
     }
 
     fn event(&mut self, v: &Value) {
+        if let Some(found) = &self.found {
+            for (name, path) in &self.fields {
+                for root in [&v["usage"], &v["response"]["usage"], &v["message"]["usage"], &v["usageMetadata"]] {
+                    if let Some(n) = path.split('.').fold(root, |r, k| &r[k]).as_f64() {
+                        found.lock().unwrap().insert(name.clone(), n);
+                    }
+                }
+            }
+        }
         match self.api {
             ApiKind::Openai => {
                 // Chat completions (final chunk or whole body).
@@ -188,6 +203,14 @@ pub struct Meter {
 impl Meter {
     pub fn new(api: ApiKind, content_type: &str, done: impl FnOnce(TokenUsage) + Send + 'static) -> Meter {
         Meter { scanner: Some(Scanner::new(api, content_type)), done: Some(Box::new(done)) }
+    }
+    /// Also read these numbers from the usage the provider reports.
+    pub fn watch(mut self, fields: Vec<(String, String)>, found: Found) -> Meter {
+        if let Some(s) = &mut self.scanner {
+            s.fields = fields;
+            s.found = Some(found);
+        }
+        self
     }
     pub fn feed(&mut self, chunk: &[u8]) {
         if let Some(s) = &mut self.scanner {

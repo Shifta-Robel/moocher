@@ -18,6 +18,7 @@ use std::sync::Arc;
 pub struct Library {
     pub templates: Vec<AgentConfig>,
     pub preamble: Option<String>,
+    pub git: Option<moocher_protocol::config::GitConfig>,
     pub errors: Vec<String>,
     pub hash: String,
 }
@@ -63,6 +64,8 @@ impl Sup {
         let mut h = Sha256::new();
         h.update(serde_json::to_vec(&lib.templates).unwrap_or_default());
         h.update(lib.preamble.as_deref().unwrap_or("").as_bytes());
+        lib.git = Some(self.cfg.git.clone());
+        h.update(serde_json::to_vec(&lib.git).unwrap_or_default());
         lib.hash = hex::encode(&h.finalize()[..8]);
         lib
     }
@@ -73,7 +76,7 @@ impl Sup {
         if is_relay {
             return;
         }
-        let cmd = NodeCommand::SyncTemplates { templates: lib.templates.clone(), preamble: lib.preamble.clone(), hash: lib.hash.clone() };
+        let cmd = NodeCommand::SyncTemplates { templates: lib.templates.clone(), preamble: lib.preamble.clone(), git: lib.git.clone(), hash: lib.hash.clone() };
         match self.nodes.call(node, cmd, CMD_TIMEOUT).await {
             Ok(_) => tracing::debug!(node, hash = %lib.hash, "templates synced"),
             Err(e) => tracing::warn!(node, error = %e, "template sync failed"),
@@ -131,6 +134,8 @@ impl Sup {
                     "secret": t.provider.key.as_ref().and_then(|k| k.secret.clone()),
                     "instances": {"live": live, "max": t.instances.max},
                     "overridable": t.overridable,
+                    "generic": t.is_generic(),
+                    "min_urgency": t.min_urgency,
                     "runnable_on": runnable,
                     "not_runnable": blocked,
                 })

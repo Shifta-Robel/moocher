@@ -30,6 +30,8 @@ pub struct LoadedAgent {
 pub struct HubSet {
     pub templates: Vec<AgentConfig>,
     pub preamble: Option<String>,
+    #[serde(default)]
+    pub git: Option<moocher_protocol::config::GitConfig>,
     pub hash: String,
 }
 
@@ -54,10 +56,16 @@ pub struct Snapshot {
     pub file_errors: BTreeMap<String, String>,
     /// Cluster preamble from the hub (None: the built-in default).
     pub hub_preamble: Option<String>,
+    pub hub_git: Option<moocher_protocol::config::GitConfig>,
     pub hub_hash: String,
 }
 
 impl Snapshot {
+    /// The hub's `git:`, else this node's, else the defaults.
+    pub fn git(&self) -> moocher_protocol::config::GitConfig {
+        self.hub_git.clone().or_else(|| self.node.git.clone()).unwrap_or_default()
+    }
+
     pub fn agent_infos(&self) -> Vec<AgentInfo> {
         self.agents
             .values()
@@ -83,9 +91,12 @@ impl Snapshot {
                 source: a.source.into(),
                 max_instances: a.cfg.instances.max,
                 overridable: a.cfg.overridable.clone(),
+                generic: a.cfg.is_generic(),
+                min_urgency: a.cfg.min_urgency,
                 price_in_per_mtok: self.providers.get(&a.cfg.provider.id).and_then(|p| p.prices.get(&a.cfg.provider.model)).map(|p| p.input_per_mtok).unwrap_or(0.0),
                 price_out_per_mtok: self.providers.get(&a.cfg.provider.id).and_then(|p| p.prices.get(&a.cfg.provider.model)).map(|p| p.output_per_mtok).unwrap_or(0.0),
                 on_death: a.cfg.on_death.clone(),
+                context: a.cfg.provider.context,
             })
             .collect()
     }
@@ -231,7 +242,7 @@ pub fn load(dir: &Path) -> Result<Snapshot> {
         }
         agents.insert(cfg.name.clone(), LoadedAgent { cfg, role_text, hash, errors, secret_ok, source });
     }
-    Ok(Snapshot { dir: dir.to_path_buf(), node, providers, routes, overrides, agents, file_errors, hub_preamble: hub.preamble, hub_hash: hub.hash })
+    Ok(Snapshot { dir: dir.to_path_buf(), node, providers, routes, overrides, agents, file_errors, hub_preamble: hub.preamble, hub_git: hub.git, hub_hash: hub.hash })
 }
 
 /// Shared, swappable config snapshot.

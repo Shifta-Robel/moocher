@@ -29,6 +29,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::net::UnixListener;
 
+/// One request through the keyproxy from inside the node, as an instance's would go.
+pub async fn proxied(g: &Gateway, provider: &str, rest: &str, headers: &[(&str, &str)], body: Vec<u8>) -> anyhow::Result<(u16, Vec<u8>)> {
+    let mut req = axum::http::Request::builder().method("POST").header("authorization", format!("Bearer {}", g.cap)).header("content-type", "application/json");
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let res = keyproxy(State(g.clone()), Path((provider.to_string(), rest.to_string())), req.body(Body::from(body))?).await;
+    let status = res.status().as_u16();
+    Ok((status, axum::body::to_bytes(res.into_body(), MAX_BODY).await?.to_vec()))
+}
+
 /// Set while every route's allowance is used up: (until, explanation).
 pub type Parked = Arc<Mutex<Option<(Ts, String)>>>;
 
@@ -68,6 +79,8 @@ pub struct Gateway {
     files: Arc<crate::wsops::WsOps>,
     /// Artifacts this session fetched: lineage parents of what it shares.
     fetched: Arc<Mutex<Vec<String>>>,
+    obs: Arc<crate::obs::Observer>,
+    units: Arc<crate::units::Units>,
 }
 
 /// The instance's workspace: host directory and the path the agent sees.
@@ -84,6 +97,8 @@ pub struct GatewayDeps {
     pub egress: Arc<Egress>,
     pub quotas: Arc<Quotas>,
     pub files: Arc<crate::wsops::WsOps>,
+    pub obs: Arc<crate::obs::Observer>,
+    pub units: Arc<crate::units::Units>,
 }
 
 impl Gateway {
@@ -124,10 +139,16 @@ impl Gateway {
             ws: Arc::new(ws),
             files: deps.files.clone(),
             fetched: Default::default(),
+            obs: deps.obs.clone(),
+            units: deps.units.clone(),
         }
     }
 
     /// Artifacts this session fetched (lineage of what it produces).
+    pub fn metered(&self) -> TokenUsage {
+        self.metered.get()
+    }
+
     pub fn fetched(&self) -> Vec<String> {
         self.fetched.lock().unwrap().clone()
     }
@@ -344,6 +365,14 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
         }
     }
     let scope = quota::default_scope(&pdef, secret.is_some());
+    let call = |t: &Target, route: &str| crate::obs::Call {
+        provider: provider.clone(),
+        model: agent.cfg.provider.model.clone(),
+        scope_id: t.scope_id.clone(),
+        route: route.to_string(),
+        session: g.id.clone(),
+        ..Default::default()
+    };
     let mut skipped: Vec<String> = vec![];
     let mut soonest: Option<Ts> = None;
     let mut all_exhausted = true;
@@ -356,9 +385,15 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
         let ip = g.egress.ip_of(name);
         let target = Target { provider: provider.clone(), scope, scope_id: quota::scope_id(scope, &snap.node.name, name, ip.as_deref(), secret.as_deref(), account.as_deref()) };
         g.quotas.ensure(&target, name, &limits);
+        g.units.ensure(&target, name, &agent.cfg.provider.model, &spec.units);
         let now = now_ms();
         if let Some(until) = g.quotas.exhausted(&target, &limits, &snap.overrides.quotas, now) {
             skipped.push(format!("{name} ({}): allowance used up, resets in {}", target.scope_id, human_in(until - now)));
+            soonest = Some(soonest.map_or(until, |s: Ts| s.min(until)));
+            continue;
+        }
+        if let Some((until, unit)) = g.units.exhausted(&target, &agent.cfg.provider.model, &spec.units, now) {
+            skipped.push(format!("{name} ({}): {unit} used up, resets in {}", target.scope_id, human_in(until - now)));
             soonest = Some(soonest.map_or(until, |s: Ts| s.min(until)));
             continue;
         }
@@ -387,6 +422,7 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
                 }
                 tracing::warn!(agent = %g.agent, provider, route = %name, error = %why, "upstream request failed");
                 g.egress.observe_call(name, &provider, None, Some(why.clone()));
+                g.obs.record(&crate::obs::Call { unreachable: Some(why.clone()), ..call(&target, name) });
                 skipped.push(format!("{name}: upstream unreachable: {why}"));
                 all_exhausted = false;
                 continue;
@@ -399,7 +435,14 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
         if status.as_u16() == 429 {
             let rh = upstream.headers().clone();
             let rb = upstream.bytes().await.unwrap_or_default();
-            let until = g.quotas.observe(&target, 429, &rh, &rb, &spec.learn).unwrap_or(now_ms() + 60_000);
+            let text = String::from_utf8_lossy(&rb[..rb.len().min(crate::obs::ERR_BODY)]).to_string();
+            g.obs.record(&crate::obs::Call { status: Some(429), duration_ms: Some(sent.elapsed().as_secs_f64() * 1000.0), error_body: text.clone(), ..call(&target, name) });
+            let mut until = g.quotas.observe(&target, 429, &rh, &rb, &spec.learn).unwrap_or(now_ms() + 60_000);
+            if crate::obs::classify(429, &text).class == "credits" {
+                // Out of credits is not a per-minute limit: look again in an hour.
+                until = until.max(now_ms() + 3_600_000);
+                g.quotas.exhaust_until(&target, until);
+            }
             soonest = Some(soonest.map_or(until, |s: Ts| s.min(until)));
             skipped.push(format!("{name} ({}): provider says rate limited, resets in {}", target.scope_id, human_in(until - now_ms())));
             if i + 1 < names.len() {
@@ -417,6 +460,10 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
             return out.body(Body::from(rb)).unwrap_or_else(|_| llm_error(StatusCode::TOO_MANY_REQUESTS, "rate limited"));
         }
         g.quotas.observe(&target, status.as_u16(), upstream.headers(), b"", &spec.learn);
+        if status.as_u16() == 402 {
+            // Payment required: out of credits; look again in an hour.
+            g.quotas.exhaust_until(&target, now_ms() + 3_600_000);
+        }
         g.unpark();
         g.note_route(name, &names[0], &skipped, &target.scope_id);
         let mut out = Response::builder().status(status.as_u16());
@@ -426,11 +473,26 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
             }
         }
         let ct = upstream.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        let mut probe = crate::obs::Probe::new(g.obs.clone(), crate::obs::Call { status: Some(status.as_u16()), ..call(&target, name) }, sent);
+        let probe_usage = probe.usage.clone();
+        // A call's cost in the provider's units: a header now, or the usage at the end.
+        let found: crate::usage::Found = Default::default();
+        for (unit, u) in &spec.units {
+            if let Some(v) = u.header.as_ref().and_then(|h| upstream.headers().get(h.as_str())).and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse().ok()) {
+                found.lock().unwrap().insert(unit.clone(), v);
+            }
+        }
+        let watch: Vec<(String, String)> = spec.units.iter().filter_map(|(unit, u)| Some((unit.clone(), u.usage_field.clone()?))).collect();
+        let (unit_specs, unit_target, unit_route, unit_found) = (spec.units.clone(), target.clone(), name.clone(), found.clone());
+        let unit_model = agent.cfg.provider.model.clone();
         let mut meter = (status.is_success()).then(|| {
             let g = g.clone();
             let price = pdef.prices.get(&agent.cfg.provider.model).cloned();
             crate::usage::Meter::new(pdef.api, &ct, move |mut u| {
                 crate::usage::price(&mut u, price.as_ref());
+                *probe_usage.lock().unwrap() = Some((u.input, u.output, u.cost_usd));
+                let call = crate::units::UnitCall { target: &unit_target, route: &unit_route, session: &g.id, model: &unit_model, input: u.input, output: u.output + u.reasoning };
+                g.units.record(&call, &unit_specs, &unit_found.lock().unwrap());
                 g.metered.add(&u);
                 // During a turn OpenCode's count can lag (under load until the
                 // turn ends, when the manager compares). A call between turns
@@ -443,11 +505,14 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
                         }
                     });
                 }
-            })
+            }).watch(watch, found)
         });
         let stream = upstream.bytes_stream().map(move |r| {
-            if let (Ok(b), Some(m)) = (&r, &mut meter) {
-                m.feed(b);
+            if let Ok(b) = &r {
+                probe.chunk(b);
+                if let Some(m) = &mut meter {
+                    m.feed(b);
+                }
             }
             r.map_err(std::io::Error::other)
         });
@@ -622,7 +687,12 @@ const TOOLS: &[ToolDef] = &[
         coordinator: false,
     },
     ToolDef { name: "read_inbox", desc: "Read and clear messages left for you by other sessions.", schema: || obj(json!({}), &[]), coordinator: false },
-    ToolDef { name: "list_agents", desc: "List agent profiles available in the cluster (name, description, model, node).", schema: || obj(json!({}), &[]), coordinator: false },
+    ToolDef {
+        name: "list_agents",
+        desc: "List the agents you can start, one entry each: description, model, generic (true = no specialization of its own, pass its system_prompt to spawn_agent), status (ready = starts now; wait_allowance = its provider allowance is used up, wait_s says for how long; busy = every node that has it is full, idle_sessions lists idle ones that could be stopped; reserved = a costly model kept for more urgent work than yours; unavailable = misconfigured), what the cluster has observed of its model (speed, errors, context window), and its nodes. When the one you want is not ready: wait (spawn_agent if_busy=wait), pick another, or ask the user with cluster_ask.",
+        schema: || obj(json!({}), &[]),
+        coordinator: false,
+    },
     ToolDef {
         name: "list_nodes",
         desc: "List cluster machines: free slots, agents, link latency, egress IPs, provider allowances left (with reset times) and provider latency per route. Use it to choose where to start an agent (spawn_agent's node).",
@@ -638,7 +708,7 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "spawn_agent",
-        desc: "Start a new agent instance from a template (see list_agents) with an initial prompt. Returns its session id. You are notified when it finishes a turn. share_workspace=true gives it your workspace. role_append / budget_usd / route customise this instance where the template's `overridable` allows it.",
+        desc: "Start a new agent instance from a template (list_agents shows which can start now, which are busy and how long an allowance wait is) with an initial prompt. Returns its session id. You are notified when it finishes a turn. share_workspace=true gives it your workspace (you both edit the same files); fork_workspace=true gives it a copy of your workspace, git history included, on a new branch agent/<agent>/<session>; templates that hand back git history bring that branch back into your repository when it stops. role_append / budget_usd / route customise this instance where the template's `overridable` allows it.",
         schema: || {
             obj(
                 json!({
@@ -647,6 +717,11 @@ const TOOLS: &[ToolDef] = &[
                     "title": {"type": "string"},
                     "node": {"type": "string", "description": "pin to a node (see list_nodes); default: the supervisor chooses"},
                     "share_workspace": {"type": "boolean"},
+                    "fork_workspace": {"type": "boolean"},
+                    "if_busy": {"type": "string", "enum": ["fail", "wait"], "description": "when no node can take it now (see list_agents' status): fail (default) or wait in a queue; you get a message when it starts"},
+                    "wait_max_s": {"type": "integer", "description": "with if_busy=wait: give up after this many seconds (default 3600)"},
+                    "system_prompt": {"type": "string", "description": "required for generic agents (list_agents: generic=true), refused for others: who this agent is and how it should work"},
+                    "urgency": {"type": "string", "enum": ["urgent", "normal", "when_free"], "description": "lower than your own urgency if this work can wait (default: yours; it cannot go higher)"},
                     "role_append": {"type": "string", "description": "extra standing instructions for this instance"},
                     "budget_usd": {"type": "number"},
                     "route": {"type": "string", "description": "preferred egress route"}
@@ -793,7 +868,14 @@ fn to_call(name: &str, a: &Value) -> Result<AgentCall, String> {
             node: s("node").ok(),
             title: s("title").ok(),
             share_workspace: a.get("share_workspace").and_then(|v| v.as_bool()).unwrap_or(false),
-            overrides: SpawnOverrides { role_append: s("role_append").ok(), budget_usd: a.get("budget_usd").and_then(|v| v.as_f64()), route: s("route").ok() },
+            fork_workspace: a.get("fork_workspace").and_then(|v| v.as_bool()).unwrap_or(false),
+            if_busy: match a.get("if_busy").and_then(|v| v.as_str()) {
+                Some("wait") => moocher_protocol::link::IfBusy::Wait,
+                _ => moocher_protocol::link::IfBusy::Fail,
+            },
+            wait_max_s: a.get("wait_max_s").and_then(|v| v.as_u64()),
+            urgency: s("urgency").ok().and_then(|u| moocher_protocol::model::TaskLabel::parse(&u)),
+            overrides: SpawnOverrides { role_append: s("role_append").ok(), system_prompt: s("system_prompt").ok(), budget_usd: a.get("budget_usd").and_then(|v| v.as_f64()), route: s("route").ok() },
         },
         "stop_session" => AgentCall::Stop { session: s("session")? },
         "task_get" => AgentCall::TaskGet,

@@ -258,3 +258,32 @@ What stays the same:
 - **The agent image:** no rebuild needed. A rebuilt one has `moo-bridge` inside.
 
 What changes: dashboard users log in once more (the cookie was renamed), and scripts must use `moo` and `MOO_TOKEN` / `MOO_URL`.
+
+## 11. Upgrading moocher, and removing old binaries
+
+Build from the repo, on the machine or on one with the same or an older glibc:
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build --release
+cargo build --release -p moo-bridge --target x86_64-unknown-linux-musl
+```
+
+See what is installed and what is running, then stop it:
+
+```bash
+type -a moo moocher-hub moocher-node moo-bridge ocl ocl-supervisor opencode-node ocl-bridge
+systemctl --user list-units 'moocher*' 'ocl*' 'opencode*'
+systemctl --user stop moocher-node moocher-hub
+```
+
+Coming from the `ocl` names, use §10 instead. Otherwise delete each path `type -a` printed and install the new ones where your units expect them (`ExecStart=` in `systemctl --user cat moocher-node`):
+
+```bash
+install -D -m 755 target/release/moo target/release/moocher-hub target/release/moocher-node -t ~/.local/bin/
+install -m 755 target/x86_64-unknown-linux-musl/release/moo-bridge ~/.local/bin/
+systemctl --user start moocher-hub moocher-node
+moo status
+```
+
+Config, data, users and tokens stay where they are, and the database gains its new tables on start. Stopping the node leaves agent containers running, and it adopts them again on start. The agent image needs a rebuild only when `bridge/` or `images/agent/` changed.

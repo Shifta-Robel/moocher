@@ -9,7 +9,9 @@ import type { Task } from "../types";
 import { ago, money } from "../util";
 
 const LABELS = [
-  ["urgent", "Urgent", "starts as soon as a slot is free"],
+  ["right_now", "Right now", "starts at once and pauses less urgent work"],
+  ["urgent", "Urgent", "starts as soon as a slot is free, ahead of the queue"],
+  ["normal", "Normal", "starts when below the task limit"],
   ["when_free", "When free", "starts when the cluster is idle"],
   ["on_demand", "On demand", "starts when you press Run"],
 ] as const;

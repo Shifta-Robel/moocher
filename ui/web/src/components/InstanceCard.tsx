@@ -34,6 +34,11 @@ export default function InstanceCard(p: { s: Session }) {
           </span>
           <span title="tokens">{num(billed(p.s).total)} tok</span>
           <span title="cost">{money(billed(p.s).cost_usd)}</span>
+          <Show when={(p.s.held ?? 0) > 0}>
+            <span class="inline-flex items-center gap-1 text-amber-700 dark:text-amber-400" title="messages waiting until it runs again">
+              <I.Mail class="size-3.5" />{p.s.held}
+            </span>
+          </Show>
           <span class="ml-auto" title="age">{ago(p.s.started_at)}</span>
           <Show when={p.s.attached_by && (p.s.attached_until ?? 0) > Date.now()}>
             <span class="inline-flex items-center gap-1 text-indigo-600 dark:text-indigo-400" title={`attached by ${p.s.attached_by}`}>

@@ -24,6 +24,7 @@ export default function Templates() {
   const [prompt, setPrompt] = createSignal("");
   const [node, setNode] = createSignal("");
   const [append, setAppend] = createSignal("");
+  const [sysPrompt, setSysPrompt] = createSignal("");
   const [budget, setBudget] = createSignal("");
   const [route, setRoute] = createSignal("");
   const [shared, setShared] = createSignal("");
@@ -33,6 +34,7 @@ export default function Templates() {
     const a = pick()!;
     const overrides: any = {};
     if (append()) overrides.role_append = append();
+    if (sysPrompt()) overrides.system_prompt = sysPrompt();
     if (budget()) overrides.budget_usd = Number(budget());
     if (route()) overrides.route = route();
     const r = await act(
@@ -104,6 +106,11 @@ export default function Templates() {
               <input class={inputCls} value={shared()} onInput={(e) => setShared(e.currentTarget.value)} pattern="[a-z0-9\-]*" />
             </Field>
           </div>
+          <Show when={pick()?.generic}>
+            <Field label="System prompt" hint="a generic agent is just a model: say who it is and how it should work">
+              <PromptBox rows={4} label="system prompt" value={sysPrompt()} onValue={setSysPrompt} required />
+            </Field>
+          </Show>
           <Show when={pick()?.overridable.role_append}>
             <Field label="Extra instructions for this instance">
               <PromptBox rows={2} label="extra instructions" value={append()} onValue={setAppend} />

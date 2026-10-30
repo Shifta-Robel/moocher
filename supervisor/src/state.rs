@@ -29,6 +29,8 @@ pub struct Sup {
     pub stream: broadcast::Sender<StreamEvent>,
     /// Serialises orchestration decisions (workflow steps, task scheduling).
     pub orch_lock: tokio::sync::Mutex<()>,
+    /// One delivery of held messages at a time, so they stay in order.
+    pub held_lock: tokio::sync::Mutex<()>,
     /// Cluster CA (set at start when remote nodes are enabled).
     pub ca: std::sync::OnceLock<crate::pki::Ca>,
     /// Last audit time per (node, rejection reason): a rejected node retries
@@ -88,6 +90,13 @@ pub struct SpawnOpts {
     pub overrides: moocher_protocol::config::SpawnOverrides,
     /// Resume elsewhere: the dead session this one replaces.
     pub replaces: Option<String>,
+    /// Default: its task's urgency, else normal.
+    pub urgency: Option<TaskLabel>,
+}
+
+/// The urgency an entry of `availability()` is reserved for, if `level` is below it.
+fn reserved_above(agent: &Value, level: u8) -> Option<TaskLabel> {
+    serde_json::from_value::<TaskLabel>(agent["min_urgency"].clone()).ok().filter(|m| m.level() > level)
 }
 
 impl Sup {
@@ -103,6 +112,7 @@ impl Sup {
             nodes: Registry::default(),
             stream,
             orch_lock: tokio::sync::Mutex::new(()),
+            held_lock: Default::default(),
             ca: std::sync::OnceLock::new(),
             rejections: Default::default(),
             stats: Default::default(),
@@ -128,8 +138,10 @@ impl Sup {
     }
 
     pub fn save_session(&self, s: &SessionInfo) {
-        let _ = self.db.put_session(s);
-        let _ = self.stream.send(StreamEvent::Session(s.clone()));
+        let mut s = s.clone();
+        s.held = self.db.held_count(&s.report.id);
+        let _ = self.db.put_session(&s);
+        let _ = self.stream.send(StreamEvent::Session(s));
     }
 
     pub fn save_task(&self, t: &Task) {
@@ -179,6 +191,10 @@ impl Sup {
                 prompt: None,
                 attached_by: None,
                 attached_until: None,
+                urgency: None,
+                preempted: None,
+                overrides: Default::default(),
+                held: 0,
             },
         };
         self.save_session(&info);
@@ -207,7 +223,7 @@ impl Sup {
     // ---------------------------------------------------------- sessions
 
     pub async fn spawn(&self, actor: &Actor, o: SpawnOpts) -> Result<SessionInfo> {
-        let res = self.spawn_inner(&o).await;
+        let res = self.spawn_with_room(&o).await;
         self.audit(
             actor,
             "session.spawn",
@@ -218,7 +234,7 @@ impl Sup {
         res
     }
 
-    async fn spawn_inner(&self, o: &SpawnOpts) -> Result<SessionInfo> {
+    pub(crate) async fn spawn_inner(&self, o: &SpawnOpts) -> Result<SessionInfo> {
         let near = crate::placement::Near {
             parent_node: o.parent.as_deref().and_then(|p| self.db.session(p)).map(|p| p.report.node),
             workspace: o.workspace.as_ref().filter(|w| w.mode == WorkspaceMode::Shared).and_then(|w| w.name.clone()),
@@ -278,6 +294,10 @@ impl Sup {
             prompt: o.prompt.as_deref().map(|p| truncate(p, 8000)),
             attached_by: None,
             attached_until: None,
+            urgency: o.urgency,
+            preempted: None,
+            overrides: o.overrides.clone(),
+            held: 0,
         };
         self.save_session(&info);
         let spec = SpawnSpec {
@@ -317,10 +337,20 @@ impl Sup {
                 };
                 return self.db.inbox_push(id, &from, text);
             }
+            if self.holds_messages(&s) {
+                return self.hold_message(actor, id, text).await;
+            }
             if !s.report.state.is_live() {
                 bail!("session {id} is {}", s.report.state.as_str());
             }
-            self.nodes.call(&s.report.node, NodeCommand::Prompt { session: id.into(), text: text.into(), delivery }, CMD_TIMEOUT).await?;
+            if let Err(e) = self.nodes.call(&s.report.node, NodeCommand::Prompt { session: id.into(), text: text.into(), delivery }, CMD_TIMEOUT).await {
+                // It went away while this was on its way.
+                let now = self.session(id)?;
+                if self.holds_messages(&now) || !self.nodes.connected(&now.report.node) {
+                    return self.hold_message(actor, id, text).await;
+                }
+                return Err(e);
+            }
             Ok(())
         }
         .await;
@@ -408,7 +438,11 @@ impl Sup {
     pub async fn on_node_event(self: &Arc<Self>, node: &str, ev: NodeEvent) {
         match ev {
             NodeEvent::Session(r) => {
-                self.merge_report(r);
+                let s = self.merge_report(r);
+                if s.held > 0 {
+                    let me = self.clone();
+                    tokio::spawn(async move { me.after_report(&s).await });
+                }
             }
             NodeEvent::Agents { agents } => {
                 if let Some(mut n) = self.db.node(node) {
@@ -442,12 +476,45 @@ impl Sup {
             NodeEvent::RouteStats { stats } => {
                 let _ = self.db.put_route_stats(node, &stats);
             }
+            NodeEvent::Observations { rows, events } => {
+                let _ = self.db.put_observations(&rows);
+                let _ = self.db.add_provider_events(&events);
+                for e in &events {
+                    let what = format!("{}/{}", e.provider, e.model);
+                    match e.kind.as_str() {
+                        "credits_exhausted" => self.notify(
+                            "provider.credits_exhausted",
+                            "warning",
+                            format!("{what} is out of credits ({})", e.scope_id),
+                            format!("seen from {} via {}; requests through it are held back for an hour. {}", e.node, e.route, truncate(e.detail["message"].as_str().unwrap_or(""), 300)),
+                            e.session.clone(),
+                        ),
+                        "context_overflow" => {
+                            if let Some(l) = e.detail["limit"].as_u64() {
+                                let configured = self.db.node(node).and_then(|n| n.agents.into_iter().find(|a| a.provider == e.provider && a.model == e.model)).and_then(|a| a.context);
+                                if configured.is_some_and(|c| c > l) {
+                                    self.notify(
+                                        "provider.context_learned",
+                                        "info",
+                                        format!("{what} has a {l}-token window"),
+                                        format!("Its agents are configured for {} tokens; new sessions on {} use {l}. Set `context: {l}` in the template.", configured.unwrap_or(0), e.node),
+                                        e.session.clone(),
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.log(&format!("provider.{}", e.kind), Some(&e.node), e.session.as_deref(), json!({"provider": e.provider, "model": e.model, "scope_id": e.scope_id, "route": e.route, "detail": e.detail}));
+                }
+            }
             NodeEvent::Quotas { buckets } => {
                 // An allowance used up, or back after its reset.
-                let before: std::collections::HashSet<(String, String)> =
-                    self.db.quotas().into_iter().filter(|q| q.node == node && q.exhausted && q.kind == "requests").map(|q| (q.provider, q.scope_id)).collect();
-                for q in buckets.iter().filter(|q| q.kind == "requests") {
-                    let key = (q.provider.clone(), q.scope_id.clone());
+                let gates = |q: &QuotaBucket| q.kind == "requests" || q.unit.is_some();
+                let before: std::collections::HashSet<(String, String, String)> =
+                    self.db.quotas().into_iter().filter(|q| q.node == node && q.exhausted && gates(q)).map(|q| (q.provider, q.scope_id, q.kind)).collect();
+                for q in buckets.iter().filter(|q| gates(q)) {
+                    let key = (q.provider.clone(), q.scope_id.clone(), q.kind.clone());
                     if q.exhausted && !before.contains(&key) {
                         let resets = q.resets_at.map(|t| format!(", resets in {}s", ((t - now_ms()) / 1000).max(0))).unwrap_or_default();
                         self.notify("quota.exhausted", "warning", format!("{} allowance used up on {node}", q.provider), format!("{}{resets}", q.scope_id), Some(format!("{}:{}", q.provider, q.scope_id)));
@@ -535,31 +602,29 @@ impl Sup {
             bail!("only coordinator sessions may use this tool");
         }
         let actor = Actor::Session(from.to_string());
+        let original = call.clone();
         match call {
             AgentCall::Send { to, text, delivery } => {
                 let target = self.session(&to)?;
                 let msg = format!("[message from session {from} ({})]\n{text}", caller.report.agent);
                 self.message(&actor, &target.report.id, &msg, delivery).await?;
+                let now = self.session(&to)?;
+                if delivery != Delivery::Inbox && self.holds_messages(&now) {
+                    return Ok(json!(format!("{to} is {} and not running: held, and delivered when it runs again", now.report.state.as_str())));
+                }
                 Ok(json!(format!("delivered to {to} ({:?})", delivery)))
             }
             AgentCall::Inbox => Ok(Value::Array(self.db.inbox_take(from)?)),
             AgentCall::ListAgents => {
-                let mut out: Vec<Value> = vec![];
-                for n in self.db.nodes().into_iter().filter(|n| n.connected) {
-                    for a in n.agents.iter().filter(|a| a.secret_ok && a.errors.is_empty()) {
-                        out.push(json!({
-                            "agent": a.name,
-                            "description": a.description,
-                            "model": format!("{}/{}", a.provider, a.model),
-                            "node": n.name,
-                            "tier": a.tier,
-                            "source": a.source,
-                            "max_instances": a.max_instances,
-                            "overridable": a.overridable,
-                        }));
+                let mine = self.urgency_of(&caller).level();
+                let mut list = self.availability();
+                for a in &mut list {
+                    if let Some(min) = reserved_above(a, mine) {
+                        a["status"] = json!("reserved");
+                        a["detail"] = json!(format!("a costly model kept for {} work", min.as_str()));
                     }
                 }
-                Ok(Value::Array(out))
+                Ok(Value::Array(list))
             }
             AgentCall::ListNodes => Ok(self.nodes_for_agents()),
             AgentCall::ListSessions => Ok(Value::Array(self.db.sessions(false).iter().filter(|s| s.report.state.is_live()).map(session_brief).collect())),
@@ -571,9 +636,31 @@ impl Sup {
                 v["error"] = json!(s.report.error);
                 Ok(v)
             }
-            AgentCall::Spawn { agent, prompt, node: hint, title, share_workspace, overrides } => {
-                let (workspace, node_hint) = if share_workspace {
-                    let ws = caller.report.workspace.as_deref().and_then(|w| w.strip_prefix("shared:")).map(|n| WorkspaceSpec { mode: WorkspaceMode::Shared, name: Some(n.into()), seed: None });
+            AgentCall::Spawn { agent, prompt, node: hint, title, share_workspace, fork_workspace, overrides, if_busy, wait_max_s, urgency } => {
+                let own = self.urgency_of(&caller);
+                let level = urgency.filter(|u| u.level() < own.level()).unwrap_or(own);
+                if let Some(a) = self.availability().iter().find(|a| a["agent"] == agent) {
+                    if let Some(min) = reserved_above(a, level.level()) {
+                        bail!("{agent} is a costly model kept for {} work; this work is {}. Pick another agent.", min.as_str(), level.as_str());
+                    }
+                }
+                if share_workspace && fork_workspace {
+                    bail!("share_workspace and fork_workspace exclude each other");
+                }
+                let agent_name = agent.clone();
+                // Busy now and the caller is willing to wait: queue it without trying.
+                let behind = self.queued_spawns().iter().any(|q| q.agent == agent && q.urgency.level() >= level.level());
+                if if_busy == IfBusy::Wait && level != TaskLabel::RightNow && (behind || self.agent_waits(&agent).is_some()) {
+                    return self.queue_spawn(from, &original, wait_max_s, level);
+                }
+                let (workspace, node_hint) = if fork_workspace {
+                    // A copy of the caller's workspace, history included, on its own branch.
+                    let label = caller.report.workspace.clone().ok_or_else(|| anyhow!("you have no workspace to fork"))?;
+                    let snap = self.ws_snapshot(&caller.report.node, &label, Some(from), "fork").await?;
+                    let seed = snap["reference"].as_str().ok_or_else(|| anyhow!("snapshot of your workspace returned no reference"))?.to_string();
+                    (Some(WorkspaceSpec { mode: WorkspaceMode::Isolated, name: None, seed: Some(seed), branch: Some("agent/{agent}/{session}".into()) }), hint)
+                } else if share_workspace {
+                    let ws = caller.report.workspace.as_deref().and_then(|w| w.strip_prefix("shared:")).map(|n| WorkspaceSpec { mode: WorkspaceMode::Shared, name: Some(n.into()), seed: None, branch: None });
                     if ws.is_none() {
                         bail!("your workspace is not shareable");
                     }
@@ -595,11 +682,21 @@ impl Sup {
                             parent: Some(from.into()),
                             task_id: caller.task_id,
                             overrides,
+                            urgency: (caller.task_id.and_then(|t| self.db.task(t)).map(|t| t.label) != Some(level)).then_some(level),
                             ..Default::default()
                         },
                     )
-                    .await?;
+                    .await;
+                let s = match s {
+                    Ok(s) => s,
+                    Err(_) if if_busy == IfBusy::Wait && self.agent_waits(&agent_name).is_some() => return self.queue_spawn(from, &original, wait_max_s, level),
+                    Err(e) => return Err(e),
+                };
                 Ok(json!({"session": s.report.id, "node": s.report.node, "note": "You will receive a message when it finishes a turn."}))
+            }
+            AgentCall::Stop { session } if session.starts_with("q-") => {
+                self.cancel_queued_spawn(from, &session)?;
+                Ok(json!("removed from the queue"))
             }
             AgentCall::Stop { session } => {
                 let s = self.session(&session)?;
@@ -767,6 +864,8 @@ pub fn session_brief(s: &SessionInfo) -> Value {
         "cost_usd": s.report.billed().cost_usd,
         "parent": s.parent,
         "waiting_on": s.waiting_on,
+        "paused_for": s.preempted.as_ref().map(|p| &p.by),
+        "held_messages": s.held,
     })
 }
 

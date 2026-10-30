@@ -34,6 +34,8 @@ pub struct Scored {
     pub parts: BTreeMap<&'static str, f64>,
     /// Every route's allowance for the agent's provider is used up here.
     pub exhausted: bool,
+    /// When `exhausted`: the soonest reset.
+    pub resets_at: Option<Ts>,
     pub notes: Vec<String>,
 }
 
@@ -88,7 +90,7 @@ impl Sup {
                 let ip = egress.iter().find(|e| e.node == n.name && &e.route == r).and_then(|e| e.ip.clone());
                 let bs: Vec<&QuotaView> = quotas
                     .iter()
-                    .filter(|q| q.provider == a.provider && q.kind == "requests")
+                    .filter(|q| q.provider == a.provider && q.gates(&a.model))
                     .filter(|q| q.routes.contains(&key) || (q.scope == "ip" && ip.as_deref() == Some(q.scope_id.as_str())))
                     .collect();
                 if let Some(e) = bs.iter().find(|q| q.exhausted) {
@@ -136,7 +138,7 @@ impl Sup {
             let link = n.link_rtt_ms.map_or(0.6, |ms| 1.0 / (1.0 + ms / 200.0));
             let score = w.capacity * capacity + w.quota * quota + w.latency * latency + w.locality * locality + w.link * link;
             let parts = BTreeMap::from([("capacity", capacity), ("quota", quota), ("latency", latency), ("locality", locality), ("link", link)]);
-            out.push(Scored { node: n.name.clone(), score, parts, exhausted: all_exhausted, notes });
+            out.push(Scored { node: n.name.clone(), score, parts, exhausted: all_exhausted, resets_at: soonest.filter(|_| all_exhausted), notes });
         }
         // Nodes that can make progress now come first; within that, by score.
         out.sort_by(|a, b| a.exhausted.cmp(&b.exhausted).then(b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)).then(a.node.cmp(&b.node)));
@@ -149,6 +151,81 @@ impl Sup {
         let ranked = self.rank(agent, &Near::default());
         let any_usable = ranked.iter().any(|s| !s.exhausted);
         ranked.into_iter().filter(|s| !any_usable || !s.exhausted).map(|s| s.node).collect()
+    }
+
+    /// What each agent in the cluster would do if started now (the
+    /// `cluster_list_agents` tool): ready, waiting for an allowance, busy, or
+    /// unavailable, with what the cluster has observed of its model.
+    pub fn availability(&self) -> Vec<Value> {
+        let nodes: Vec<NodeInfo> = self.node_views().into_iter().filter(|n| n.connected && !n.relay && self.nodes.connected(&n.name)).collect();
+        let sessions = self.db.sessions(false);
+        let queued = self.queued_spawns();
+        let now = now_ms();
+        let mut agents: BTreeMap<String, AgentInfo> = BTreeMap::new();
+        for n in &nodes {
+            for a in &n.agents {
+                agents.entry(a.name.clone()).or_insert_with(|| a.clone());
+            }
+        }
+        let learned: BTreeMap<(String, String), u64> = self
+            .db
+            .provider_events(None, Some("context_overflow"), 2000)
+            .into_iter()
+            .filter_map(|e| Some(((e.provider, e.model), e.detail["limit"].as_u64()?)))
+            .fold(BTreeMap::new(), |mut m, (k, l)| {
+                let e = m.entry(k).or_insert(l);
+                *e = (*e).min(l);
+                m
+            });
+        let idle = |filter: &dyn Fn(&SessionInfo) -> bool| -> Vec<Value> {
+            sessions
+                .iter()
+                .filter(|s| s.report.state == SessionState::Idle && filter(s))
+                .map(|s| json!({"session": s.report.id, "agent": s.report.agent, "node": s.report.node, "parent": s.parent, "idle_s": (now - s.report.updated_at) / 1000}))
+                .collect()
+        };
+        agents
+            .into_values()
+            .map(|a| {
+                let ok_nodes: Vec<&NodeInfo> = nodes.iter().filter(|n| n.agents.iter().any(|x| x.name == a.name && x.secret_ok && x.errors.is_empty())).collect();
+                let live = sessions.iter().filter(|s| s.report.agent == a.name && s.report.state.is_live()).count() as u32;
+                let ranked = self.rank(&a.name, &Near::default());
+                let (status, detail, wait_s, idle_list) = if ok_nodes.is_empty() {
+                    ("unavailable", self.why_not(&a.name), None, vec![])
+                } else if a.max_instances.is_some_and(|m| live >= m) {
+                    let name = a.name.clone();
+                    ("busy", format!("all {live} allowed instances are running"), None, idle(&|s: &SessionInfo| s.report.agent == name))
+                } else if let Some(r) = ranked.iter().find(|r| !r.exhausted) {
+                    ("ready", format!("would start on {}", r.node), None, vec![])
+                } else if let Some(t) = ranked.iter().filter_map(|r| r.resets_at).min() {
+                    ("wait_allowance", format!("{}'s allowance is used up on every route; resets in {}", a.provider, human_in(t - now)), Some((t - now).max(0) / 1000), vec![])
+                } else {
+                    let names: Vec<String> = ok_nodes.iter().map(|n| n.name.clone()).collect();
+                    ("busy", format!("every node that has it is full ({})", ok_nodes.iter().map(|n| format!("{} {}/{}", n.name, n.running, n.max_sessions)).collect::<Vec<_>>().join(", ")), None, idle(&|s: &SessionInfo| names.contains(&s.report.node)))
+                };
+                let learned_ctx = learned.get(&(a.provider.clone(), a.model.clone())).copied();
+                json!({
+                    "agent": a.name,
+                    "description": a.description,
+                    "model": format!("{}/{}", a.provider, a.model),
+                    "tier": a.tier,
+                    "status": status,
+                    "detail": detail,
+                    "wait_s": wait_s,
+                    "idle_sessions": idle_list,
+                    "running": live,
+                    "queued": queued.iter().filter(|q| q.agent == a.name).count(),
+                    "max_instances": a.max_instances,
+                    "context": match (a.context, learned_ctx) { (Some(c), Some(l)) => Some(c.min(l)), (c, l) => c.or(l) },
+                    "observed": self.provider_brief(&a.provider, &a.model),
+                    "price_per_mtok": (a.price_in_per_mtok > 0.0 || a.price_out_per_mtok > 0.0).then(|| json!({"input": a.price_in_per_mtok, "output": a.price_out_per_mtok})),
+                    "nodes": ok_nodes.iter().map(|n| n.name.clone()).collect::<Vec<_>>(),
+                    "overridable": a.overridable,
+                    "generic": a.generic,
+                    "min_urgency": a.min_urgency,
+                })
+            })
+            .collect()
     }
 
     /// Why no node can take `agent`, node by node.
@@ -211,8 +288,8 @@ impl Sup {
             .map(|n| {
                 let q: Vec<Value> = quotas
                     .iter()
-                    .filter(|q| q.nodes.contains(&n.name) && q.kind == "requests")
-                    .map(|q| json!({"provider": q.provider, "scope_id": q.scope_id, "remaining": q.remaining, "limit": q.limit, "exhausted": q.exhausted, "resets_in_s": q.resets_at.map(|t| ((t - now_ms()) / 1000).max(0))}))
+                    .filter(|q| q.nodes.contains(&n.name) && (q.kind == "requests" || q.unit.is_some()))
+                    .map(|q| json!({"provider": q.provider, "kind": q.kind, "scope_id": q.scope_id, "remaining": q.remaining, "limit": q.limit, "exhausted": q.exhausted, "resets_in_s": q.resets_at.map(|t| ((t - now_ms()) / 1000).max(0))}))
                     .collect();
                 let lat: Vec<Value> = stats
                     .iter()

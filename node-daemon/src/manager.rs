@@ -27,7 +27,7 @@ use moocher_protocol::model::*;
 use rand::Rng;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -186,6 +186,9 @@ impl Manager {
             NodeCommand::Spawn(spec) => self.spawn(spec).await,
             NodeCommand::Prompt { session, text, delivery } => {
                 let inst = self.get(&session)?;
+                if inst.stopping.load(Ordering::Relaxed) {
+                    bail!("session {session} is stopping");
+                }
                 self.prompt(&inst, &text, delivery).await?;
                 Ok(json!({"ok": true}))
             }
@@ -229,7 +232,7 @@ impl Manager {
                 tracing::info!(workspace, reference, from = ?from_node, applied = %r["applied"], conflicts = %r["conflicts"], "workspace merged");
                 Ok(r)
             }
-            NodeCommand::PlaceArtifact { workspace, reference, dest } => self.gw.files.place(&workspace, &reference, &dest).await,
+            NodeCommand::PlaceArtifact { workspace, reference, dest, merge } => self.gw.files.place(&workspace, &reference, &dest, merge).await,
             NodeCommand::Restart { session, prompt } => {
                 self.restart(&session, &prompt).await?;
                 Ok(json!({"ok": true}))
@@ -248,6 +251,7 @@ impl Manager {
                 Ok(json!({"ok": true}))
             }
             NodeCommand::PromoteRoute { agent, by } => self.promote_route(&agent, &by),
+            NodeCommand::ManagerChat { agent, system, messages, tools } => crate::oneshot::chat(&self.gw, &self.data_root, &agent, &system, &messages, &tools).await,
             NodeCommand::Harvest { session, trigger } => {
                 let inst = self.get(&session)?;
                 let h = self.harvest(&inst, &trigger).await;
@@ -285,6 +289,15 @@ impl Manager {
                 Ok(json!({"ok": true}))
             }
             NodeCommand::SetQuota { ov, clear } => {
+                if let (Some(unit), Some(used)) = (&ov.unit, ov.used) {
+                    // Applied to the counters; nothing to keep in overrides.yaml.
+                    let snap = self.cfg.get();
+                    let spec = snap.providers.get(&ov.provider).and_then(|p| crate::quota::spec_for(p).units.get(unit).cloned()).ok_or_else(|| anyhow!("{} has no unit {unit} on {}", ov.provider, self.node))?;
+                    let scope_id = ov.scope_id.as_deref().ok_or_else(|| anyhow!("calibrating needs a scope id"))?;
+                    self.gw.units.calibrate(&ov.provider, scope_id, unit, ov.model.as_deref(), used, &spec).map_err(|e| anyhow!(e))?;
+                    tracing::info!(provider = %ov.provider, unit, used, "provider unit calibrated");
+                    return Ok(json!({"ok": true}));
+                }
                 self.write_overrides(|o| {
                     let now = now_ms();
                     o.quotas.retain(|x| x.resets_at.is_none_or(|r| r > now) && !(x.provider == ov.provider && x.scope_id == ov.scope_id));
@@ -295,13 +308,13 @@ impl Manager {
                 self.gw.quotas.touch();
                 Ok(json!({"ok": true}))
             }
-            NodeCommand::SyncTemplates { templates, preamble, hash } => {
+            NodeCommand::SyncTemplates { templates, preamble, git, hash } => {
                 if !self.cfg.get().node.hub_templates {
                     return Ok(json!({"ok": true, "ignored": "hub_templates: false on this node"}));
                 }
                 if self.cfg.get().hub_hash != hash {
                     let n = templates.len();
-                    let s = self.cfg.set_hub(&crate::cfgstore::HubSet { templates, preamble, hash })?;
+                    let s = self.cfg.set_hub(&crate::cfgstore::HubSet { templates, preamble, git, hash })?;
                     tracing::info!(templates = n, "hub template library updated");
                     let agents = if s.node.role == NodeRole::Relay { vec![] } else { s.agent_infos() };
                     self.link.emit(NodeEvent::Agents { agents });
@@ -512,8 +525,19 @@ impl Manager {
             }
             tracing::info!(session = %spec.id, seed, files = n, "workspace seeded");
         }
+        // A forked workspace works on its own branch.
+        if let Some(b) = ws_spec.branch.as_deref().filter(|_| fresh) {
+            let name = b.replace("{session}", &spec.id).replace("{agent}", &spec.agent);
+            let scratch = self.gw.files.cas.tmp_path("git");
+            match self.gw.files.git.branch(&paths.workspace, &scratch, &name).await {
+                Ok(r) => tracing::info!(session = %spec.id, result = %r, "workspace branch"),
+                Err(e) => tracing::warn!(session = %spec.id, error = %format!("{e:#}"), "could not create the workspace branch"),
+            }
+            let _ = std::fs::remove_dir_all(&scratch);
+        }
         let gw_port = self.rt.gateway_port(&spec.id)?;
-        write_opencode_config(&snap, &agent, &spec, &paths, gw_port, &cap, self.rt.kind)?;
+        let learned = self.gw.obs.learned_context(&agent.cfg.provider.id, &agent.cfg.provider.model);
+        write_opencode_config(&snap, &agent, &spec, &paths, gw_port, &cap, self.rt.kind, learned)?;
 
         let now = now_ms();
         let report = SessionReport {
@@ -1209,7 +1233,9 @@ impl Manager {
                     ..Default::default()
                 };
                 let globby = o.path.contains(['*', '?', '[', '{']);
-                let res = if globby {
+                let res = if o.git {
+                    self.gw.files.put_git(&root, o.path.trim_end_matches('/'), info).await
+                } else if globby {
                     self.gw.files.put_glob(&root, &o.path, info).await.map(|r| r.map(|(m, _)| m))
                 } else if root.join(o.path.trim_end_matches('/')).exists() {
                     self.gw.files.put_path(&root, o.path.trim_end_matches('/'), info).await.map(Some)
@@ -1225,6 +1251,7 @@ impl Manager {
                         kind: m.kind,
                         to: o.to.clone(),
                         dest: o.dest.clone(),
+                        merge: o.merge,
                         delivered: None,
                     }),
                     Ok(None) => h.missing.push(o.path.clone()),
@@ -1649,6 +1676,73 @@ fn oc_provider_id(snap: &Snapshot, provider: &str) -> String {
     }
 }
 
+/// Hooks every git command in the instance runs (repository hooks still run
+/// first), and the environment that points git at them. Written to
+/// `etc/git.env` (KEY=VALUE lines) for the runtime to pass on at launch.
+const GIT_HOOKS: [&str; 14] = [
+    "applypatch-msg", "pre-applypatch", "post-applypatch", "pre-commit", "pre-merge-commit", "prepare-commit-msg", "commit-msg",
+    "post-commit", "pre-rebase", "post-checkout", "post-merge", "pre-push", "post-rewrite", "pre-auto-gc",
+];
+
+const DEFAULT_GIT_NAME: &str = "moocher agent";
+const DEFAULT_GIT_EMAIL: &str = "agent@moocher.invalid";
+
+fn write_git_setup(git: &moocher_protocol::config::GitConfig, etc: &Path, etc_in_runtime: &str, note: &[(&str, String)]) -> Result<()> {
+    let clean = |v: &str| v.chars().filter(|c| !c.is_control()).collect::<String>();
+    let mut env: Vec<(String, String)> = vec![];
+    // Without a configured identity git refuses to commit in a fresh container.
+    let name = clean(git.name.as_deref().unwrap_or(DEFAULT_GIT_NAME));
+    let email = clean(git.email.as_deref().unwrap_or(DEFAULT_GIT_EMAIL));
+    for (k, v) in [("GIT_AUTHOR_NAME", &name), ("GIT_COMMITTER_NAME", &name), ("GIT_AUTHOR_EMAIL", &email), ("GIT_COMMITTER_EMAIL", &email)] {
+        env.push((k.into(), v.clone()));
+    }
+    let hooks = etc.join("git-hooks");
+    let _ = std::fs::remove_dir_all(&hooks);
+    if git.notes {
+        std::fs::create_dir_all(&hooks)?;
+        let body: String = note.iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| format!("moocher-{k}: {}\n", clean(v).replace('\'', ""))).collect();
+        for h in GIT_HOOKS {
+            let mut sh = format!(
+                "#!/bin/sh\n# moocher: run the repository's own {h} hook first.\n\
+                 d=$(git config --local --get core.hooksPath 2>/dev/null)\n\
+                 if [ -n \"$d\" ]; then case \"$d\" in /*) ;; *) d=\"$(git rev-parse --show-toplevel)/$d\";; esac\n\
+                 else d=\"$(git rev-parse --git-common-dir)/hooks\"; fi\n\
+                 if [ -x \"$d/{h}\" ]; then \"$d/{h}\" \"$@\" || exit $?; fi\n"
+            );
+            if h == "post-commit" {
+                sh.push_str(&format!(
+                    "# Which agent made this commit (git log --notes=moo).\n\
+                     git -c user.name=moocher -c user.email=moocher@localhost notes --ref=moo add -f -m '{body}' HEAD >/dev/null 2>&1 || true\n"
+                ));
+            }
+            sh.push_str("exit 0\n");
+            let p = hooks.join(h);
+            std::fs::write(&p, sh)?;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let cfgs = [("core.hooksPath", format!("{etc_in_runtime}/git-hooks")), ("notes.rewriteRef", "refs/notes/moo".into()), ("notes.displayRef", "refs/notes/moo".into())];
+        env.push(("GIT_CONFIG_COUNT".into(), cfgs.len().to_string()));
+        for (i, (k, v)) in cfgs.into_iter().enumerate() {
+            env.push((format!("GIT_CONFIG_KEY_{i}"), k.into()));
+            env.push((format!("GIT_CONFIG_VALUE_{i}"), v));
+        }
+    }
+    let text: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+    std::fs::write(etc.join("git.env"), text)?;
+    Ok(())
+}
+
+/// `etc/git.env` of an instance (see `write_git_setup`).
+pub fn read_git_env(etc: &Path) -> Vec<(String, String)> {
+    std::fs::read_to_string(etc.join("git.env"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+        .filter(|(k, _)| k.starts_with("GIT_"))
+        .collect()
+}
+
 fn write_opencode_config(
     snap: &Snapshot,
     agent: &LoadedAgent,
@@ -1657,8 +1751,12 @@ fn write_opencode_config(
     gw_port: u16,
     cap: &str,
     kind: RuntimeKind,
+    learned_context: Option<u64>,
 ) -> Result<()> {
     let a = &agent.cfg;
+    // A window the provider itself named in an overflow error beats the
+    // configured one, so OpenCode compacts before the provider refuses.
+    let context = a.provider.context.unwrap_or(128_000).min(learned_context.unwrap_or(u64::MAX));
     let pdef = snap.providers.get(&a.provider.id).ok_or_else(|| anyhow!("unknown provider {}", a.provider.id))?;
     let pid = oc_provider_id(snap, &a.provider.id);
     let gw = format!("http://127.0.0.1:{gw_port}");
@@ -1673,7 +1771,14 @@ fn write_opencode_config(
     let outputs = if a.outputs.is_empty() {
         String::new()
     } else {
-        let list: Vec<String> = a.outputs.iter().map(|o| format!("`{}` → {}", o.path, o.to.replace('_', " "))).collect();
+        let list: Vec<String> = a
+            .outputs
+            .iter()
+            .map(|o| match o.git {
+                true => format!("the git history (commit your work!) of {} → {}", if o.path.is_empty() { "the workspace's repository".to_string() } else { format!("`{}`", o.path) }, o.to.replace('_', " ")),
+                false => format!("`{}` → {}", o.path, o.to.replace('_', " ")),
+            })
+            .collect();
         format!("When you finish, these are collected from your workspace: {}.", list.join(", "))
     };
     let vars: [(&str, String); 10] = [
@@ -1698,6 +1803,11 @@ fn write_opencode_config(
     }
     role.push_str(&agent.role_text);
     role.push('\n');
+    if let Some(p) = &spec.overrides.system_prompt {
+        // A generic agent's specialization, chosen by its spawner.
+        role.push_str(p);
+        role.push('\n');
+    }
     if let Some(extra) = &spec.extra_instructions {
         role.push('\n');
         role.push_str(extra);
@@ -1709,6 +1819,14 @@ fn write_opencode_config(
         role.push('\n');
     }
     std::fs::write(paths.etc.join("ROLE.md"), role)?;
+    write_git_setup(&snap.git(), &paths.etc, &etc_in_runtime, &[
+        ("agent", a.name.clone()),
+        ("session", spec.id.clone()),
+        ("model", format!("{}/{}", a.provider.id, a.provider.model)),
+        ("node", snap.node.name.clone()),
+        ("task", spec.task.map(|t| t.to_string()).unwrap_or_default()),
+        ("parent", spec.parent.clone().unwrap_or_default()),
+    ])?;
     let (provider, model) = if pdef.api == ApiKind::Opencode {
         // OpenCode's built-in provider, from the catalog bundled in the binary:
         // the empty cache written by prepare_dirs would hide it.
@@ -1727,7 +1845,7 @@ fn write_opencode_config(
                     a.provider.model.clone(): {
                         "name": a.provider.model,
                         "tool_call": true,
-                        "limit": {"context": a.provider.context.unwrap_or(128_000), "output": a.provider.max_output.unwrap_or(16_384)}
+                        "limit": {"context": context, "output": a.provider.max_output.unwrap_or(16_384).min(context / 2)}
                     }
                 }
             }

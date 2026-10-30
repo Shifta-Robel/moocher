@@ -207,6 +207,7 @@ sequenceDiagram
   - `queue` (default): picked up at the agent's next step. This is how an operator changes course mid-run, and it was verified in the demo.
   - `steer`: abort the current step and deliver now.
   - `inbox`: the agent pulls it with `cluster_read_inbox`.
+  - A session that is not running gets neither of the first two: the hub holds the message (`held` table) and delivers everything in one digest, marked as past events, once it reports running again (`supervisor/src/held.rs`).
 
   Messages carry `art://` references (`send_message(…, artifacts=[…])`), never file bytes.
 - **Workflows.** Workflows are YAML state machines (`steps: build → review`). Each step has an agent profile, a prompt template (`{{input}}`, `{{prev.output}}`, `{{feedback}}`, …), seeded todos, checks, and `next` / `on_fail` transitions. `max_step_runs` bounds review↔build loops. Step state is persisted. All steps of a run share one workspace, so in Phase 1 a run is placed on a node that has every step's agent. Free-form messaging between any two sessions sits alongside workflows.
@@ -225,10 +226,14 @@ The operator keeps a **bucket of tasks** (CLI, dashboard and TUI) and the cluste
 
 | Label | When it starts |
 |---|---|
+| `right_now` | At once, ignoring the task cap. Less urgent sessions are paused for the room it needs, and nothing lower starts or resumes until it is done. |
 | `urgent` | As soon as a task slot is free. One slot beyond `max_concurrent_tasks` is reserved for urgent work, so it never waits behind routine tasks. |
+| `normal` | When fewer than `max_concurrent_tasks` tasks are running. |
 | `when_free` | Only when no task is running **and** every session in the cluster has been idle for `idle_grace_secs`. |
 | `on_demand` | Never automatically; the operator presses **Run**. |
 
+- **Spawns:** a session's urgency is its task's, unless it was spawned lower; agents cannot raise it. The spawn queue serves higher urgency first, then arrival order.
+- **Preemption** (`supervisor/src/preempt.rs`): a `right_now` spawn with no room halts one session at a time (harvested, container kept): idle ones first, then running ones from `when_free` up, workers before coordinators, until it fits. Other `right_now` work, its own task, sessions started by hand and sessions waiting on a question or still booting are left alone. Paused sessions restart once no `right_now` work is left. Budgets and provider allowances still apply.
 - **Order:** within a label, lower `rank` runs first. Sorting in the UI rewrites ranks (`POST /api/v1/tasks/reorder {ids:[…]}`).
 - **Starting a task** spawns a **coordinator session** (the `coordinator` agent profile, configurable) on any node that has it. The coordinator:
   - gets the task as its prompt;
@@ -296,7 +301,7 @@ Agents use `cluster_artifact_put/get` or `cluster_sync_workspace`, and the opera
 1. The holder node packs its copy as a tree artifact (tar.zst; regular files and directories only, links never followed).
 2. The other node merges it file by file against the last manifest both sides agreed on (kept per node and workspace). A file changed on one side takes that side; changed on both, the local version stays and the incoming one lands as `<file>.theirs`.
 
-This needs no git in the workspace and behaves the same for any tree. Syncs happen before a session starts on a node whose copy may be behind, after each turn towards other machines with live sessions, and on `cluster_sync_workspace`. The hub records the latest snapshot per workspace, so a node that never had it (or replaces a lost one) starts from there.
+This needs no git in the workspace and behaves the same for any tree. Git repositories inside it are the exception to "by file": `.git` is left out of the manifest and the merge (a file-wise merge corrupts it). Each repository's branches, tags and `refs/notes/moo` travel in the same snapshot as a git bundle under `.moo-git/`; the receiving node fetches it as `refs/remotes/moo-<node>/…` and fast-forwards its own branches (the checked-out one with `reset --mixed`, since the files were merged already). Branches that diverged stay apart and the agents are told. Git runs in a throwaway, network-less container of the agent image, never on the host, because the repository's config and hooks are the agent's. Whether a repository changed is decided host-side from its refs, read without git, so an unchanged workspace costs no container. Syncs happen before a session starts on a node whose copy may be behind, after each turn towards other machines with live sessions, and on `cluster_sync_workspace`. The hub records the latest snapshot per workspace, so a node that never had it (or replaces a lost one) starts from there.
 
 ## 7. Artifacts
 

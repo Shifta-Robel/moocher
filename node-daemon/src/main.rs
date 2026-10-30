@@ -7,11 +7,15 @@ mod disk_quota;
 mod egress;
 mod egress_proxy;
 mod gateway;
+mod gitops;
 mod link;
 mod manager;
+mod oneshot;
+mod obs;
 mod oc;
 mod pki;
 mod quota;
+mod units;
 mod relay;
 mod runtime;
 mod secrets;
@@ -192,8 +196,10 @@ async fn run(dir: PathBuf) -> Result<()> {
     let quotas = Arc::new(quota::Quotas::new(&node_name, store.clone()));
     let cache_max = moocher_protocol::model::parse_size(&cfg.get().node.artifact_cache).unwrap_or(2 << 30);
     let cas = Arc::new(cas::Cas::new(data_dir.join("cas"), link.clone(), &node_name, cache_max)?);
-    let files = Arc::new(wsops::WsOps::new(cas, store.clone(), data_dir.clone(), rt.chown_target()));
-    let deps = gateway::GatewayDeps { cfg: cfg.clone(), link: link.clone(), egress: egress.clone(), quotas: quotas.clone(), files };
+    let files = Arc::new(wsops::WsOps::new(cas, store.clone(), data_dir.clone(), rt.chown_target(), rt.git_runner(cfg.clone())));
+    let obs = obs::Observer::new(&node_name, store.clone());
+    let units = Arc::new(units::Units::new(&node_name, store.clone()));
+    let deps = gateway::GatewayDeps { cfg: cfg.clone(), link: link.clone(), egress: egress.clone(), quotas: quotas.clone(), units: units.clone(), files, obs: obs.clone() };
     let mgr = manager::Manager::new(cfg.clone(), store, rt, link.clone(), deps)?;
     tracing::info!(node = %node_name, supervisor = %supervisor, data = %mgr.data_root().display(), "starting");
 
@@ -256,17 +262,35 @@ async fn run(dir: PathBuf) -> Result<()> {
             }
         });
     }
+    // What keyproxy saw of providers: once a minute when something changed.
+    {
+        let (obs, link) = (obs.clone(), link.clone());
+        let every = std::env::var("MOO_OBS_INTERVAL_S").ok().and_then(|v| v.parse().ok()).unwrap_or(60u64).max(1);
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(std::time::Duration::from_secs(every));
+            loop {
+                iv.tick().await;
+                if let Some((rows, events)) = obs.take() {
+                    link.emit(NodeEvent::Observations { rows, events });
+                }
+            }
+        });
+    }
     // Quota buckets: persist and report changes (at most every 3 s).
     {
-        let (quotas, cfg, link) = (quotas.clone(), cfg.clone(), link.clone());
+        let (quotas, units, cfg, link) = (quotas.clone(), units.clone(), cfg.clone(), link.clone());
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(std::time::Duration::from_secs(3));
             loop {
                 iv.tick().await;
-                if quotas.flush() {
+                let (a, b) = (quotas.flush(), units.flush());
+                if a || b {
                     let s = cfg.get();
                     let limits = s.providers.iter().map(|(k, p)| (k.clone(), quota::spec_for(p).limits)).collect();
-                    link.emit(NodeEvent::Quotas { buckets: quotas.snapshot(&limits, &s.overrides.quotas) });
+                    let specs = s.providers.iter().map(|(k, p)| (k.clone(), quota::spec_for(p).units)).collect();
+                    let mut buckets = quotas.snapshot(&limits, &s.overrides.quotas);
+                    buckets.extend(units.snapshot(&specs));
+                    link.emit(NodeEvent::Quotas { buckets });
                 }
             }
         });

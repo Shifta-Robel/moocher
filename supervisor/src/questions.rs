@@ -409,7 +409,7 @@ impl Sup {
                 let mut s2 = s.clone();
                 s2.waiting_on.retain(|w| w != &q.id);
                 self.save_session(&s2);
-                if s.report.state.is_live() {
+                if s.report.state.is_live() || self.holds_messages(&s) {
                     self.message(&Actor::System, &q.asker, &body, Delivery::Queue).await?;
                 }
             }

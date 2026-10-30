@@ -10,10 +10,22 @@ export default function Quotas() {
   const [edit, setEdit] = createSignal<Quota | null>(null);
   const [remaining, setRemaining] = createSignal("");
   const [resets, setResets] = createSignal("");
+  const [unitUsed, setUnitUsed] = createSignal("");
   const providers = () => [...new Set(state.quotas.map((q) => q.provider))].sort();
   const sharers = (ip: string) => egress()?.shared?.find((s: any) => s.ip === ip)?.nodes?.length ?? 1;
   const save = async (clear = false) => {
     const q = edit()!;
+    if (q.unit) {
+      const r = await act(
+        () => post("/quotas/override", { provider: q.provider, scope_id: q.scope_id, unit: q.unit!.name, used: Number(unitUsed()), model: q.unit!.model ?? undefined, note: "set from the dashboard" }),
+        "Calibrated",
+      );
+      if (r) {
+        setEdit(null);
+        setTimeout(() => refreshQuotas(), 800);
+      }
+      return;
+    }
     const at = resets() ? new Date(resets()).getTime() : undefined;
     const r = await act(
       () => post("/quotas/override", { provider: q.provider, scope_id: q.scope_id, remaining: remaining() === "" ? undefined : Number(remaining()), resets_at: at, clear, note: "set from the dashboard" }),
@@ -47,11 +59,18 @@ export default function Quotas() {
                             <For each={q.nodes}>{(n) => <NodeChip name={n} />}</For>
                             <span class="text-slate-500">{q.sessions.length ? `used by ${q.sessions.length}` : ""}</span>
                           </div>
-                          <Button size="sm" variant="ghost" class="shrink-0" onClick={() => { setRemaining(""); setResets(""); setEdit(q); }}>
-                            override
+                          <Button size="sm" variant="ghost" class="shrink-0" onClick={() => { setRemaining(""); setResets(""); setUnitUsed(""); setEdit(q); }}>
+                            {q.unit ? "calibrate" : "override"}
                           </Button>
                         </div>
                         <QuotaBar used={q.used} limit={q.limit} remaining={q.remaining} exhausted={q.exhausted} resets={q.resets_at} />
+                        <For each={q.unit?.rates ?? []}>
+                          {(r) => (
+                            <p class="mt-1 break-words text-xs text-slate-500">
+                              {r.model}: 1 {q.unit!.name} buys ~{Math.round(1e6 / r.units_per_mtok).toLocaleString()} tokens ({r.source})
+                            </p>
+                          )}
+                        </For>
                       </div>
                     )}
                   </For>
@@ -87,7 +106,17 @@ export default function Quotas() {
         </table>
       </Card>
       <Modal open={!!edit()} onClose={() => setEdit(null)} title={`Override ${edit()?.provider ?? ""} · ${edit()?.scope_id ?? ""}`}>
-        <div class="space-y-3">
+        <Show when={edit()?.unit}>
+          <div class="space-y-3">
+            <Field label={`${edit()?.unit?.name ?? ""} used so far`} hint="what the provider's dashboard shows for this window; also teaches what your tokens cost">
+              <input class={inputCls} type="number" min="0" step="any" value={unitUsed()} onInput={(e) => setUnitUsed(e.currentTarget.value)} />
+            </Field>
+            <div class="flex justify-end">
+              <Button variant="primary" disabled={unitUsed() === ""} onClick={() => save(false)}>Save</Button>
+            </div>
+          </div>
+        </Show>
+        <div class="space-y-3" classList={{ hidden: !!edit()?.unit }}>
           <Field label="Remaining requests" hint="0 = used up">
             <input class={inputCls} type="number" min="0" value={remaining()} onInput={(e) => setRemaining(e.currentTarget.value)} />
           </Field>

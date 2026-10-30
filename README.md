@@ -17,7 +17,14 @@ Status: **Phase 5 complete** (Phases 1–4 plus hardening):
 - **harvesting** of declared outputs and transcripts when an instance ends, and retention of its volumes;
 - the **web dashboard** (every view, dark/light, phone layout), **Open in OpenCode** for any instance, notifications to your phone (Web Push), ntfy or a webhook, and a terminal dashboard.
 
-Verified with seventeen end-to-end suites (`tests/e2e/`), including a real browser, an ACME CA, and load and chaos tests. Phase 5 adds the hardening: keyproxy usage metering, egress allowlists, hard disk quotas, event export and artifact expiry, and systemd/Quadlet units. See [docs/PHASE5.md](docs/PHASE5.md).
+Since then:
+- **provider units**, **generic agents** (just a model; the spawner gives the role) and models reserved with `min_urgency`;
+- four **urgency levels**: `right_now` pauses less urgent work, which resumes afterwards;
+- messages for a paused or dead session are **held** and delivered in order, marked as past events;
+- a **manager** that answers questions about the cluster and opens the right page, keeping nothing (`moo ask`, or the dashboard button);
+- a **work map** showing each task's agents as a graph.
+
+Verified with end-to-end suites (`tests/e2e/`), including a real browser, an ACME CA, and load and chaos tests. Phase 5 adds the hardening: keyproxy usage metering, egress allowlists, hard disk quotas, event export and artifact expiry, and systemd/Quadlet units. See [docs/PHASE5.md](docs/PHASE5.md).
 
 ```bash
 examples/quickstart/run-local.sh --with-worker   # full demo with a mock LLM
@@ -28,7 +35,7 @@ Docs:
 - [Quickstart](docs/QUICKSTART.md)
 - [Usage guide](docs/USAGE.md) (extensive examples)
 - [Config reference](docs/CONFIG.md)
-- [Runbook](docs/RUNBOOK.md) (enroll machines, rotate credentials, debug)
+- [Runbook](docs/RUNBOOK.md) (enroll machines, rotate credentials, debug, upgrade)
 - [Phase 5 report](docs/PHASE5.md)
 - [Phase 4 report](docs/PHASE4.md)
 - [Phase 3 report](docs/PHASE3.md)

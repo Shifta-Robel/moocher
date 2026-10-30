@@ -28,6 +28,36 @@ pub struct FileEntry {
 /// Relative path (with `/`) -> file.
 pub type Manifest = BTreeMap<String, FileEntry>;
 
+/// Snapshots of a workspace carry each git repository's history as a bundle
+/// under this directory (`.moo-git/bundle` for a repo at the root,
+/// `.moo-git/<dir>/bundle` for one in `<dir>`), never `.git` itself: a
+/// file-by-file merge of `.git` corrupts it.
+pub const GIT_BUNDLES: &str = ".moo-git";
+
+/// Paths a workspace sync leaves alone: anything inside a `.git` directory
+/// (or a `.git` file of a worktree/submodule) and the bundle area.
+pub fn is_git_internal(rel: &str) -> bool {
+    rel == GIT_BUNDLES || rel.starts_with(".moo-git/") || rel.split('/').any(|c| c == ".git")
+}
+
+/// Archive path of the bundle of the repository in `repo` ("" = root).
+pub fn bundle_entry(repo: &str) -> String {
+    if repo.is_empty() {
+        format!("{GIT_BUNDLES}/bundle")
+    } else {
+        format!("{GIT_BUNDLES}/{repo}/bundle")
+    }
+}
+
+/// The repository directory a bundle entry belongs to.
+pub fn bundle_repo(entry: &str) -> Option<String> {
+    let rest = entry.strip_prefix(".moo-git/")?;
+    if rest == "bundle" {
+        return Some(String::new());
+    }
+    rest.strip_suffix("/bundle").filter(|r| !r.is_empty()).map(String::from)
+}
+
 /// Hash of a manifest: equal trees have equal digests.
 pub fn manifest_digest(m: &Manifest) -> String {
     let mut h = blake3::Hasher::new();
@@ -198,9 +228,23 @@ pub fn manifest(root: &Path, sub: &str, skip: &dyn Fn(&str) -> bool) -> Result<(
 
 /// Pack the files of `m` (relative to `root`) into a tar.zst at `out`.
 pub fn pack(root: &Path, m: &Manifest, out: &Path) -> Result<()> {
+    pack_with(root, m, &[], out)
+}
+
+/// `pack`, plus trusted files from outside the workspace (archive path, source).
+pub fn pack_with(root: &Path, m: &Manifest, extra: &[(String, PathBuf)], out: &Path) -> Result<()> {
     let f = File::create(out)?;
     let enc = zstd::stream::write::Encoder::new(f, 3)?;
     let mut tar = tar::Builder::new(enc);
+    for (rel, src) in extra {
+        let file = File::open(src)?;
+        let mut h = tar::Header::new_gnu();
+        h.set_size(file.metadata()?.len());
+        h.set_mode(0o644);
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_cksum();
+        tar.append_data(&mut h, rel, file)?;
+    }
     for (rel, e) in m {
         let file = open_inside(root, rel)?;
         let mut h = tar::Header::new_gnu();
@@ -337,6 +381,22 @@ mod tests {
         let p = root.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, body).unwrap();
+    }
+
+    #[test]
+    fn git_internals_and_bundle_paths() {
+        for p in [".git", ".git/HEAD", "sub/.git/config", "sub/.git", ".moo-git/bundle", ".moo-git"] {
+            assert!(is_git_internal(p), "{p}");
+        }
+        for p in ["a.git", ".gitignore", "x/.github/ci.yml", "moo-git/bundle"] {
+            assert!(!is_git_internal(p), "{p}");
+        }
+        assert_eq!(bundle_entry(""), ".moo-git/bundle");
+        assert_eq!(bundle_entry("app/core"), ".moo-git/app/core/bundle");
+        assert_eq!(bundle_repo(".moo-git/bundle").as_deref(), Some(""));
+        assert_eq!(bundle_repo(".moo-git/app/core/bundle").as_deref(), Some("app/core"));
+        assert_eq!(bundle_repo(".moo-git/other"), None);
+        assert_eq!(bundle_repo("src/bundle"), None);
     }
 
     #[test]

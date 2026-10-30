@@ -6,18 +6,23 @@ mod attach;
 mod auth;
 mod db;
 mod link;
+mod manager;
 mod nodes;
 mod notify;
+mod observe;
 mod orch;
 mod pki;
 mod placement;
 mod questions;
+mod held;
 mod quotas;
 mod recovery;
 mod resources;
 mod state;
 mod templates;
 mod retention;
+mod preempt;
+mod spawnq;
 mod tlslink;
 mod web;
 mod workspaces;
@@ -356,6 +361,17 @@ async fn run(dir: PathBuf, cfg: SupervisorConfig) -> Result<()> {
             loop {
                 iv.tick().await;
                 sup.schedule(&mut idle_since).await;
+                sup.resume_preempted().await;
+            }
+        });
+    }
+    {
+        let sup = sup.clone();
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                iv.tick().await;
+                sup.retry_queued_spawns().await;
             }
         });
     }

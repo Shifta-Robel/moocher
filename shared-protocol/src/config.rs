@@ -89,6 +89,32 @@ pub struct NodeConfig {
     /// Local artifact cache size; least recently used blobs are dropped beyond it.
     #[serde(default = "default_cache_size")]
     pub artifact_cache: String,
+    /// Commit identity and notes for this node's agents when the hub sends
+    /// none (the hub's `git:` wins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitConfig>,
+}
+
+/// How agents commit (`git:` in supervisor.yaml, pushed to every node).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GitConfig {
+    /// Author and committer of every agent commit (default `moocher agent
+    /// <agent@moocher.invalid>`; the note says which agent it was).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// Record which agent, model, node and task made each commit as a git
+    /// note in `refs/notes/moo` (`git log --notes=moo`).
+    #[serde(default = "default_true")]
+    pub notes: bool,
+}
+
+impl Default for GitConfig {
+    fn default() -> Self {
+        GitConfig { name: None, email: None, notes: true }
+    }
 }
 
 fn default_checkpoint_turns() -> u32 {
@@ -248,6 +274,21 @@ pub struct SupervisorConfig {
     pub login: LoginConfig,
     #[serde(default)]
     pub notifications: NotificationsConfig,
+    /// Commit identity and notes for every agent (pushed to the nodes).
+    #[serde(default)]
+    pub git: GitConfig,
+    /// The manager: answers questions about the cluster and finds pages.
+    #[serde(default)]
+    pub manager: ManagerConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ManagerConfig {
+    /// The agent whose provider, model and key it uses (a small `kind: generic`
+    /// one will do). Off when unset. It runs no instance and takes no slot.
+    #[serde(default)]
+    pub agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -575,6 +616,8 @@ impl Default for SupervisorConfig {
             attach_url: None,
             login: LoginConfig::default(),
             notifications: NotificationsConfig::default(),
+            git: GitConfig::default(),
+            manager: ManagerConfig::default(),
         }
     }
 }
@@ -692,7 +735,14 @@ pub struct TaskSchedulerConfig {
     /// Pin coordinators to a node (default: any node that has the profile).
     #[serde(default)]
     pub coordinator_node: Option<String>,
-    /// Upper bound on tasks running at once. `urgent` tasks may use one extra slot.
+    /// Coordinator for `right_now` tasks, e.g. a stronger model (default: `coordinator_agent`).
+    #[serde(default)]
+    pub coordinator_agent_right_now: Option<String>,
+    /// `right_now` work may also pause sessions started by hand (no task).
+    #[serde(default)]
+    pub preempt_operator_sessions: bool,
+    /// Upper bound on tasks running at once. `urgent` tasks may use one extra
+    /// slot; `right_now` tasks ignore it.
     #[serde(default = "default_max_tasks")]
     pub max_concurrent_tasks: u32,
     /// `when_free` tasks start only after the cluster has been idle this long.
@@ -711,6 +761,8 @@ impl Default for TaskSchedulerConfig {
         TaskSchedulerConfig {
             coordinator_agent: default_coordinator(),
             coordinator_node: None,
+            coordinator_agent_right_now: None,
+            preempt_operator_sessions: false,
             max_concurrent_tasks: default_max_tasks(),
             idle_grace_secs: default_idle_grace(),
             max_nudges: default_nudges(),
@@ -783,6 +835,64 @@ pub struct QuotaSpec {
     /// Signals trusted over the configured limits.
     #[serde(default = "default_learn")]
     pub learn: Vec<QuotaLearn>,
+    /// The provider's own units (neurons, pollen, credits, …) by name: what
+    /// one call costs in them, how many you get, and how many of your tokens
+    /// one buys (learned).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub units: BTreeMap<String, UnitSpec>,
+}
+
+/// One provider unit (`quota.units.<name>`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UnitSpec {
+    /// Allowances in this unit (the same windows as request limits).
+    #[serde(default)]
+    pub limits: Vec<UnitLimit>,
+    /// Each model draws from its own pool (default: all models of the
+    /// provider share one, per key / IP / account as `scope:` says).
+    #[serde(default)]
+    pub per_model: bool,
+    /// Where a call's cost in this unit is read from: a response header
+    /// (`header: x-neurons`), a number in the usage the provider reports
+    /// (`usage_field: cost`, i.e. `usage.cost`), or neither (estimated from
+    /// `per_mtok`, then from what was measured or calibrated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_field: Option<String>,
+    /// Starting estimate: units per million input / output tokens, per model
+    /// (`default` for the rest).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub per_mtok: BTreeMap<String, UnitRate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UnitRate {
+    pub input: f64,
+    pub output: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UnitLimit {
+    pub max: f64,
+    /// `1d`, `5h`, `30d` …
+    pub window: String,
+    #[serde(default)]
+    pub at: Option<String>,
+    #[serde(default)]
+    pub tz: Option<String>,
+    #[serde(default)]
+    pub rolling: bool,
+}
+
+impl UnitLimit {
+    /// The same window as a request limit (for the window arithmetic).
+    pub fn as_quota_limit(&self) -> QuotaLimit {
+        QuotaLimit { kind: QuotaKind::Requests, max: self.max.ceil() as u64, window: self.window.clone(), at: self.at.clone(), tz: self.tz.clone(), rolling: self.rolling }
+    }
 }
 
 fn default_learn() -> Vec<QuotaLearn> {
@@ -1080,7 +1190,7 @@ pub struct OverridesFile {
 }
 
 /// "On this node, provider X's bucket resets at T / has N left."
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QuotaOverride {
     pub provider: String,
@@ -1093,6 +1203,15 @@ pub struct QuotaOverride {
     /// Requests left until `resets_at` (0 = exhausted until then).
     #[serde(default)]
     pub remaining: Option<u64>,
+    /// Calibrate a provider unit (`quota.units`) instead: how much of it the
+    /// provider says is used in the current window. Applied once (not stored).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<f64>,
+    /// With `unit`: only this model's pool (`per_model` units).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(default)]
     pub note: Option<String>,
     #[serde(default)]
@@ -1140,6 +1259,10 @@ pub struct AgentConfig {
     /// What whoever spawns an instance (operator or coordinator) may change.
     #[serde(default)]
     pub overridable: Overridable,
+    /// Reserve a costly model: agents can only start this from work at least
+    /// this urgent (`right_now`, `urgent`, `normal`). Starting it by hand always works.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_urgency: Option<crate::model::TaskLabel>,
     /// Files collected when the instance stops, dies or its task ends.
     #[serde(default)]
     pub outputs: Vec<OutputSpec>,
@@ -1164,7 +1287,9 @@ fn default_retain() -> String {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OutputSpec {
-    /// File, directory or glob relative to the workspace (`report.md`, `dist/`, `**/*.whl`).
+    /// File, directory or glob relative to the workspace (`report.md`, `dist/`,
+    /// `**/*.whl`). With `git: true`, the repository's directory (default: the root).
+    #[serde(default)]
     pub path: String,
     /// `artifact` (default), `parent_workspace`, `task_workspace` or
     /// `workspace:<name>` (a shared workspace).
@@ -1176,6 +1301,35 @@ pub struct OutputSpec {
     /// Artifact name (default: the path).
     #[serde(default)]
     pub name: Option<String>,
+    /// Hand back the git history instead of files: every branch and tag (and
+    /// the `refs/notes/moo` notes) as a bundle. The destination repository
+    /// fetches them as `refs/remotes/<session>/…`; see `merge`.
+    #[serde(default)]
+    pub git: bool,
+    /// With `git: true`, what happens to the destination's checked-out branch:
+    /// `ff` (default) fast-forwards it to this instance's HEAD when possible,
+    /// `merge` merges (aborted on conflicts), `none` only fetches.
+    #[serde(default)]
+    pub merge: GitMerge,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GitMerge {
+    None,
+    #[default]
+    Ff,
+    Merge,
+}
+
+impl GitMerge {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GitMerge::None => "none",
+            GitMerge::Ff => "ff",
+            GitMerge::Merge => "merge",
+        }
+    }
 }
 
 fn default_output_to() -> String {
@@ -1241,6 +1395,9 @@ pub struct Overridable {
 pub struct SpawnOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_append: Option<String>,
+    /// The specialization of a `kind: generic` agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1255,6 +1412,11 @@ impl SpawnOverrides {
     /// Why these overrides are not allowed for `agent`, if they are not.
     pub fn check(&self, agent: &AgentConfig) -> Result<(), String> {
         let o = &agent.overridable;
+        match (agent.is_generic(), self.system_prompt.as_deref().is_some_and(|p| !p.trim().is_empty())) {
+            (true, false) => return Err(format!("{} is a generic agent: give it a system_prompt", agent.name)),
+            (false, true) => return Err(format!("{} has its own role; system_prompt is for generic agents (kind: generic)", agent.name)),
+            _ => {}
+        }
         if self.role_append.is_some() && !o.role_append {
             return Err(format!("agent {} does not allow role_append (overridable.role_append)", agent.name));
         }
@@ -1475,11 +1637,15 @@ pub struct WorkspaceSpec {
     /// Start a new workspace from an artifact (`art://b3/…`, a file or tree).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<String>,
+    /// After seeding, check out a new branch in the root repository
+    /// (`{session}` and `{agent}` are filled in), e.g. `agent/{agent}/{session}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 impl Default for WorkspaceSpec {
     fn default() -> Self {
-        WorkspaceSpec { mode: WorkspaceMode::Isolated, name: None, seed: None }
+        WorkspaceSpec { mode: WorkspaceMode::Isolated, name: None, seed: None, branch: None }
     }
 }
 
@@ -1643,8 +1809,19 @@ pub fn valid_name(s: &str) -> bool {
 
 impl AgentConfig {
     /// Static validation that does not need node context.
+    /// No specialization of its own: the spawner gives its system prompt.
+    pub fn is_generic(&self) -> bool {
+        self.kind == "generic"
+    }
+
     pub fn validate(&self, providers: &BTreeMap<String, ProviderDef>) -> Vec<String> {
         let mut errs = vec![];
+        if self.is_generic() && (self.role.system_prompt.is_some() || self.role.system_prompt_file.is_some() || self.role.preamble.is_some()) {
+            errs.push("kind: generic has no role of its own: remove role.system_prompt, system_prompt_file and preamble".into());
+        }
+        if self.min_urgency.is_some_and(|u| matches!(u, crate::model::TaskLabel::OnDemand | crate::model::TaskLabel::WhenFree)) {
+            errs.push("min_urgency must be right_now, urgent or normal".into());
+        }
         if !valid_name(&self.name) {
             errs.push(format!("agent name {:?} must match [a-z0-9-]{{1,48}}", self.name));
         }
@@ -1693,6 +1870,12 @@ impl AgentConfig {
             }
             if o.path.starts_with('/') || o.path.split('/').any(|c| c == "..") {
                 errs.push(format!("outputs: path {:?} must be relative to the workspace", o.path));
+            }
+            if o.path.is_empty() && !o.git {
+                errs.push("outputs: path is required (unless git: true)".into());
+            }
+            if o.git && o.path.contains(['*', '?', '[', '{']) {
+                errs.push(format!("outputs: git path {:?} must be the repository's directory, not a pattern", o.path));
             }
         }
         errs
@@ -1875,7 +2058,7 @@ success: { todos: ["write module"], checks: [ { exit_code: "pytest -q" } ] }
         )
         .unwrap();
         assert!(a.validate(&builtin_providers()).is_empty(), "a secret alias counts as a key");
-        let ok = SpawnOverrides { role_append: Some("x".into()), budget_usd: Some(0.5), route: Some("direct".into()) };
+        let ok = SpawnOverrides { role_append: Some("x".into()), budget_usd: Some(0.5), route: Some("direct".into()), ..Default::default() };
         assert!(ok.check(&a).is_ok());
         assert!(SpawnOverrides { budget_usd: Some(2.0), ..Default::default() }.check(&a).is_err());
         assert!(SpawnOverrides { route: Some("via-x".into()), ..Default::default() }.check(&a).is_err());
@@ -1893,12 +2076,29 @@ success: { todos: ["write module"], checks: [ { exit_code: "pytest -q" } ] }
         let f = Retain::parse("on_failure").unwrap();
         assert_eq!((f.keep_ms(false), f.keep_ms(true)), (Some(0), Some(86_400_000)));
         assert_eq!(Retain::parse("soon"), None);
-        let y = "name: a\nprovider: { id: groq, model: m, key: { ref: \"env:K\" } }\noutputs:\n  - { path: report.md, to: parent_workspace }\n  - { path: ../etc/passwd }\n  - { path: x, to: somewhere }\nretain: soon\n";
+        let y = "name: a\nprovider: { id: groq, model: m, key: { ref: \"env:K\" } }\noutputs:\n  - { path: report.md, to: parent_workspace }\n  - { path: ../etc/passwd }\n  - { path: x, to: somewhere }\n  - { to: artifact }\n  - { git: true, to: parent_workspace, merge: none }\nretain: soon\n";
         let a: AgentConfig = serde_yaml::from_str(y).unwrap();
+        assert!(a.outputs[4].git && a.outputs[4].merge == GitMerge::None && a.outputs[4].path.is_empty());
         let errs = a.validate(&builtin_providers());
+        assert!(errs.iter().filter(|e| e.contains("path is required")).count() == 1, "{errs:?}");
         assert!(errs.iter().any(|e| e.contains("relative to the workspace")), "{errs:?}");
         assert!(errs.iter().any(|e| e.contains("to \"somewhere\"")), "{errs:?}");
         assert!(errs.iter().any(|e| e.contains("retain")), "{errs:?}");
+    }
+
+    #[test]
+    fn generic_agents_need_a_prompt_and_have_no_role() {
+        let a: AgentConfig = serde_yaml::from_str("name: g\nkind: generic\nprovider: { id: groq, model: m, key: { secret: groq } }\n").unwrap();
+        assert!(a.validate(&builtin_providers()).is_empty());
+        assert!(SpawnOverrides::default().check(&a).is_err());
+        assert!(SpawnOverrides { system_prompt: Some("  ".into()), ..Default::default() }.check(&a).is_err());
+        assert!(SpawnOverrides { system_prompt: Some("You review code.".into()), ..Default::default() }.check(&a).is_ok());
+        let plain: AgentConfig = serde_yaml::from_str("name: p\nprovider: { id: groq, model: m, key: { secret: groq } }\n").unwrap();
+        assert!(SpawnOverrides::default().check(&plain).is_ok());
+        assert!(SpawnOverrides { system_prompt: Some("x".into()), ..Default::default() }.check(&plain).is_err());
+        let bad: AgentConfig = serde_yaml::from_str("name: g\nkind: generic\nprovider: { id: groq, model: m, key: { secret: groq } }\nrole: { system_prompt: hi }\nmin_urgency: when_free\n").unwrap();
+        let errs = bad.validate(&builtin_providers());
+        assert!(errs.iter().any(|e| e.contains("no role")) && errs.iter().any(|e| e.contains("min_urgency")), "{errs:?}");
     }
 
     #[test]
