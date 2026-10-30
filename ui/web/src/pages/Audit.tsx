@@ -21,7 +21,25 @@ export default function Audit() {
       <Show when={verified()}>
         <p class={`mb-3 text-sm ${verified().ok ? "text-emerald-700 dark:text-emerald-400" : "text-red-700"}`}>{verified().ok ? `Chain intact: ${verified().entries} entries.` : verified().error}</p>
       </Show>
-      <Card class="overflow-x-auto">
+      <Card class="divide-y divide-slate-100 sm:hidden dark:divide-slate-800">
+        <For each={list() ?? []}>
+          {(e) => (
+            <Show when={!e.error} fallback={<p class="p-3 text-sm text-red-600">{e.error}</p>}>
+              <div class="p-3 text-sm">
+                <div class="flex items-center justify-between gap-2">
+                  <span class="font-medium">{e.action}</span>
+                  {e.ok ? <Pill tone="emerald">ok</Pill> : <Pill tone="red">failed</Pill>}
+                </div>
+                <div class="mt-0.5 font-mono text-xs break-all text-slate-500">
+                  {clock(e.ts)} · {e.actor}
+                  <Show when={e.target && e.target !== "-"}> · {e.target}</Show>
+                </div>
+              </div>
+            </Show>
+          )}
+        </For>
+      </Card>
+      <Card class="hidden overflow-x-auto sm:block">
         <table class="w-full text-sm">
           <thead class="text-left text-xs text-slate-500">
             <tr>

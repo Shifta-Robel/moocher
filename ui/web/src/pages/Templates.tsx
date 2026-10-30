@@ -2,6 +2,7 @@ import { useNavigate } from "@solidjs/router";
 import { For, Show, createMemo, createResource, createSignal } from "solid-js";
 import { get, post } from "../api";
 import { Button, Card, Empty, Field, Modal, NodeChip, PageHeader, Pill, act, inputCls } from "../components/ui";
+import PromptBox from "../components/PromptBox";
 import * as I from "../icons";
 import { state } from "../store";
 import type { AgentInfo } from "../types";
@@ -90,7 +91,7 @@ export default function Templates() {
       <Modal open={!!pick()} onClose={() => setPick(null)} title={`New ${pick()?.name ?? ""} instance`} wide>
         <form class="space-y-3" onSubmit={(e) => { e.preventDefault(); spawn(); }}>
           <Field label="First prompt">
-            <textarea class={inputCls} rows={5} value={prompt()} onInput={(e) => setPrompt(e.currentTarget.value)} placeholder="What should it do?" />
+            <PromptBox rows={5} label="first prompt" value={prompt()} onValue={setPrompt} placeholder="What should it do?" onSubmit={spawn} />
           </Field>
           <div class="grid gap-3 sm:grid-cols-2">
             <Field label="Node" hint="empty = best placement">
@@ -105,7 +106,7 @@ export default function Templates() {
           </div>
           <Show when={pick()?.overridable.role_append}>
             <Field label="Extra instructions for this instance">
-              <textarea class={inputCls} rows={2} value={append()} onInput={(e) => setAppend(e.currentTarget.value)} />
+              <PromptBox rows={2} label="extra instructions" value={append()} onValue={setAppend} />
             </Field>
           </Show>
           <div class="grid gap-3 sm:grid-cols-2">

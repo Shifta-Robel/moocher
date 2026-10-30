@@ -20,7 +20,7 @@ echo "browser-test-password" | "$BIN/moocher-hub" --config-dir "$W/hub" user set
 wait_for 20 "agents loaded" bash -c "$O agents | grep -q qtop"
 Q=$(spawn_id qtop -p "start")
 mkdir -p "$S/shots"
-node "$REPO/tests/e2e/ui-check.mjs" http://127.0.0.1:7700 admin browser-test-password "$Q" "$S/shots" > "$S/ui-check.out" 2>&1
+node "$REPO/tests/e2e/ui-check.mjs" http://127.0.0.1:7700 admin browser-test-password "$Q" "$S/shots" > "$S/ui-check.out" 2>&1 || true
 sed 's/^/  /' "$S/ui-check.out"
 expect "every browser check passed" bash -c "! grep -q '^FAIL' $S/ui-check.out && grep -q 'logout returns' $S/ui-check.out"
 expect "the answer reached the agent" bash -c "grep -q 9090 $W/hub/data/workspaces/$Q/answer.txt"

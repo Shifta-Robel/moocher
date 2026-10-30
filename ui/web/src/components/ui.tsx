@@ -142,10 +142,10 @@ export function QuotaBar(p: { used: number; limit?: number | null; remaining?: n
       <div class="h-2 flex-1 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800" role="progressbar" aria-valuenow={Math.round(pct())} aria-valuemin={0} aria-valuemax={100}>
         <div class={cx("h-full rounded-full transition-all", color())} style={{ width: `${pct()}%` }} />
       </div>
-      <span class="w-28 shrink-0 text-right font-mono text-xs tabular-nums">
+      <span class="shrink-0 text-right font-mono text-xs tabular-nums sm:w-28">
         {p.exhausted ? <span class="font-semibold text-red-600 dark:text-red-400">used up</span> : `${p.used}/${p.limit ?? "?"}`}
       </span>
-      <span class="inline-flex w-20 shrink-0 items-center gap-1 text-xs text-slate-500" title="resets in">
+      <span class="inline-flex shrink-0 items-center gap-1 text-xs text-slate-500 sm:w-20" title="resets in">
         <I.Clock class="size-3" />
         {(now(), until(p.resets))}
       </span>
@@ -233,7 +233,7 @@ export function Field(p: { label: string; hint?: string; children: JSX.Element }
 }
 
 export const inputCls =
-  "w-full rounded-lg bg-white px-3 py-2 text-sm ring-1 ring-slate-300 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 dark:bg-slate-950 dark:ring-slate-700";
+  "w-full rounded-lg bg-white px-3 py-2 text-base ring-1 ring-slate-300 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 md:text-sm dark:bg-slate-950 dark:ring-slate-700";
 
 export function Modal(p: { open: boolean; onClose: () => void; title: string; children: JSX.Element; wide?: boolean }) {
   // Escape closes it even when focus fell back to the page (e.g. the focused
@@ -266,7 +266,7 @@ export function Modal(p: { open: boolean; onClose: () => void; title: string; ch
 
 export function notify(title: string, body = "", tone: "ok" | "error" = "ok") {
   toaster.show((props) => (
-    <Toast toastId={props.toastId} class={cx("pointer-events-auto flex w-80 items-start gap-2 rounded-xl p-3 shadow-lg ring-1", tone === "error" ? "bg-red-50 ring-red-200 dark:bg-red-950 dark:ring-red-900" : "bg-white ring-slate-200 dark:bg-slate-900 dark:ring-slate-700")}>
+    <Toast toastId={props.toastId} class={cx("pointer-events-auto flex w-[min(20rem,calc(100vw-1.5rem))] items-start gap-2 rounded-xl p-3 shadow-lg ring-1", tone === "error" ? "bg-red-50 ring-red-200 dark:bg-red-950 dark:ring-red-900" : "bg-white ring-slate-200 dark:bg-slate-900 dark:ring-slate-700")}>
       <Show when={tone === "error"} fallback={<I.Check class="mt-0.5 size-4 text-emerald-600" />}>
         <I.AlertTriangle class="mt-0.5 size-4 text-red-600" />
       </Show>

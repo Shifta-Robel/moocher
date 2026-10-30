@@ -2,6 +2,7 @@ import { A } from "@solidjs/router";
 import { For, Show, createSignal } from "solid-js";
 import { del, get, post } from "../api";
 import { Button, Card, Empty, Field, Modal, PageHeader, Pill, act, inputCls } from "../components/ui";
+import PromptBox from "../components/PromptBox";
 import * as I from "../icons";
 import { setState, state } from "../store";
 import type { Task } from "../types";
@@ -122,10 +123,10 @@ export default function Tasks() {
         <div class="mb-6 grid gap-3 md:grid-cols-2">
           <For each={state.tasks.filter((t) => t.status === "running")}>
             {(t) => (
-              <Card class="p-3">
+              <Card class="min-w-0 p-3">
                 <div class="flex items-start justify-between gap-2">
-                  <div>
-                    <div class="font-medium">#{t.id} {t.title}</div>
+                  <div class="min-w-0">
+                    <div class="font-medium break-words">#{t.id} {t.title}</div>
                     <div class="text-xs text-slate-500">started {ago(t.started_at ?? t.created_at)} ago</div>
                   </div>
                   <Button size="sm" variant="ghost" onClick={() => confirm(`Cancel task #${t.id}?`) && act(() => post(`/tasks/${t.id}/cancel`), "Cancelled")}>
@@ -144,7 +145,7 @@ export default function Tasks() {
       <div class="grid gap-4 lg:grid-cols-3">
         <For each={LABELS}>
           {([l, name, desc]) => (
-            <section>
+            <section class="min-w-0">
               <h2 class="font-semibold">{name}</h2>
               <p class="mb-2 text-xs text-slate-500">{desc}</p>
               <div class="space-y-2" onDragOver={(e) => e.preventDefault()}>
@@ -154,7 +155,7 @@ export default function Tasks() {
                       <Card class="flex items-start gap-2 p-2.5">
                         <I.GripVertical class="mt-0.5 size-4 shrink-0 cursor-grab text-slate-400" aria-hidden="true" />
                         <div class="min-w-0 flex-1">
-                          <div class="truncate text-sm font-medium">#{t.id} {t.title}</div>
+                          <div class="line-clamp-3 text-sm font-medium break-words" title={t.title}>#{t.id} {t.title}</div>
                           <div class="flex flex-wrap gap-1">
                             <For each={t.tags}>{(g) => <Pill>{g}</Pill>}</For>
                             <Show when={t.question_mode}>
@@ -229,7 +230,7 @@ export default function Tasks() {
               <div class="flex items-start gap-2 p-3 text-sm">
                 <Pill tone={statusTone(t.status)}>{t.status}</Pill>
                 <div class="min-w-0 flex-1">
-                  <div class="font-medium">#{t.id} {t.title}</div>
+                  <div class="font-medium break-words">#{t.id} {t.title}</div>
                   <Show when={t.result}>
                     <p class="line-clamp-2 text-xs text-slate-500">{t.result}</p>
                   </Show>
@@ -246,7 +247,7 @@ export default function Tasks() {
             <input class={inputCls} value={title()} onInput={(e) => setTitle(e.currentTarget.value)} required />
           </Field>
           <Field label="Details">
-            <textarea class={inputCls} rows={4} value={body()} onInput={(e) => setBody(e.currentTarget.value)} />
+            <PromptBox rows={4} label="details" value={body()} onValue={setBody} />
           </Field>
           <Field label="When">
             <select class={inputCls} value={label()} onChange={(e) => setLabel(e.currentTarget.value)}>
@@ -274,7 +275,7 @@ export default function Tasks() {
       <Modal open={!!runWf()} onClose={() => setRunWf(null)} title={`Run ${runWf() ?? ""}`}>
         <form class="space-y-3" onSubmit={async (e) => { e.preventDefault(); const r = await act(() => post(`/workflows/${runWf()}/run`, { input: wfInput() }), "Run started"); if (r) setRunWf(null); }}>
           <Field label="Input" hint="becomes {{input}} in the steps' prompts">
-            <textarea class={inputCls} rows={4} value={wfInput()} onInput={(e) => setWfInput(e.currentTarget.value)} required />
+            <PromptBox rows={4} label="input" value={wfInput()} onValue={setWfInput} required />
           </Field>
           <div class="flex justify-end gap-2">
             <Button type="button" variant="ghost" onClick={() => setRunWf(null)}>Cancel</Button>

@@ -110,7 +110,7 @@ await step("tasks: add two, reorder with the arrows", async () => {
   await col.getByText("second task").locator("xpath=ancestor::div[@draggable]").getByLabel("move up").click();
   await page.waitForFunction(() => {
     const s = [...document.querySelectorAll("section")].find((x) => x.querySelector("h2")?.textContent === "On demand");
-    const t = [...(s?.querySelectorAll("[draggable] .truncate") ?? [])].map((e) => e.textContent);
+    const t = [...(s?.querySelectorAll("[draggable] [title]") ?? [])].map((e) => e.textContent);
     return t.findIndex((x) => x.includes("second")) < t.findIndex((x) => x.includes("first"));
   });
 });
@@ -134,7 +134,7 @@ await step("dark mode via the theme toggle", async () => {
   await page.screenshot({ path: `${shots}/overview-dark.png`, fullPage: true });
 });
 
-await step("phone layout: bottom tab bar, no sidebar", async () => {
+await step("phone layout: bottom tab bar, no sidebar, activity rows expand, no page scrolls sideways", async () => {
   const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, storageState: await ctx.storageState() });
   const p = await phone.newPage();
   await p.goto(hub + "/instances/" + sid);
@@ -144,6 +144,19 @@ await step("phone layout: bottom tab bar, no sidebar", async () => {
   const overflow = await p.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
   if (overflow > 1) throw new Error(`page scrolls sideways by ${overflow}px`);
   await p.screenshot({ path: `${shots}/instance-phone.png`, fullPage: true });
+  await p.getByRole("tab", { name: "Activity" }).click();
+  await p.locator("li > button[aria-expanded=false]:not([disabled])").first().click();
+  await p.locator("li > pre").first().waitFor();
+  await p.screenshot({ path: `${shots}/activity-phone.png`, fullPage: true });
+  const wide = [];
+  for (const r of ["/", "/instances", "/questions", "/tasks", "/quotas", "/templates", "/nodes", "/artifacts", "/notifications", "/audit", "/settings"]) {
+    await p.goto(hub + r);
+    await p.locator("main h1").first().waitFor();
+    await p.waitForTimeout(800);
+    const o = await p.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+    if (o > 1) wide.push(`${r} by ${o}px`);
+  }
+  if (wide.length) throw new Error(`pages scroll sideways: ${wide.join(", ")}`);
   await phone.close();
 });
 

@@ -2,7 +2,8 @@ import { Tabs } from "@kobalte/core/tabs";
 import { A, useParams } from "@solidjs/router";
 import { For, Show, createEffect, createResource, createSignal, on } from "solid-js";
 import { get, post, del } from "../api";
-import { Button, Card, Empty, Importance, NodeChip, PageHeader, Pill, Sparkline, StatusBadge, Todos, act, inputCls } from "../components/ui";
+import PromptBox from "../components/PromptBox";
+import { Button, Card, Empty, Importance, NodeChip, PageHeader, Pill, Sparkline, StatusBadge, Todos, act } from "../components/ui";
 import * as I from "../icons";
 import { events, isLive, state, statsTick } from "../store";
 import type { LogEvent, RecoveryOption } from "../types";
@@ -17,6 +18,27 @@ function Stat(p: { label: string; value: string; hint?: string }) {
         <div class="text-[11px] text-slate-500">{p.hint}</div>
       </Show>
     </div>
+  );
+}
+
+/** One event: time, kind and a one-line preview; tap for the whole payload,
+ * which scrolls sideways rather than being cut off. */
+function ActivityRow(p: { e: LogEvent }) {
+  const [open, setOpen] = createSignal(false);
+  const data = () => (p.e.data == null || (typeof p.e.data === "object" && !Object.keys(p.e.data).length) ? "" : JSON.stringify(p.e.data));
+  return (
+    <li>
+      <button class="flex w-full min-w-0 flex-col gap-0.5 p-1.5 text-left hover:bg-slate-50 sm:flex-row sm:gap-2 dark:hover:bg-slate-800/50" onClick={() => setOpen(!open())} aria-expanded={open()} disabled={!data()}>
+        <span class="flex shrink-0 gap-2">
+          <span class="text-slate-500">{clock(p.e.ts)}</span>
+          <span class="font-semibold sm:w-36">{p.e.kind}</span>
+        </span>
+        <span class="min-w-0 truncate text-slate-600 dark:text-slate-400">{data()}</span>
+      </button>
+      <Show when={open()}>
+        <pre class="mx-1.5 mb-1.5 max-h-72 overflow-auto rounded-md bg-slate-50 p-2 whitespace-pre dark:bg-slate-950">{JSON.stringify(p.e.data, null, 2)}</pre>
+      </Show>
+    </li>
   );
 }
 
@@ -134,7 +156,7 @@ export default function Instance() {
           <Show when={isLive(si())}>
             <Card class="mb-4 p-3">
               <div class="flex flex-col gap-2 sm:flex-row">
-                <textarea class={`${inputCls} min-h-[2.5rem] flex-1`} rows={2} placeholder="Message this agent…" value={msg()} onInput={(e) => setMsg(e.currentTarget.value)} onKeyDown={(e) => e.key === "Enter" && (e.metaKey || e.ctrlKey) && send()} aria-label="message" />
+                <PromptBox class="flex-1" rows={2} placeholder="Message this agent…" label="message" value={msg()} onValue={setMsg} onSubmit={send} />
                 <div class="flex items-center gap-2 sm:flex-col sm:items-stretch">
                   <label class="inline-flex items-center gap-1.5 text-xs" title="steer: abort the current step and deliver now; otherwise it waits for the next step">
                     <input type="checkbox" checked={steer()} onChange={(e) => setSteer(e.currentTarget.checked)} /> deliver now (steer)
@@ -169,15 +191,7 @@ export default function Instance() {
               <Card class="max-h-[32rem] overflow-auto p-2">
                 <ul class="divide-y divide-slate-100 font-mono text-xs dark:divide-slate-800">
                   <For each={[...allEvents()].reverse()} fallback={<li class="p-2 text-slate-500">No events yet.</li>}>
-                    {(e) => (
-                      <li class="flex gap-2 p-1.5">
-                        <span class="shrink-0 text-slate-500">{clock(e.ts)}</span>
-                        <span class="w-36 shrink-0 font-semibold">{e.kind}</span>
-                        <span class="truncate text-slate-600 dark:text-slate-400" title={JSON.stringify(e.data)}>
-                          {JSON.stringify(e.data)}
-                        </span>
-                      </li>
-                    )}
+                    {(e) => <ActivityRow e={e} />}
                   </For>
                 </ul>
               </Card>

@@ -23,6 +23,7 @@ export { default as Loader } from "lucide-solid/icons/loader-circle";
 export { default as LogOut } from "lucide-solid/icons/log-out";
 export { default as Menu } from "lucide-solid/icons/menu";
 export { default as MessageSquare } from "lucide-solid/icons/message-square";
+export { default as Mic } from "lucide-solid/icons/mic";
 export { default as Monitor } from "lucide-solid/icons/monitor";
 export { default as Moon } from "lucide-solid/icons/moon";
 export { default as MoreHorizontal } from "lucide-solid/icons/ellipsis";

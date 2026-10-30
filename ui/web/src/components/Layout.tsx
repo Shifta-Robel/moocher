@@ -145,11 +145,11 @@ export default function Layout(p: { children?: JSX.Element }) {
             <ThemeButton />
           </div>
         </header>
-        <main class="mx-auto max-w-7xl px-4 py-5 pb-24 md:px-6 md:pb-8">{p.children}</main>
+        <main class="mx-auto max-w-7xl px-4 py-5 pb-[calc(6rem+env(safe-area-inset-bottom))] md:px-6 md:pb-8">{p.children}</main>
       </div>
       <nav class="fixed inset-x-0 bottom-0 z-30 grid grid-cols-5 border-t border-slate-200 bg-white/95 px-1 pt-1 pb-[max(env(safe-area-inset-bottom),0.25rem)] backdrop-blur md:hidden dark:border-slate-800 dark:bg-slate-900/95" aria-label="main">
         <For each={NAV.filter((n) => n.mobile)}>{(n) => <NavLink {...n} compact />}</For>
-        <button class="flex flex-col items-center gap-0.5 rounded-lg px-2 py-1.5 text-[11px] font-medium text-slate-600 dark:text-slate-400" onClick={() => setMore(!more())} aria-expanded={more()}>
+        <button class="relative flex flex-col items-center gap-0.5 rounded-lg px-2 py-1.5 text-[11px] font-medium text-slate-600 dark:text-slate-400" onClick={() => setMore(!more())} aria-expanded={more()}>
           <I.Menu class="size-5" />
           More
           <Show when={state.unread > 0}>
@@ -159,7 +159,7 @@ export default function Layout(p: { children?: JSX.Element }) {
       </nav>
       <Show when={more()}>
         <div class="fixed inset-0 z-40 bg-slate-950/40 md:hidden" onClick={() => setMore(false)}>
-          <div class="absolute inset-x-2 bottom-20 rounded-2xl bg-white p-2 shadow-xl dark:bg-slate-900" onClick={(e) => e.stopPropagation()}>
+          <div class="absolute inset-x-2 bottom-[calc(5rem+env(safe-area-inset-bottom))] rounded-2xl bg-white p-2 shadow-xl dark:bg-slate-900" onClick={(e) => e.stopPropagation()}>
             <div class="grid grid-cols-2 gap-1" onClick={() => setMore(false)}>
               <For each={NAV.filter((n) => !n.mobile)}>{(n) => <NavLink {...n} />}</For>
               <button class="flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium text-slate-600 dark:text-slate-400" onClick={logout}>

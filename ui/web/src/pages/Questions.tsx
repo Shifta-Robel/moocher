@@ -2,7 +2,8 @@ import { Tabs } from "@kobalte/core/tabs";
 import { A } from "@solidjs/router";
 import { For, Show, createResource, createSignal } from "solid-js";
 import { get, post } from "../api";
-import { Button, Card, Empty, Importance, NodeChip, PageHeader, Pill, act, inputCls } from "../components/ui";
+import { Button, Card, Empty, Importance, NodeChip, PageHeader, Pill, act } from "../components/ui";
+import PromptBox from "../components/PromptBox";
 import * as I from "../icons";
 import { setState, state } from "../store";
 import type { Question } from "../types";
@@ -79,7 +80,7 @@ function QuestionCard(p: { q: Question }) {
         </For>
       </div>
       <div class="mt-3 flex flex-col gap-2 sm:flex-row">
-        <input class={inputCls} placeholder="Or type an answer…" value={text()} onInput={(e) => setText(e.currentTarget.value)} onKeyDown={(e) => e.key === "Enter" && text().trim() && answer({ answer: text() })} aria-label="answer" />
+        <PromptBox line class="flex-1" placeholder="Or type an answer…" label="answer" value={text()} onValue={setText} onSubmit={() => text().trim() && answer({ answer: text() })} />
         <div class="flex gap-2">
           <Button variant="primary" busy={busy()} disabled={!text().trim()} onClick={() => answer({ answer: text() })}>
             <I.Send class="size-4" /> Answer

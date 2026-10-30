@@ -37,15 +37,17 @@ export default function Quotas() {
                   <For each={state.quotas.filter((q) => q.provider === p).sort((a, b) => a.scope_id.localeCompare(b.scope_id) || a.kind.localeCompare(b.kind))}>
                     {(q) => (
                       <div>
-                        <div class="mb-1 flex flex-wrap items-center gap-2 text-xs">
-                          <Show when={q.scope === "ip"} fallback={<Pill>{q.scope_id}</Pill>}>
-                            <IpChip ip={q.scope_id} sharers={sharers(q.scope_id)} />
-                          </Show>
-                          <Pill>{q.kind}</Pill>
-                          <Pill tone={q.source === "override" ? "indigo" : "slate"} title="where the numbers come from">{q.source}</Pill>
-                          <For each={q.nodes}>{(n) => <NodeChip name={n} />}</For>
-                          <span class="text-slate-500">{q.sessions.length ? `used by ${q.sessions.length}` : ""}</span>
-                          <Button size="sm" variant="ghost" class="ml-auto" onClick={() => { setRemaining(""); setResets(""); setEdit(q); }}>
+                        <div class="mb-1 flex items-start gap-2">
+                          <div class="flex min-w-0 flex-1 flex-wrap items-center gap-1.5 text-xs">
+                            <Show when={q.scope === "ip"} fallback={<Pill>{q.scope_id}</Pill>}>
+                              <IpChip ip={q.scope_id} sharers={sharers(q.scope_id)} />
+                            </Show>
+                            <Pill>{q.kind}</Pill>
+                            <Pill tone={q.source === "override" ? "indigo" : "slate"} title="where the numbers come from">{q.source}</Pill>
+                            <For each={q.nodes}>{(n) => <NodeChip name={n} />}</For>
+                            <span class="text-slate-500">{q.sessions.length ? `used by ${q.sessions.length}` : ""}</span>
+                          </div>
+                          <Button size="sm" variant="ghost" class="shrink-0" onClick={() => { setRemaining(""); setResets(""); setEdit(q); }}>
                             override
                           </Button>
                         </div>
