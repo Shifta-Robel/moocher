@@ -65,6 +65,8 @@ enum Cmd {
         /// Only this provider.
         provider: Option<String>,
     },
+    /// Key pools: each key's state, who uses what, and what is kept for urgent work.
+    Pool,
     /// Egress IP of every route, and which nodes/sessions share an IP.
     Ips,
     /// Host and per-instance CPU, memory, processes and disk.
@@ -787,6 +789,35 @@ async fn run(cli: Cli) -> Result<()> {
                     s["pids"].as_u64().map(|p| p.to_string()).unwrap_or("-".into()),
                     format!("{}/{}", mib(s["disk_bytes"].as_u64()), mib(s["disk_limit"].as_u64()))
                 );
+            }
+        }
+        Cmd::Pool => {
+            let v = api.get("/pool").await?;
+            if raw {
+                return Ok(out(&v));
+            }
+            let p: PoolView = serde_json::from_value(v)?;
+            println!("{:<14} {:<12} {:<18} {:<10} {:<9} {:<7} {}", "PROVIDER", "NODE", "KEY", "USED", "CALLS", "LEND", "STATE");
+            for k in &p.keys {
+                let state = match (k.key.bad_until, k.exhausted_until) {
+                    (Some(_), _) => "refused by the provider".to_string(),
+                    (_, Some(t)) => format!("used up, resets in {}s", (t - now_ms()).max(0) / 1000),
+                    _ if k.key.borrowed => "ok (borrowed)".to_string(),
+                    _ => "ok".to_string(),
+                };
+                println!("{:<14} {:<12} {:<18} {:<10} {:<9} {:<7} {}", k.key.provider, k.node, k.key.key_id, k.used, k.key.in_flight, if k.key.lendable { "yes" } else { "no" }, state);
+            }
+            if !p.in_use.is_empty() {
+                println!("\nIN USE");
+                for u in &p.in_use {
+                    println!("  {:<14} {:<12} {:<14} {:<18} {} {}", u.used.session, u.node, u.used.provider, u.used.key_id, u.used.route, u.used.ip.as_deref().unwrap_or(""));
+                }
+            }
+            if !p.yields.is_empty() {
+                println!("\nKEPT FOR URGENT WORK");
+                for y in &p.yields {
+                    println!("  {:<14} {:<18} for {}", y.provider, y.scope_id, y.by);
+                }
             }
         }
         Cmd::Ips => {

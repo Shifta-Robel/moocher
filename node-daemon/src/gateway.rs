@@ -13,6 +13,7 @@
 use crate::cfgstore::ConfigStore;
 use crate::egress::Egress;
 use crate::link::LinkHandle;
+use crate::pool::KeyChoice;
 use crate::quota::{self, Quotas, Target};
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
@@ -21,7 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
-use moocher_protocol::config::{AuthStyle, OnExhausted, Route, SpawnOverrides};
+use moocher_protocol::config::{AuthStyle, KeySelection, OnExhausted, Route, SpawnOverrides};
 use moocher_protocol::link::{AgentCall, NodeEvent};
 use moocher_protocol::model::{now_ms, SessionRole, TokenUsage, Ts};
 use serde_json::{json, Value};
@@ -81,6 +82,11 @@ pub struct Gateway {
     fetched: Arc<Mutex<Vec<String>>>,
     obs: Arc<crate::obs::Observer>,
     units: Arc<crate::units::Units>,
+    pool: Arc<crate::pool::Pool>,
+    /// The key this session stays on, and the route when routes are balanced.
+    current: Arc<Mutex<Option<(String, String)>>>,
+    /// Last time each allowance's pressure was reported.
+    pressured: Arc<Mutex<std::collections::HashMap<String, Ts>>>,
 }
 
 /// The instance's workspace: host directory and the path the agent sees.
@@ -99,6 +105,7 @@ pub struct GatewayDeps {
     pub files: Arc<crate::wsops::WsOps>,
     pub obs: Arc<crate::obs::Observer>,
     pub units: Arc<crate::units::Units>,
+    pub pool: Arc<crate::pool::Pool>,
 }
 
 impl Gateway {
@@ -141,6 +148,9 @@ impl Gateway {
             fetched: Default::default(),
             obs: deps.obs.clone(),
             units: deps.units.clone(),
+            pool: deps.pool.clone(),
+            current: Default::default(),
+            pressured: Default::default(),
         }
     }
 
@@ -304,18 +314,21 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
             body = serde_json::to_vec(&v).unwrap_or_default().into();
         }
     }
-    let (secret, account) = match &agent.cfg.provider.key {
-        None => (None, None),
+    // An agent's own key, else the provider's pool (with what was borrowed).
+    let pooled = agent.cfg.provider.key.is_none() && (!pdef.keys.is_empty() || pdef.borrow);
+    let mut keys: Vec<KeyChoice> = match &agent.cfg.provider.key {
         Some(r) => match snap.secret(r) {
-            Ok((s, account)) => (Some(s), account),
+            Ok((s, account)) => vec![KeyChoice { key_id: crate::pool::key_id(&s), secret: Some(s), account, ..Default::default() }],
             Err(e) => {
                 tracing::warn!(agent = %g.agent, error = %e, "secret unresolvable");
                 return llm_error(StatusCode::BAD_GATEWAY, "provider credential unavailable on this node");
             }
         },
+        None if pooled => g.pool_keys(&snap, &pdef, &provider),
+        None => vec![KeyChoice::default()],
     };
-    let mut url = format!("{}/{}", pdef.base_url.trim_end_matches('/'), rest);
-    let mut q: Vec<String> = query.unwrap_or_default().split('&').filter(|kv| !kv.is_empty() && !kv.starts_with("key=")).map(String::from).collect();
+    let base_url = format!("{}/{}", pdef.base_url.trim_end_matches('/'), rest);
+    let q: Vec<String> = query.unwrap_or_default().split('&').filter(|kv| !kv.is_empty() && !kv.starts_with("key=")).map(String::from).collect();
     for h in HOP {
         headers.remove(*h);
     }
@@ -324,25 +337,6 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
             headers.insert(k, v);
         }
     }
-    if let Some(s) = &secret {
-        match &pdef.auth {
-            AuthStyle::Bearer => {
-                headers.insert("authorization", HeaderValue::try_from(format!("Bearer {s}")).unwrap());
-            }
-            AuthStyle::Header { name } => {
-                if let Ok(n) = HeaderName::try_from(name.as_str()) {
-                    headers.insert(n, HeaderValue::try_from(s.as_str()).unwrap());
-                }
-            }
-            AuthStyle::Query { name } => q.push(format!("{name}={s}")),
-            AuthStyle::None => {}
-        }
-    }
-    if !q.is_empty() {
-        url.push('?');
-        url.push_str(&q.join("&"));
-    }
-
     // The previous request's tokens are known now; account them where it went.
     let spec = quota::spec_for(&pdef);
     let limits = spec.limits.clone();
@@ -364,7 +358,39 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
             names.push(n);
         }
     }
-    let scope = quota::default_scope(&pdef, secret.is_some());
+    let scope = quota::default_scope(&pdef, pooled || keys.iter().any(|k| k.secret.is_some()));
+    let target_of = |k: &KeyChoice, route: &str| {
+        let ip = g.egress.ip_of(route);
+        Target { provider: provider.clone(), scope, scope_id: quota::scope_id(scope, &snap.node.name, route, ip.as_deref(), k.secret.as_deref(), k.account.as_deref()) }
+    };
+    // What stops this key and route now: (until, why, is it a limit being hit).
+    let blocked = |k: &KeyChoice, t: &Target, now: Ts| -> Option<(Ts, String, bool)> {
+        let model = &agent.cfg.provider.model;
+        if let Some(until) = g.quotas.exhausted(t, &limits, &snap.overrides.quotas, now).or_else(|| g.pool.exhausted(&provider, &t.scope_id, now)) {
+            return Some((until, format!("allowance used up, resets in {}", human_in(until - now)), true));
+        }
+        if let Some((until, unit)) = g.units.exhausted(t, model, &spec.units, now) {
+            return Some((until, format!("{unit} used up, resets in {}", human_in(until - now)), true));
+        }
+        if let Some(by) = g.pool.yielded(&provider, &t.scope_id, &g.id, now) {
+            return Some((now + YIELD_RETRY_MS, format!("kept for {by}"), false));
+        }
+        if g.pool.at_capacity(&provider, &t.scope_id, k) {
+            return Some((now + YIELD_RETRY_MS, "at its max_concurrent".into(), false));
+        }
+        None
+    };
+    // Nothing of ours can serve this: ask the other nodes.
+    if pooled && pdef.borrow && keys.iter().all(|k| names.iter().all(|n| blocked(k, &target_of(k, n), now_ms()).is_some())) {
+        let have = keys.iter().map(|k| k.key_id.clone()).collect();
+        if g.pool.borrow(&g.link, &g.id, &provider, have).await {
+            keys = g.pool_keys(&snap, &pdef, &provider);
+        }
+    }
+    if keys.is_empty() {
+        return llm_error(StatusCode::BAD_GATEWAY, "no usable key for this provider on this node");
+    }
+    let pairs = g.order_pairs(keys, names.clone(), &provider, &plan, pdef.selection, &target_of);
     let call = |t: &Target, route: &str| crate::obs::Call {
         provider: provider.clone(),
         model: agent.cfg.provider.model.clone(),
@@ -376,25 +402,22 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
     let mut skipped: Vec<String> = vec![];
     let mut soonest: Option<Ts> = None;
     let mut all_exhausted = true;
-    for (i, name) in names.iter().enumerate() {
+    for (i, (name, key)) in pairs.iter().enumerate() {
         let Some(route) = snap.route(name) else {
             skipped.push(format!("{name}: unknown route"));
             all_exhausted = false;
             continue;
         };
-        let ip = g.egress.ip_of(name);
-        let target = Target { provider: provider.clone(), scope, scope_id: quota::scope_id(scope, &snap.node.name, name, ip.as_deref(), secret.as_deref(), account.as_deref()) };
+        let target = target_of(key, name);
         g.quotas.ensure(&target, name, &limits);
         g.units.ensure(&target, name, &agent.cfg.provider.model, &spec.units);
         let now = now_ms();
-        if let Some(until) = g.quotas.exhausted(&target, &limits, &snap.overrides.quotas, now) {
-            skipped.push(format!("{name} ({}): allowance used up, resets in {}", target.scope_id, human_in(until - now)));
+        if let Some((until, why, limit)) = blocked(key, &target, now) {
+            skipped.push(format!("{name} ({}): {why}", target.scope_id));
             soonest = Some(soonest.map_or(until, |s: Ts| s.min(until)));
-            continue;
-        }
-        if let Some((until, unit)) = g.units.exhausted(&target, &agent.cfg.provider.model, &spec.units, now) {
-            skipped.push(format!("{name} ({}): {unit} used up, resets in {}", target.scope_id, human_in(until - now)));
-            soonest = Some(soonest.map_or(until, |s: Ts| s.min(until)));
+            if limit {
+                g.pressure(&provider, &target.scope_id);
+            }
             continue;
         }
         let client = match g.egress.client(&route) {
@@ -405,10 +428,32 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
                 continue;
             }
         };
+        let mut headers = headers.clone();
+        let mut q = q.clone();
+        if let Some(s) = &key.secret {
+            match &pdef.auth {
+                AuthStyle::Bearer => {
+                    headers.insert("authorization", HeaderValue::try_from(format!("Bearer {s}")).unwrap());
+                }
+                AuthStyle::Header { name } => {
+                    if let Ok(n) = HeaderName::try_from(name.as_str()) {
+                        headers.insert(n, HeaderValue::try_from(s.as_str()).unwrap());
+                    }
+                }
+                AuthStyle::Query { name } => q.push(format!("{name}={s}")),
+                AuthStyle::None => {}
+            }
+        }
+        let mut url = base_url.clone();
+        if !q.is_empty() {
+            url.push('?');
+            url.push_str(&q.join("&"));
+        }
+        let flight = g.pool.begin(&provider, &target.scope_id, &key.key_id);
         g.quotas.record_request(&target, name, &g.id, &limits);
         *g.prev.lock().unwrap() = Some((target.clone(), name.clone(), usage_total));
         let sent = std::time::Instant::now();
-        let upstream = match client.request(method.clone(), &url).headers(headers.clone()).body(body.clone()).send().await {
+        let upstream = match client.request(method.clone(), &url).headers(headers).body(body.clone()).send().await {
             Ok(r) => {
                 g.egress.observe_call(name, &provider, Some(sent.elapsed()), None);
                 r
@@ -430,7 +475,14 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
         };
         let status = upstream.status();
         if status.as_u16() == 401 || status.as_u16() == 403 {
-            g.provider_problem("provider.auth_failed", json!({"provider": provider, "route": name, "status": status.as_u16()}));
+            g.provider_problem("provider.auth_failed", json!({"provider": provider, "route": name, "status": status.as_u16(), "key": key.key_id}));
+            // Another key of the pool may still work. Nothing has reached OpenCode yet.
+            if pooled && i + 1 < pairs.len() {
+                g.pool.mark_bad(&provider, &key.key_id);
+                skipped.push(format!("{name} ({}): the provider refused this key", key.key_id));
+                all_exhausted = false;
+                continue;
+            }
         }
         if status.as_u16() == 429 {
             let rh = upstream.headers().clone();
@@ -445,8 +497,9 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
             }
             soonest = Some(soonest.map_or(until, |s: Ts| s.min(until)));
             skipped.push(format!("{name} ({}): provider says rate limited, resets in {}", target.scope_id, human_in(until - now_ms())));
-            if i + 1 < names.len() {
-                continue; // nothing has reached OpenCode yet: try the next route
+            g.pressure(&provider, &target.scope_id);
+            if i + 1 < pairs.len() {
+                continue; // nothing has reached OpenCode yet: try the next key or route
             }
             if plan.on_exhausted == OnExhausted::Wait {
                 g.park(until, &provider, &skipped);
@@ -466,6 +519,7 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
         }
         g.unpark();
         g.note_route(name, &names[0], &skipped, &target.scope_id);
+        g.note_key(key, name, &provider, &target, &skipped);
         let mut out = Response::builder().status(status.as_u16());
         for (k, v) in upstream.headers() {
             if !HOP.contains(&k.as_str()) {
@@ -508,6 +562,7 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
             }).watch(watch, found)
         });
         let stream = upstream.bytes_stream().map(move |r| {
+            let _ = &flight; // under way until the stream ends
             if let Ok(b) = &r {
                 probe.chunk(b);
                 if let Some(m) = &mut meter {
@@ -538,6 +593,11 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
 }
 
 /// `3h 24m`, `5m 10s`, `42s`.
+/// How soon a held-back call looks again.
+const YIELD_RETRY_MS: i64 = 15_000;
+/// Report pressure on one allowance at most this often.
+const PRESSURE_EVERY_MS: i64 = 15_000;
+
 pub fn human_in(ms: i64) -> String {
     let s = (ms.max(0) + 999) / 1000;
     match s {
@@ -549,6 +609,62 @@ pub fn human_in(ms: i64) -> String {
 }
 
 impl Gateway {
+    /// The pool on this node, without keys the provider refused.
+    fn pool_keys(&self, snap: &crate::cfgstore::Snapshot, p: &moocher_protocol::config::ProviderDef, provider: &str) -> Vec<KeyChoice> {
+        let now = now_ms();
+        let mut keys = crate::pool::own_keys(snap, p);
+        for b in self.pool.borrowed(provider, now) {
+            if !keys.iter().any(|k| k.key_id == b.key_id) {
+                keys.push(b);
+            }
+        }
+        keys.retain(|k| !self.pool.is_bad(&k.key_id, now));
+        keys
+    }
+
+    /// The order to try key and route pairs: routes as planned (the least used
+    /// first if balanced), keys by the least used, the session's own key first
+    /// unless it spreads.
+    fn order_pairs(&self, mut keys: Vec<KeyChoice>, mut routes: Vec<String>, provider: &str, plan: &moocher_protocol::config::RoutePlan, selection: KeySelection, target_of: &dyn Fn(&KeyChoice, &str) -> Target) -> Vec<(String, KeyChoice)> {
+        let current = self.current.lock().unwrap().clone().filter(|_| selection == KeySelection::Sticky);
+        if keys.len() > 1 {
+            keys.sort_by_cached_key(|k| {
+                let mine = current.as_ref().is_some_and(|c| c.0 == k.key_id);
+                (!mine, self.pool.load(provider, &target_of(k, &routes[0]).scope_id, &self.id))
+            });
+        }
+        if plan.balance {
+            routes.sort_by_cached_key(|r| {
+                let mine = current.as_ref().is_some_and(|c| &c.1 == r);
+                (!mine, self.pool.route_load(provider, r, &self.id))
+            });
+        }
+        routes.iter().flat_map(|r| keys.iter().map(move |k| (r.clone(), k.clone()))).collect()
+    }
+
+    /// This session hit a limit. Only right_now work makes others give way,
+    /// which the hub decides.
+    fn pressure(&self, provider: &str, scope_id: &str) {
+        let now = now_ms();
+        let mut last = self.pressured.lock().unwrap();
+        if last.get(scope_id).is_some_and(|t| now - t < PRESSURE_EVERY_MS) {
+            return;
+        }
+        last.insert(scope_id.to_string(), now);
+        self.link.emit(NodeEvent::Activity { session: self.id.clone(), kind: "quota.pressure".into(), detail: json!({"provider": provider, "scope_id": scope_id}) });
+    }
+
+    /// Remember what this call went out with, and report a change of key.
+    fn note_key(&self, key: &KeyChoice, route: &str, provider: &str, t: &Target, skipped: &[String]) {
+        let ip = self.egress.ip_of(route);
+        self.pool.note_use(moocher_protocol::model::KeyUse { session: self.id.clone(), provider: provider.to_string(), key_id: key.key_id.clone(), scope_id: t.scope_id.clone(), route: route.to_string(), ip });
+        let prev = self.current.lock().unwrap().replace((key.key_id.clone(), route.to_string()));
+        if let Some((from, _)) = prev.filter(|p| p.0 != key.key_id) {
+            tracing::info!(session = %self.id, from = %from, to = %key.key_id, "key.switched");
+            self.link.emit(NodeEvent::Activity { session: self.id.clone(), kind: "key.switched".into(), detail: json!({"provider": provider, "from": from, "to": key.key_id, "borrowed": key.borrowed, "skipped": skipped}) });
+        }
+    }
+
     /// Attribute tokens used since the last request to the bucket that served
     /// it (called before each request and when a turn ends).
     pub fn settle_tokens(&self) {

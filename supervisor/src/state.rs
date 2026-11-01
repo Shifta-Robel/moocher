@@ -31,6 +31,8 @@ pub struct Sup {
     pub orch_lock: tokio::sync::Mutex<()>,
     /// One delivery of held messages at a time, so they stay in order.
     pub held_lock: tokio::sync::Mutex<()>,
+    /// Key pools and who gives way (pool.rs).
+    pub pool: std::sync::Mutex<crate::pool::PoolState>,
     /// Cluster CA (set at start when remote nodes are enabled).
     pub ca: std::sync::OnceLock<crate::pki::Ca>,
     /// Last audit time per (node, rejection reason): a rejected node retries
@@ -113,6 +115,7 @@ impl Sup {
             stream,
             orch_lock: tokio::sync::Mutex::new(()),
             held_lock: Default::default(),
+            pool: Default::default(),
             ca: std::sync::OnceLock::new(),
             rejections: Default::default(),
             stats: Default::default(),
@@ -452,6 +455,8 @@ impl Sup {
                 }
                 self.log("node.agents", Some(node), None, json!({}));
             }
+            NodeEvent::Activity { session, kind, detail } if kind == "quota.pressure" => self.on_pressure(&session, &detail),
+            NodeEvent::Pool { keys, in_use } => self.pool_report(node, keys, in_use),
             NodeEvent::Activity { session, kind, detail } => {
                 let who = self.db.session(&session).map(|s| format!("{} ({session})", s.report.agent)).unwrap_or(session.clone());
                 let alert = match kind.as_str() {
@@ -614,6 +619,7 @@ impl Sup {
                 }
                 Ok(json!(format!("delivered to {to} ({:?})", delivery)))
             }
+            AgentCall::BorrowKey { provider, public_key, have } => self.borrow_key(from, node, &provider, &public_key, &have).await,
             AgentCall::Inbox => Ok(Value::Array(self.db.inbox_take(from)?)),
             AgentCall::ListAgents => {
                 let mine = self.urgency_of(&caller).level();

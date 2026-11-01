@@ -83,6 +83,9 @@ impl Sup {
             let mut usable_route: Option<String> = None;
             let mut soonest: Option<Ts> = None;
             let mut all_exhausted = true;
+            // With a pool, one key running out is not the node running out.
+            let pooled = !a.pool.is_empty() || a.borrow;
+            let keys_out = pooled && a.pool.iter().all(|id| quotas.iter().any(|q| q.provider == a.provider && &q.scope_id == id && q.exhausted)) && !(a.borrow && self.lender_for(&n.name, &a.provider, &quotas));
             for r in &routes {
                 let key = format!("{}/{r}", n.name);
                 // A per-IP bucket applies to every route leaving from that IP,
@@ -92,9 +95,14 @@ impl Sup {
                     .iter()
                     .filter(|q| q.provider == a.provider && q.gates(&a.model))
                     .filter(|q| q.routes.contains(&key) || (q.scope == "ip" && ip.as_deref() == Some(q.scope_id.as_str())))
+                    .filter(|q| !pooled || q.scope == "ip")
                     .collect();
                 if let Some(e) = bs.iter().find(|q| q.exhausted) {
                     soonest = e.resets_at.map(|t| soonest.map_or(t, |s: Ts| s.min(t)));
+                    continue;
+                }
+                if keys_out {
+                    soonest = quotas.iter().filter(|q| q.provider == a.provider && a.pool.contains(&q.scope_id) && q.exhausted).filter_map(|q| q.resets_at).min().or(soonest);
                     continue;
                 }
                 all_exhausted = false;

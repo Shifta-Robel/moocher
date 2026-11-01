@@ -350,7 +350,7 @@ This needs no git in the workspace and behaves the same for any tree. Git reposi
 
 | Asset | Where it lives | Who can see it |
 |---|---|---|
-| Provider API keys | Node secret backend | `moocher-node` keyproxy **only**. Never the supervisor, the UI or the container. |
+| Provider API keys | Node secret backend | `moocher-node` keyproxy **only**. Never the UI or the container. The supervisor never holds one. A key marked `lend: true` can go to another node, encrypted for a one-time X25519 key of the borrower, and is kept in memory there. The supervisor passes on only ciphertext, but it also carries the borrower's public key, so a compromised supervisor could substitute its own and read a lendable key. Without `lend: true` that cannot happen. |
 | Capability tokens | Container `opencode.json` | That agent. Scoped to its session, budget-capped, revoked when the session ends. |
 | Node private key | Node `0600` file or systemd-cred | That node. |
 | Operator API tokens | Supervisor DB, SHA-256 hashed, scoped `read`/`operate`/`admin` | Shown once at creation. |
@@ -413,3 +413,9 @@ moocher/
 | Death and cleanup | `dead` reasons, cost-aware retry/reassign/halt, harvest of outputs on every exit | 3 ✔ |
 | UI | SolidJS + Tailwind + Kobalte, dark/light, colour+icon status encoding, Open in OpenCode on a second port of your domain, notifications incl. Web Push, password login on your domain | 4 |
 | Containers | Live CPU/RAM/pids/disk per instance, soft or hard disk limits | 2 ✔ soft · 5 hard |
+
+## Key pools and the registry
+
+Keyproxy tries key and route pairs in turn (`node-daemon/src/gateway.rs`, `pool.rs`). The hub's registry (`supervisor/src/pool.rs`) holds each node's keys, who uses what, and the merged allowances, and sends each node its view every few seconds. Choosing stays on the node, so calls keep working while the hub is away; the view can only lag, so counts can still overshoot a little.
+
+Urgency goes through the hub, since nodes do not know it: a session hitting a limit reports `quota.pressure`, and if it is `right_now` the hub tells nodes that everyone else keeps off that allowance. The rule lapses after 90 s unless renewed, so a lost hub cannot hold work back for long. A held-back call gets a 429 with `retry-after`, like any parked call, so it happens between model calls and loses nothing.

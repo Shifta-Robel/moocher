@@ -21,6 +21,7 @@ mod resources;
 mod state;
 mod templates;
 mod retention;
+mod pool;
 mod preempt;
 mod spawnq;
 mod tlslink;
@@ -353,6 +354,16 @@ async fn run(dir: PathBuf, cfg: SupervisorConfig) -> Result<()> {
     }
     let api = web::serve(listener, api::router(sup.clone()), api_tls);
 
+    {
+        let sup = sup.clone();
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(std::time::Duration::from_secs(3));
+            loop {
+                iv.tick().await;
+                sup.push_registry().await;
+            }
+        });
+    }
     {
         let sup = sup.clone();
         tokio::spawn(async move {

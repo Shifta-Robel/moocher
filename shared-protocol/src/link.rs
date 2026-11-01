@@ -55,6 +55,11 @@ pub enum NodeEvent {
     Egress { ips: Vec<EgressIp> },
     /// Current quota buckets of this node (full snapshot, debounced).
     Quotas { buckets: Vec<QuotaBucket> },
+    /// This node's key pools and who uses what (full snapshot, on change).
+    Pool {
+        keys: Vec<crate::model::PoolKeyInfo>,
+        in_use: Vec<crate::model::KeyUse>,
+    },
     /// Provider latency per route (full snapshot, at most once a minute).
     RouteStats { stats: Vec<RouteStat> },
     /// What keyproxy saw of providers: hourly rows (absolute values for their
@@ -147,6 +152,13 @@ pub struct SpawnSpec {
 #[serde(tag = "c", rename_all = "snake_case")]
 pub enum NodeCommand {
     Spawn(SpawnSpec),
+    /// The cluster's allowances and who must keep off which.
+    Registry {
+        buckets: Vec<crate::model::RegistryBucket>,
+        yields: Vec<crate::model::KeyYield>,
+    },
+    /// Encrypt a lendable key for `to` (the hub only passes the result on).
+    LendKey { provider: String, key_id: String, to: String, public_key: String },
     Prompt { session: String, text: String, delivery: Delivery },
     Interrupt { session: String },
     /// Stop and harvest; `trigger` (`stop`, `task_end`) goes into the harvest record.
@@ -249,6 +261,8 @@ pub enum IfBusy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "tool", rename_all = "snake_case")]
 pub enum AgentCall {
+    /// A node's keys for `provider` ran out: ask another for one, encrypted to `public_key`.
+    BorrowKey { provider: String, public_key: String, have: Vec<String> },
     Send { to: String, text: String, #[serde(default)] delivery: Delivery },
     Inbox,
     ListAgents,

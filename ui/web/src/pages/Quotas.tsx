@@ -1,4 +1,4 @@
-import { For, Show, createResource, createSignal } from "solid-js";
+import { For, Show, createResource, createSignal, onCleanup } from "solid-js";
 import { get, post } from "../api";
 import { Button, Card, Empty, Field, IpChip, Modal, NodeChip, PageHeader, Pill, QuotaBar, act, inputCls } from "../components/ui";
 import * as I from "../icons";
@@ -7,6 +7,11 @@ import type { Quota } from "../types";
 
 export default function Quotas() {
   const [egress] = createResource(() => get<any>("/egress").catch(() => ({ ips: [], shared: [] })));
+  const [pool, { refetch: refetchPool }] = createResource(() => get<any>("/pool").catch(() => ({ keys: [], in_use: [], yields: [] })));
+  const poolTimer = window.setInterval(() => refetchPool(), 5000);
+  onCleanup(() => window.clearInterval(poolTimer));
+  const keyState = (k: any) =>
+    k.bad_until ? "refused by the provider" : k.exhausted_until ? `used up, resets in ${Math.max(0, Math.round((k.exhausted_until - Date.now()) / 60000))} min` : k.borrowed ? "ok (borrowed)" : "ok";
   const [edit, setEdit] = createSignal<Quota | null>(null);
   const [remaining, setRemaining] = createSignal("");
   const [resets, setResets] = createSignal("");
@@ -39,6 +44,35 @@ export default function Quotas() {
   return (
     <>
       <PageHeader title="Providers & quotas" subtitle="Allowances per IP, key or account, with reset countdowns. Overrides are written to the node's overrides.yaml." />
+      <Show when={pool()?.keys?.length}>
+        <Card class="mb-5">
+          <h2 class="mb-2 font-semibold">Key pools</h2>
+          <ul class="space-y-1 text-sm">
+            <For each={pool()!.keys}>
+              {(k: any) => (
+                <li class="flex flex-wrap items-center gap-x-2 gap-y-1">
+                  <span class="font-medium">{k.provider}</span>
+                  <NodeChip name={k.node} />
+                  <code class="break-all text-xs">{k.key_id}</code>
+                  <Show when={k.lendable}>
+                    <Pill>lends</Pill>
+                  </Show>
+                  <span class="text-slate-500">
+                    {keyState(k)} · {pool()!.in_use.filter((u: any) => u.node === k.node && u.key_id === k.key_id).length} sessions · {k.in_flight} calls now
+                  </span>
+                </li>
+              )}
+            </For>
+          </ul>
+          <For each={pool()!.yields}>
+            {(y: any) => (
+              <p class="mt-2 text-sm text-amber-700 dark:text-amber-400">
+                {y.provider} {y.scope_id} is kept for {y.by}; less urgent work waits or uses another key.
+              </p>
+            )}
+          </For>
+        </Card>
+      </Show>
       <Show when={state.quotas.length} fallback={<Empty icon={I.Gauge} title="No allowances seen yet">They appear after the first provider calls.</Empty>}>
         <div class="space-y-5">
           <For each={providers()}>

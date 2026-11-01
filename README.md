@@ -22,6 +22,7 @@ Since then:
 - four **urgency levels**: `right_now` pauses less urgent work, which resumes afterwards;
 - messages for a paused or dead session are **held** and delivered in order, marked as past events;
 - a **manager** that answers questions about the cluster and opens the right page, keeping nothing (`moo ask`, or the dashboard button);
+- **key pools**: a session moves to another API key or IP when one runs out, `right_now` work takes priority under pressure, and nodes can lend each other keys;
 - a **work map** showing each task's agents as a graph.
 
 Verified with end-to-end suites (`tests/e2e/`), including a real browser, an ACME CA, and load and chaos tests. Phase 5 adds the hardening: keyproxy usage metering, egress allowlists, hard disk quotas, event export and artifact expiry, and systemd/Quadlet units. See [docs/PHASE5.md](docs/PHASE5.md).

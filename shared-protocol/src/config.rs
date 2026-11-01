@@ -822,6 +822,52 @@ pub struct ProviderDef {
     /// limits are still learned from rate-limit headers and 429 responses.
     #[serde(default)]
     pub quota: Option<QuotaSpec>,
+    /// API keys shared by every agent of this provider that names no `key`.
+    /// Keyproxy moves a session to another when one runs out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<PoolKey>,
+    #[serde(default)]
+    pub selection: KeySelection,
+    /// Ask other nodes for a key when this node's are used up (or it has none).
+    /// They must have marked one `lend: true`.
+    #[serde(default)]
+    pub borrow: bool,
+}
+
+/// One key of a provider's pool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PoolKey {
+    #[serde(rename = "ref", default, skip_serializing_if = "String::is_empty")]
+    pub reference: String,
+    /// Alias from node.yaml `secrets:`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Other nodes may borrow this key. It leaves this machine, encrypted for the borrower.
+    #[serde(default)]
+    pub lend: bool,
+    /// Calls this key may have under way across the cluster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
+}
+
+impl PoolKey {
+    pub fn secret_ref(&self) -> SecretRef {
+        SecretRef { reference: self.reference.clone(), secret: self.secret.clone(), account: self.account.clone() }
+    }
+}
+
+/// How a session uses a pool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KeySelection {
+    /// Start on the least used key and stay until it runs out (keeps prompt caches).
+    #[default]
+    Sticky,
+    /// Every call goes to the key with the most room.
+    Spread,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1067,6 +1113,9 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderDef> {
             prices: BTreeMap::new(),
             description: Some(desc.into()),
             quota: None,
+            keys: vec![],
+            selection: KeySelection::default(),
+            borrow: false,
         }
     }
     use ApiKind::*;
@@ -1145,6 +1194,9 @@ pub struct RoutePlan {
     pub failover: Vec<String>,
     #[serde(default)]
     pub on_exhausted: OnExhausted,
+    /// Treat the routes as equals: a session starts on the least used one.
+    #[serde(default)]
+    pub balance: bool,
 }
 
 fn default_direct() -> String {
@@ -1164,7 +1216,7 @@ pub enum OnExhausted {
 impl RouteSpec {
     pub fn plan(&self) -> RoutePlan {
         match self {
-            RouteSpec::Name(n) => RoutePlan { prefer: n.clone(), failover: vec![], on_exhausted: OnExhausted::Wait },
+            RouteSpec::Name(n) => RoutePlan { prefer: n.clone(), failover: vec![], on_exhausted: OnExhausted::Wait, balance: false },
             RouteSpec::Plan(p) => p.clone(),
         }
     }
@@ -1833,8 +1885,8 @@ impl AgentConfig {
         match providers.get(&self.provider.id) {
             None => errs.push(format!("unknown provider {:?}", self.provider.id)),
             Some(p) => {
-                if p.auth != AuthStyle::None && self.provider.key.is_none() && self.provider.id != "pollinations" {
-                    errs.push(format!("provider {:?} needs provider.key (a secret ref)", self.provider.id));
+                if p.auth != AuthStyle::None && self.provider.key.is_none() && p.keys.is_empty() && !p.borrow && self.provider.id != "pollinations" {
+                    errs.push(format!("provider {:?} needs provider.key (a secret ref), or `keys:` on the provider", self.provider.id));
                 }
                 if p.api == ApiKind::Opencode {
                     if self.provider.key.is_some() {

@@ -70,6 +70,8 @@ impl Snapshot {
         self.agents
             .values()
             .map(|a| AgentInfo {
+                pool: self.pool_scopes(&a.cfg),
+                borrow: a.cfg.provider.key.is_none() && self.providers.get(&a.cfg.provider.id).is_some_and(|p| p.borrow),
                 name: a.cfg.name.clone(),
                 description: a.cfg.description.clone(),
                 provider: a.cfg.provider.id.clone(),
@@ -99,6 +101,13 @@ impl Snapshot {
                 context: a.cfg.provider.context,
             })
             .collect()
+    }
+
+    /// Allowances of the key pool an agent draws on.
+    fn pool_scopes(&self, a: &AgentConfig) -> Vec<String> {
+        let Some(p) = self.providers.get(&a.provider.id).filter(|_| a.provider.key.is_none()) else { return vec![] };
+        let scope = crate::quota::default_scope(p, true);
+        crate::pool::own_keys(self, p).iter().map(|k| crate::quota::scope_id(scope, &self.node.name, "direct", None, k.secret.as_deref(), k.account.as_deref())).collect()
     }
 
     /// Resolve an agent's key: (secret, account label). Aliases go through node.yaml `secrets:`.
@@ -229,7 +238,7 @@ pub fn load(dir: &Path) -> Result<Snapshot> {
             }
         }
         let secret_ok = match &cfg.provider.key {
-            None => true,
+            None => providers.get(&cfg.provider.id).is_none_or(|p| p.keys.is_empty() || p.borrow || p.keys.iter().any(|k| resolve_key(&node.secrets, &k.secret_ref()).is_ok())),
             Some(r) => resolve_key(&node.secrets, r).is_ok(),
         };
         let mut h = Sha256::new();

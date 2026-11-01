@@ -253,6 +253,12 @@ pub enum SessionRole {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentInfo {
+    /// Quota scope ids of the provider's key pool on this node (empty: one key, or none).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pool: Vec<String>,
+    /// This node asks others for a key when its own run out.
+    #[serde(default)]
+    pub borrow: bool,
     pub name: String,
     pub description: String,
     pub provider: String,
@@ -1182,4 +1188,96 @@ mod tests {
         assert_eq!(todo_verdict(&[t("x", "completed"), t("y", "pending")], &[], true), Verdict::Incomplete);
         assert_eq!(todo_verdict(&[], &[], true), Verdict::Pass);
     }
+}
+
+/// A key of a provider's pool, as its node reports it. Never the key itself.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PoolKeyInfo {
+    pub provider: String,
+    /// `key:<hash prefix>`.
+    pub key_id: String,
+    /// The allowance it draws on.
+    pub scope_id: String,
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub lendable: bool,
+    /// Borrowed from another node (held in memory only).
+    #[serde(default)]
+    pub borrowed: bool,
+    /// The provider refused it; not tried again until then.
+    #[serde(default)]
+    pub bad_until: Option<Ts>,
+    #[serde(default)]
+    pub max_concurrent: Option<u32>,
+    #[serde(default)]
+    pub in_flight: u32,
+}
+
+/// What a session is using now.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct KeyUse {
+    pub session: String,
+    pub provider: String,
+    pub key_id: String,
+    pub scope_id: String,
+    pub route: String,
+    #[serde(default)]
+    pub ip: Option<String>,
+}
+
+/// The cluster's view of one allowance, for choosing a key and IP.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RegistryBucket {
+    pub provider: String,
+    pub scope_id: String,
+    /// Used up, by everyone's count, until then.
+    #[serde(default)]
+    pub exhausted_until: Option<Ts>,
+    #[serde(default)]
+    pub used: u64,
+    /// Calls under way on other nodes.
+    #[serde(default)]
+    pub in_flight: u32,
+    /// Sessions on other nodes using it.
+    #[serde(default)]
+    pub sessions: u32,
+}
+
+/// Sessions other than `exempt` keep off this allowance for now.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct KeyYield {
+    pub provider: String,
+    pub scope_id: String,
+    pub exempt: Vec<String>,
+    /// Lapses unless renewed, so a lost hub cannot hold work back for long.
+    pub expires_at: Ts,
+    /// Who it is for, to tell the sessions held back.
+    pub by: String,
+}
+
+/// `GET /pool`: keys, who uses them, and what is held back.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PoolView {
+    pub keys: Vec<PoolNodeKey>,
+    pub in_use: Vec<PoolNodeUse>,
+    pub yields: Vec<KeyYield>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PoolNodeKey {
+    pub node: String,
+    #[serde(flatten)]
+    pub key: PoolKeyInfo,
+    #[serde(default)]
+    pub exhausted_until: Option<Ts>,
+    #[serde(default)]
+    pub used: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PoolNodeUse {
+    pub node: String,
+    #[serde(flatten)]
+    pub used: KeyUse,
 }

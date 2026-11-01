@@ -184,6 +184,11 @@ impl Manager {
     pub async fn handle(self: &Arc<Self>, cmd: NodeCommand) -> Result<Value> {
         match cmd {
             NodeCommand::Spawn(spec) => self.spawn(spec).await,
+            NodeCommand::Registry { buckets, yields } => {
+                self.gw.pool.apply(buckets, yields);
+                Ok(serde_json::Value::Null)
+            }
+            NodeCommand::LendKey { provider, key_id, to, public_key } => crate::pool::lend(&self.cfg.get(), &provider, &key_id, &to, &public_key),
             NodeCommand::Prompt { session, text, delivery } => {
                 let inst = self.get(&session)?;
                 if inst.stopping.load(Ordering::Relaxed) {

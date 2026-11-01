@@ -126,6 +126,7 @@ pub fn router(sup: Arc<Sup>) -> Router {
         .route("/nodes/{name}/routes", post(route_override))
         .route("/nodes/{name}/probe", post(probe_egress))
         .route("/quotas", get(quotas))
+        .route("/pool", get(pool))
         .route("/providers/stats", get(provider_stats))
         .route("/providers/events", get(provider_events))
         .route("/quotas/override", post(quota_override))
@@ -263,6 +264,10 @@ async fn session_stats(State(sup): S, Path(id): Path<String>) -> R<Value> {
 
 async fn templates(State(sup): S) -> Json<Value> {
     Json(sup.templates_view())
+}
+
+async fn pool(State(sup): S) -> Json<PoolView> {
+    Json(sup.pool_view())
 }
 
 async fn quotas(State(sup): S) -> Json<Vec<QuotaView>> {

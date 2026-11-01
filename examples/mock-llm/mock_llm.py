@@ -126,9 +126,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _quota(self):
         """(allowed, headers) for this client's fixed-window request budget."""
-        if not IP_QUOTA:
+        if not IP_QUOTA or (QUOTA_BY_KEY and self.headers.get("authorization") == f"Bearer {REQUIRE_KEY}"):
             return True, {}
-        ip, now = self.client_address[0], time.time()
+        ip, now = (self.headers.get("authorization") if QUOTA_BY_KEY else self.client_address[0]), time.time()
         start, count = WINDOWS.get(ip, (now, 0))
         if now - start >= IP_WINDOW:
             start, count = now, 0
@@ -169,7 +169,7 @@ class Handler(BaseHTTPRequestHandler):
                     "messages": body.get("messages", [])})
         if not self.path.endswith("/chat/completions"):
             return self._json(404, {"error": "not found"})
-        if REQUIRE_KEY and self.headers.get("authorization") != f"Bearer {REQUIRE_KEY}":
+        if REQUIRE_KEY and self.headers.get("authorization") not in [f"Bearer {k}" for k in [REQUIRE_KEY, *ACCEPT_KEYS]]:
             return self._json(401, {"error": {"message": "mock: wrong or missing API key"}})
         allowed, rl = self._quota()
         ip = self.client_address[0]
@@ -235,8 +235,11 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
 
 
+ACCEPT_KEYS, QUOTA_BY_KEY = [], False
+
+
 def main():
-    global SCRIPTS, REQUIRE_KEY, IP_QUOTA, IP_WINDOW
+    global SCRIPTS, REQUIRE_KEY, IP_QUOTA, IP_WINDOW, ACCEPT_KEYS, QUOTA_BY_KEY
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8099)
@@ -245,7 +248,10 @@ def main():
                     help="reject requests whose bearer token is not this key (proves keyproxy injection)")
     ap.add_argument("--ip-quota", type=int, default=0, help="chat requests allowed per client IP per window (0 = unlimited)")
     ap.add_argument("--ip-window", type=int, default=60, help="quota window in seconds")
+    ap.add_argument("--accept-key", action="append", default=[], help="another key --require-key lets through")
+    ap.add_argument("--quota-by-key", action="store_true", help="--ip-quota counts per --accept-key, not per IP")
     a = ap.parse_args()
+    ACCEPT_KEYS, QUOTA_BY_KEY = a.accept_key, a.quota_by_key
     SCRIPTS = a.scripts
     REQUIRE_KEY = a.require_key
     IP_QUOTA, IP_WINDOW = a.ip_quota, a.ip_window

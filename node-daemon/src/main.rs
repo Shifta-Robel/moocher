@@ -11,6 +11,7 @@ mod gitops;
 mod link;
 mod manager;
 mod oneshot;
+mod pool;
 mod obs;
 mod oc;
 mod pki;
@@ -199,7 +200,8 @@ async fn run(dir: PathBuf) -> Result<()> {
     let files = Arc::new(wsops::WsOps::new(cas, store.clone(), data_dir.clone(), rt.chown_target(), rt.git_runner(cfg.clone())));
     let obs = obs::Observer::new(&node_name, store.clone());
     let units = Arc::new(units::Units::new(&node_name, store.clone()));
-    let deps = gateway::GatewayDeps { cfg: cfg.clone(), link: link.clone(), egress: egress.clone(), quotas: quotas.clone(), units: units.clone(), files, obs: obs.clone() };
+    let pool = Arc::new(pool::Pool::default());
+    let deps = gateway::GatewayDeps { pool: pool.clone(), cfg: cfg.clone(), link: link.clone(), egress: egress.clone(), quotas: quotas.clone(), units: units.clone(), files, obs: obs.clone() };
     let mgr = manager::Manager::new(cfg.clone(), store, rt, link.clone(), deps)?;
     tracing::info!(node = %node_name, supervisor = %supervisor, data = %mgr.data_root().display(), "starting");
 
@@ -283,6 +285,7 @@ async fn run(dir: PathBuf) -> Result<()> {
             let mut iv = tokio::time::interval(std::time::Duration::from_secs(3));
             loop {
                 iv.tick().await;
+                pool.report(&link, &cfg.get());
                 let (a, b) = (quotas.flush(), units.flush());
                 if a || b {
                     let s = cfg.get();

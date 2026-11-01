@@ -1375,3 +1375,23 @@ moo spawn gen-fast -p "Review this diff" --system-prompt "You are a careful revi
 A coordinator does the same through `cluster_spawn_agent`'s `system_prompt`. The prompt is required for a generic agent and refused for any other. Tools and limits still come from the config, so a spawner cannot widen them.
 
 To keep a costly model for urgent work, add `min_urgency: right_now` (or another level) to its agent. An agent below that level is refused it; you can always start it by hand.
+
+## Several API keys
+
+List them on the provider, on each node that has them (`providers.yaml`), and leave `key` off the agents:
+
+```yaml
+providers:
+  groq:
+    keys:
+      - { ref: "env:GROQ_KEY_1" }
+      - { ref: "env:GROQ_KEY_2", lend: true }
+```
+
+Sessions start on the least used key and move to the next when one runs out or is refused, with no restart. `moo pool` (or **Providers & quotas**) shows each key by a short hash, its state, who uses what and anything kept for urgent work. `key.switched` events record each move.
+
+To spread sessions across IPs as well, give the agent `route: { prefer: direct, failover: [via-vps], balance: true }`.
+
+When `right_now` work hits a limit, less urgent sessions keep off that key or IP until it is done. They move to another, or wait at their next call. Nothing is lost.
+
+A node out of keys can borrow: `lend: true` on the key, `borrow: true` on the provider of the node that needs it. The key travels encrypted and stays in memory for an hour. Lending means the key leaves its machine: any approved worker can ask for it, and a compromised hub could obtain it. Only mark keys you accept that for.

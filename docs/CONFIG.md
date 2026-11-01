@@ -193,6 +193,35 @@ The figures above are placeholders: take them from your provider's price list. A
 
 An entry with the same id overrides a built-in.
 
+### Key pools — `keys:`
+
+Several keys for one provider, shared by every agent of it that names no `key` of its own:
+
+```yaml
+providers:
+  anthropic:
+    keys:
+      - { secret: anthropic-1, account: personal, lend: true }   # alias from node.yaml `secrets:`, or ref: "env:…"
+      - { ref: "file:/etc/moo/anthropic-2", max_concurrent: 4 }
+    selection: sticky   # or spread
+    borrow: true
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `keys[].ref` / `secret` | — | Where the key comes from; exactly one. |
+| `keys[].account` | — | Label for `scope: account`. |
+| `keys[].lend` | `false` | Other nodes may borrow this key. It leaves this machine, encrypted for the borrower. |
+| `keys[].max_concurrent` | — | Calls this key may have under way across the cluster. |
+| `selection` | `sticky` | `sticky`: start on the least used key and stay until it runs out, which keeps prompt caches. `spread`: each call goes to the key with the most room. |
+| `borrow` | `false` | Ask other nodes for a key when this node's run out. A node can have only this, with no keys of its own. |
+
+- **What makes a key run out:** a used-up allowance by the cluster's count, a 429, out of credits (402, looked at again in an hour), or a 401/403 (left out for 10 minutes, and you are told). The session carries on with the next one: the agent only ever holds its capability token.
+- **Set `quota.scope` to match the provider.** With `scope: key`, the default with keys, a 429 counts against the key. With `scope: ip`, it counts against the IP, so changing key does not help but changing route does. One scope is tracked per provider, so a provider limiting by both is only followed on the one you choose.
+- **Order:** routes as planned, each with its keys, least used first. `route: { …, balance: true }` treats routes as equals: a session starts on the least used and stays there.
+- **Urgency:** when `right_now` work hits a limit, less urgent sessions keep off that key or IP until it is done. They move to another, or their next call waits; the call under way finishes.
+- **Borrowing needs both sides:** `lend: true` on the lender and `borrow: true` on the borrower. Borrowed keys stay in memory for an hour, and each loan is audited.
+
 ## routes.yaml
 
 ```yaml
