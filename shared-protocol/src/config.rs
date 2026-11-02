@@ -741,6 +741,10 @@ pub struct TaskSchedulerConfig {
     /// `right_now` work may also pause sessions started by hand (no task).
     #[serde(default)]
     pub preempt_operator_sessions: bool,
+    /// How long a paused task's agents get to reach their next model call
+    /// before they are cut off.
+    #[serde(default = "default_pause_grace")]
+    pub pause_grace_secs: u32,
     /// Upper bound on tasks running at once. `urgent` tasks may use one extra
     /// slot; `right_now` tasks ignore it.
     #[serde(default = "default_max_tasks")]
@@ -763,6 +767,7 @@ impl Default for TaskSchedulerConfig {
             coordinator_node: None,
             coordinator_agent_right_now: None,
             preempt_operator_sessions: false,
+            pause_grace_secs: default_pause_grace(),
             max_concurrent_tasks: default_max_tasks(),
             idle_grace_secs: default_idle_grace(),
             max_nudges: default_nudges(),
@@ -774,6 +779,10 @@ impl Default for TaskSchedulerConfig {
 fn default_coordinator() -> String {
     "coordinator".into()
 }
+fn default_pause_grace() -> u32 {
+    120
+}
+
 fn default_max_tasks() -> u32 {
     2
 }
@@ -886,6 +895,55 @@ pub struct QuotaSpec {
     /// one buys (learned).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub units: BTreeMap<String, UnitSpec>,
+    /// How fast calls may go out, per key / IP / account as `scope:` says.
+    /// Above it a call waits briefly, the most urgent first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate: Option<RateLimit>,
+    /// What applies to one model, on top of the limits above. A model listed
+    /// here also keeps a 429 to itself instead of stopping the whole key.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, ModelQuota>,
+}
+
+impl QuotaSpec {
+    pub fn problems(&self) -> Vec<String> {
+        let mut errs = vec![];
+        let mut check = |what: &str, limits: &[QuotaLimit], rate: Option<&RateLimit>| {
+            for l in limits {
+                if parse_duration_ms(&l.window).is_none_or(|w| w <= 0) {
+                    errs.push(format!("{what}: bad window {:?}", l.window));
+                }
+            }
+            if rate.is_some_and(|r| r.rps == Some(0) || r.rpm == Some(0) || (r.rps.is_none() && r.rpm.is_none())) {
+                errs.push(format!("{what}: rate needs rps or rpm above 0"));
+            }
+        };
+        check("quota", &self.limits, self.rate.as_ref());
+        for (m, q) in &self.models {
+            check(&format!("quota.models.{m}"), &q.limits, q.rate.as_ref());
+        }
+        errs
+    }
+}
+
+/// `quota.models.<model>`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelQuota {
+    #[serde(default)]
+    pub limits: Vec<QuotaLimit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate: Option<RateLimit>,
+}
+
+/// Calls per second and per minute.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpm: Option<u32>,
 }
 
 /// One provider unit (`quota.units.<name>`).
@@ -1881,6 +1939,9 @@ impl AgentConfig {
             if k.reference.is_empty() == k.secret.is_none() {
                 errs.push("provider.key needs exactly one of `ref` or `secret`".into());
             }
+        }
+        if let Some(q) = providers.get(&self.provider.id).and_then(|p| p.quota.as_ref()) {
+            errs.extend(q.problems());
         }
         match providers.get(&self.provider.id) {
             None => errs.push(format!("unknown provider {:?}", self.provider.id)),

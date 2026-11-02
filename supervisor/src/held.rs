@@ -51,7 +51,7 @@ pub fn digest(held: &[Held], now: Ts) -> String {
 impl Sup {
     /// Should a message wait instead of going to its node?
     pub fn holds_messages(&self, s: &SessionInfo) -> bool {
-        s.preempted.is_some() || s.report.state.may_return() || (s.report.state.is_live() && self.db.held_count(&s.report.id) > 0)
+        s.preempted.is_some() || s.task_paused.is_some() || s.report.state.may_return() || (s.report.state.is_live() && self.db.held_count(&s.report.id) > 0)
     }
 
     pub async fn hold_message(&self, actor: &Actor, id: &str, text: &str) -> Result<()> {
@@ -72,7 +72,7 @@ impl Sup {
     pub async fn flush_held(&self, id: &str) {
         let _g = self.held_lock.lock().await;
         let Some(s) = self.db.session(id) else { return };
-        if s.preempted.is_some() || !matches!(s.report.state, SessionState::Idle | SessionState::Running | SessionState::Blocked | SessionState::Parked) {
+        if s.preempted.is_some() || s.task_paused.is_some() || !matches!(s.report.state, SessionState::Idle | SessionState::Running | SessionState::Blocked | SessionState::Parked) {
             return;
         }
         let held = self.db.held(id).unwrap_or_default();

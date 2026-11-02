@@ -1376,6 +1376,24 @@ A coordinator does the same through `cluster_spawn_agent`'s `system_prompt`. The
 
 To keep a costly model for urgent work, add `min_urgency: right_now` (or another level) to its agent. An agent below that level is refused it; you can always start it by hand.
 
+## Pausing a task
+
+```bash
+moo task pause 12        # also on the Tasks page
+moo task pause 12 --now  # cut off what its agents are doing
+moo task resume 12
+```
+
+A pause stops every agent of the task and keeps its conversation, todos, workspace and container. The task shows as `pausing` until all have stopped, then `paused`, and its agents give up their slots.
+
+- **Default:** each agent stops at its next model call, so the reply and any command under way finish first. Idle agents, and those waiting for an answer or for other agents, stop at once. After `tasks.pause_grace_secs` (default 2 minutes), any still going are cut off.
+- **`--now`:** stops them at once, the coordinator first. The agents are told on resume that a command may not have finished.
+- **While paused:** messages wait at the hub and arrive as one digest on resume. Questions stay open and do not escalate. Spawns the task had queued wait. The task does not count toward `max_concurrent_tasks` and holds no other work back, even at `right_now`.
+- **Resume** follows the rules for starting work: unless the task is `right_now`, it waits for `right_now` work and the task cap. An agent also preempted by `right_now` work comes back when that work is done.
+- **A queued task** can be paused too, which keeps it from starting; resume puts it back in the queue.
+- **Shared workspaces:** other tasks' agents can still change files during a pause. Prompt caches may expire, so the first call after a long pause can cost more.
+- **Workflows:** a step that finishes while the task is pausing still starts the next one, which is paused at its first model call.
+
 ## Several API keys
 
 List them on the provider, on each node that has them (`providers.yaml`), and leave `key` off the agents:

@@ -165,7 +165,7 @@ class Handler(BaseHTTPRequestHandler):
         self._rl = {}
         body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))) or b"{}")
         LOG.append({"path": self.path, "auth": self.headers.get("authorization"), "model": body.get("model"), "client": self.client_address[0],
-                    "stream": bool(body.get("stream")), "include_usage": bool((body.get("stream_options") or {}).get("include_usage")),
+                    "ts": time.time(), "stream": bool(body.get("stream")), "include_usage": bool((body.get("stream_options") or {}).get("include_usage")),
                     "messages": body.get("messages", [])})
         if not self.path.endswith("/chat/completions"):
             return self._json(404, {"error": "not found"})

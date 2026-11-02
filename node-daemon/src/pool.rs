@@ -75,6 +75,7 @@ struct Inner {
     flights: HashMap<(String, String), u32>,
     key_flights: HashMap<String, u32>,
     bad: HashMap<String, Ts>,
+    levels: BTreeMap<String, u8>,
     borrowed: HashMap<String, Vec<Borrowed>>,
     borrow_after: HashMap<String, Ts>,
     last_report: Option<(Vec<PoolKeyInfo>, Vec<KeyUse>, Ts)>,
@@ -120,7 +121,13 @@ impl Default for Pool {
 }
 
 impl Pool {
-    pub fn apply(&self, buckets: Vec<RegistryBucket>, yields: Vec<KeyYield>) {
+    /// A session's urgency as the hub last said (`level()`); normal by default.
+    pub fn level(&self, session: &str) -> u8 {
+        self.inner.lock().unwrap().levels.get(session).copied().unwrap_or(TaskLabel::Normal.level())
+    }
+
+    pub fn apply(&self, buckets: Vec<RegistryBucket>, yields: Vec<KeyYield>, levels: BTreeMap<String, u8>) {
+        self.inner.lock().unwrap().levels = levels;
         let mut m = self.inner.lock().unwrap();
         m.buckets = buckets.into_iter().map(|b| ((b.provider.clone(), b.scope_id.clone()), b)).collect();
         m.yields = yields;
@@ -370,7 +377,7 @@ mod tests {
     fn yields_spare_the_exempt_and_lapse() {
         let pool = Pool::default();
         let y = KeyYield { provider: "p".into(), scope_id: "key:a".into(), exempt: vec!["urgent".into()], expires_at: 100, by: "task #1".into() };
-        pool.apply(vec![], vec![y]);
+        pool.apply(vec![], vec![y], Default::default());
         assert_eq!(pool.yielded("p", "key:a", "other", 50).as_deref(), Some("task #1"));
         assert_eq!(pool.yielded("p", "key:a", "urgent", 50), None);
         assert_eq!(pool.yielded("p", "key:b", "other", 50), None);

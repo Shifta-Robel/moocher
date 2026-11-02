@@ -83,6 +83,10 @@ pub struct Gateway {
     obs: Arc<crate::obs::Observer>,
     units: Arc<crate::units::Units>,
     pool: Arc<crate::pool::Pool>,
+    pacer: Arc<crate::pace::Pacer>,
+    /// The task is pausing: new model calls wait here until the halt comes.
+    hold: Arc<tokio::sync::watch::Sender<bool>>,
+    holding: Arc<std::sync::atomic::AtomicU32>,
     /// The key this session stays on, and the route when routes are balanced.
     current: Arc<Mutex<Option<(String, String)>>>,
     /// Last time each allowance's pressure was reported.
@@ -106,6 +110,7 @@ pub struct GatewayDeps {
     pub obs: Arc<crate::obs::Observer>,
     pub units: Arc<crate::units::Units>,
     pub pool: Arc<crate::pool::Pool>,
+    pub pacer: Arc<crate::pace::Pacer>,
 }
 
 impl Gateway {
@@ -145,6 +150,9 @@ impl Gateway {
             provider_alert: Default::default(),
             ws: Arc::new(ws),
             files: deps.files.clone(),
+            pacer: deps.pacer.clone(),
+            hold: Arc::new(tokio::sync::watch::channel(false).0),
+            holding: Default::default(),
             fetched: Default::default(),
             obs: deps.obs.clone(),
             units: deps.units.clone(),
@@ -279,6 +287,7 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
         Ok(b) => b,
         Err(_) => return llm_error(StatusCode::PAYLOAD_TOO_LARGE, "request too large"),
     };
+    g.wait_while_held().await;
     let usage_total = {
         let u = g.effective_usage();
         let budget = g.overrides.lock().unwrap().budget_usd.or(agent.cfg.limits.budget_usd);
@@ -358,25 +367,35 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
             names.push(n);
         }
     }
+    let model_quota = spec.models.get(&agent.cfg.provider.model).cloned();
+    let model_limits = model_quota.as_ref().map(|q| q.limits.clone()).unwrap_or_default();
+    let of_model = |t: &Target| model_quota.is_some().then(|| t.for_model(&agent.cfg.provider.model));
+    let rules_of = |t: &Target| crate::pace::rules(&provider, t, spec.rate.as_ref(), model_quota.as_ref().and_then(|q| q.rate.as_ref()), &agent.cfg.provider.model);
     let scope = quota::default_scope(&pdef, pooled || keys.iter().any(|k| k.secret.is_some()));
     let target_of = |k: &KeyChoice, route: &str| {
         let ip = g.egress.ip_of(route);
         Target { provider: provider.clone(), scope, scope_id: quota::scope_id(scope, &snap.node.name, route, ip.as_deref(), k.secret.as_deref(), k.account.as_deref()) }
     };
-    // What stops this key and route now: (until, why, is it a limit being hit).
-    let blocked = |k: &KeyChoice, t: &Target, now: Ts| -> Option<(Ts, String, bool)> {
+    // What stops this key and route now: (until, why, the allowance being hit if any).
+    let blocked = |k: &KeyChoice, t: &Target, now: Ts| -> Option<(Ts, String, Option<String>)> {
         let model = &agent.cfg.provider.model;
         if let Some(until) = g.quotas.exhausted(t, &limits, &snap.overrides.quotas, now).or_else(|| g.pool.exhausted(&provider, &t.scope_id, now)) {
-            return Some((until, format!("allowance used up, resets in {}", human_in(until - now)), true));
+            return Some((until, format!("allowance used up, resets in {}", human_in(until - now)), Some(t.scope_id.clone())));
+        }
+        let mt = of_model(t);
+        if let Some(mt) = &mt {
+            if let Some(until) = g.quotas.exhausted(mt, &model_limits, &[], now).or_else(|| g.pool.exhausted(&provider, &mt.scope_id, now)) {
+                return Some((until, format!("{model}'s allowance used up, resets in {}", human_in(until - now)), Some(mt.scope_id.clone())));
+            }
         }
         if let Some((until, unit)) = g.units.exhausted(t, model, &spec.units, now) {
-            return Some((until, format!("{unit} used up, resets in {}", human_in(until - now)), true));
+            return Some((until, format!("{unit} used up, resets in {}", human_in(until - now)), Some(t.scope_id.clone())));
         }
-        if let Some(by) = g.pool.yielded(&provider, &t.scope_id, &g.id, now) {
-            return Some((now + YIELD_RETRY_MS, format!("kept for {by}"), false));
+        if let Some(by) = g.pool.yielded(&provider, &t.scope_id, &g.id, now).or_else(|| mt.as_ref().and_then(|mt| g.pool.yielded(&provider, &mt.scope_id, &g.id, now))) {
+            return Some((now + YIELD_RETRY_MS, format!("kept for {by}"), None));
         }
         if g.pool.at_capacity(&provider, &t.scope_id, k) {
-            return Some((now + YIELD_RETRY_MS, "at its max_concurrent".into(), false));
+            return Some((now + YIELD_RETRY_MS, "at its max_concurrent".into(), None));
         }
         None
     };
@@ -411,14 +430,41 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
         let target = target_of(key, name);
         g.quotas.ensure(&target, name, &limits);
         g.units.ensure(&target, name, &agent.cfg.provider.model, &spec.units);
+        let model_target = of_model(&target);
+        if let Some(mt) = &model_target {
+            g.quotas.ensure(mt, name, &model_limits);
+        }
         let now = now_ms();
         if let Some((until, why, limit)) = blocked(key, &target, now) {
             skipped.push(format!("{name} ({}): {why}", target.scope_id));
             soonest = Some(soonest.map_or(until, |s: Ts| s.min(until)));
-            if limit {
-                g.pressure(&provider, &target.scope_id);
+            if let Some(scope_id) = limit {
+                g.pressure(&provider, &scope_id);
             }
             continue;
+        }
+        // Above the rate: stay on this key for a short wait, move on if another
+        // has room for a long one, else wait here.
+        let rules = rules_of(&target);
+        if !rules.is_empty() {
+            let wait = g.pacer.wait_ms(&rules, now);
+            let elsewhere = wait > crate::pace::STAY_MS && pairs[i + 1..].iter().any(|(n, k)| {
+                let t = target_of(k, n);
+                blocked(k, &t, now).is_none() && g.pacer.wait_ms(&rules_of(&t), now) == 0
+            });
+            if elsewhere {
+                skipped.push(format!("{name} ({}): above its request rate", target.scope_id));
+                all_exhausted = false;
+                continue;
+            }
+            if wait > 0 {
+                g.note_paced(&provider, &target.scope_id, wait);
+            }
+            if !g.pacer.acquire(&rules, g.pool.level(&g.id), crate::pace::MAX_WAIT_MS).await {
+                skipped.push(format!("{name} ({}): waited too long for its request rate", target.scope_id));
+                soonest = Some(soonest.map_or(now_ms() + YIELD_RETRY_MS, |s: Ts| s.min(now_ms() + YIELD_RETRY_MS)));
+                continue;
+            }
         }
         let client = match g.egress.client(&route) {
             Ok(c) => c,
@@ -451,6 +497,11 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
         }
         let flight = g.pool.begin(&provider, &target.scope_id, &key.key_id);
         g.quotas.record_request(&target, name, &g.id, &limits);
+        if let Some(mt) = &model_target {
+            g.quotas.record_request(mt, name, &g.id, &model_limits);
+        }
+        // A model with its own settings answers for itself: other models go on.
+        let answers_for = model_target.as_ref().unwrap_or(&target);
         *g.prev.lock().unwrap() = Some((target.clone(), name.clone(), usage_total));
         let sent = std::time::Instant::now();
         let upstream = match client.request(method.clone(), &url).headers(headers).body(body.clone()).send().await {
@@ -489,15 +540,15 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
             let rb = upstream.bytes().await.unwrap_or_default();
             let text = String::from_utf8_lossy(&rb[..rb.len().min(crate::obs::ERR_BODY)]).to_string();
             g.obs.record(&crate::obs::Call { status: Some(429), duration_ms: Some(sent.elapsed().as_secs_f64() * 1000.0), error_body: text.clone(), ..call(&target, name) });
-            let mut until = g.quotas.observe(&target, 429, &rh, &rb, &spec.learn).unwrap_or(now_ms() + 60_000);
+            let mut until = g.quotas.observe(answers_for, 429, &rh, &rb, &spec.learn).unwrap_or(now_ms() + 60_000);
             if crate::obs::classify(429, &text).class == "credits" {
                 // Out of credits is not a per-minute limit: look again in an hour.
                 until = until.max(now_ms() + 3_600_000);
                 g.quotas.exhaust_until(&target, until);
             }
             soonest = Some(soonest.map_or(until, |s: Ts| s.min(until)));
-            skipped.push(format!("{name} ({}): provider says rate limited, resets in {}", target.scope_id, human_in(until - now_ms())));
-            g.pressure(&provider, &target.scope_id);
+            skipped.push(format!("{name} ({}): provider says rate limited, resets in {}", answers_for.scope_id, human_in(until - now_ms())));
+            g.pressure(&provider, &answers_for.scope_id);
             if i + 1 < pairs.len() {
                 continue; // nothing has reached OpenCode yet: try the next key or route
             }
@@ -512,7 +563,7 @@ async fn keyproxy(State(g): State<Gateway>, Path((provider, rest)): Path<(String
             }
             return out.body(Body::from(rb)).unwrap_or_else(|_| llm_error(StatusCode::TOO_MANY_REQUESTS, "rate limited"));
         }
-        g.quotas.observe(&target, status.as_u16(), upstream.headers(), b"", &spec.learn);
+        g.quotas.observe(answers_for, status.as_u16(), upstream.headers(), b"", &spec.learn);
         if status.as_u16() == 402 {
             // Payment required: out of credits; look again in an hour.
             g.quotas.exhaust_until(&target, now_ms() + 3_600_000);
@@ -642,6 +693,37 @@ impl Gateway {
         routes.iter().flat_map(|r| keys.iter().map(move |k| (r.clone(), k.clone()))).collect()
     }
 
+    /// Pausing, or no longer: holds the call while the hold is on. The call goes
+    /// nowhere until released, and a halt ends it.
+    async fn wait_while_held(&self) {
+        let mut rx = self.hold.subscribe();
+        if !*rx.borrow_and_update() {
+            return;
+        }
+        self.holding.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.link.emit(NodeEvent::Activity { session: self.id.clone(), kind: "session.holding".into(), detail: json!({}) });
+        let _ = rx.wait_for(|h| !*h).await;
+        self.holding.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Turn the hold on or off. Says whether a call is being held now.
+    pub fn set_hold(&self, hold: bool) -> bool {
+        self.hold.send_replace(hold);
+        self.holding.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+
+    /// A call waits for the request rate; say so now and then.
+    fn note_paced(&self, provider: &str, scope_id: &str, wait_ms: i64) {
+        let now = now_ms();
+        let mut last = self.pressured.lock().unwrap();
+        let key = format!("paced {scope_id}");
+        if last.get(&key).is_some_and(|t| now - t < PRESSURE_EVERY_MS) {
+            return;
+        }
+        last.insert(key, now);
+        self.link.emit(NodeEvent::Activity { session: self.id.clone(), kind: "quota.paced".into(), detail: json!({"provider": provider, "scope_id": scope_id, "wait_ms": wait_ms}) });
+    }
+
     /// This session hit a limit. Only right_now work makes others give way,
     /// which the hub decides.
     fn pressure(&self, provider: &str, scope_id: &str) {
@@ -670,8 +752,16 @@ impl Gateway {
     pub fn settle_tokens(&self) {
         let Some((t, route, before)) = self.prev.lock().unwrap().take() else { return };
         let now_total = self.effective_usage().total();
-        let limits = self.cfg.get().providers.get(&t.provider).map(|p| quota::spec_for(p).limits).unwrap_or_default();
-        self.quotas.record_tokens(&t, &route, &self.id, &limits, now_total.saturating_sub(before));
+        let snap = self.cfg.get();
+        let spec = snap.providers.get(&t.provider).map(quota::spec_for);
+        let limits = spec.as_ref().map(|s| s.limits.clone()).unwrap_or_default();
+        let spent = now_total.saturating_sub(before);
+        self.quotas.record_tokens(&t, &route, &self.id, &limits, spent);
+        if let Some(model) = snap.agents.get(&self.agent).map(|a| a.cfg.provider.model.as_str()) {
+            if let Some(q) = spec.as_ref().and_then(|s| s.models.get(model)) {
+                self.quotas.record_tokens(&t.for_model(model), &route, &self.id, &q.limits, spent);
+            }
+        }
         // Later tokens of the same request (e.g. a resync) still belong there.
         *self.prev.lock().unwrap() = Some((t, route, now_total.max(before)));
     }

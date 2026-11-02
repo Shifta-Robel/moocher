@@ -225,6 +225,10 @@ pub struct SessionInfo {
     /// Paused to make room for `right_now` work; resumed when that is done.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preempted: Option<Preempted>,
+    /// Stopped because its task is paused; a separate reason from `preempted`,
+    /// and it runs again only when neither applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_paused: Option<SessionPause>,
     /// What its spawner set for this instance, for a replacement if it dies.
     #[serde(default, skip_serializing_if = "crate::config::SpawnOverrides::is_empty")]
     pub overrides: crate::config::SpawnOverrides,
@@ -238,6 +242,14 @@ fn is_zero(n: &u32) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionPause {
+    pub at: Ts,
+    /// Cut off in the middle of a turn, rather than stopped between model calls.
+    #[serde(default)]
+    pub cut_off: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Preempted {
     pub by: String,
     pub at: Ts,
@@ -670,6 +682,10 @@ pub enum TaskStatus {
     Cancelled,
     /// An agent died and recovery needs the operator (see `halts`).
     Halted,
+    /// The operator paused it; its agents are stopping at a clean point.
+    Pausing,
+    /// Its agents are stopped with everything kept, until `moo task resume`.
+    Paused,
 }
 
 impl TaskStatus {
@@ -681,6 +697,8 @@ impl TaskStatus {
             TaskStatus::Failed => "failed",
             TaskStatus::Cancelled => "cancelled",
             TaskStatus::Halted => "halted",
+            TaskStatus::Pausing => "pausing",
+            TaskStatus::Paused => "paused",
         }
     }
     pub fn parse(s: &str) -> Option<TaskStatus> {
@@ -691,6 +709,8 @@ impl TaskStatus {
             "failed" => TaskStatus::Failed,
             "cancelled" => TaskStatus::Cancelled,
             "halted" => TaskStatus::Halted,
+            "pausing" => TaskStatus::Pausing,
+            "paused" => TaskStatus::Paused,
             _ => return None,
         })
     }
@@ -723,6 +743,26 @@ pub struct Task {
     /// Overrides the cluster's question mode for this task's agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question_mode: Option<QuestionMode>,
+    /// Set while it is pausing, paused or on its way back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause: Option<TaskPause>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskPause {
+    pub at: Ts,
+    pub by: String,
+    /// Stop at once instead of at each agent's next model call.
+    #[serde(default)]
+    pub now: bool,
+    /// After this, agents not yet stopped are cut off.
+    pub deadline: Ts,
+    /// It had not started: resuming puts it back in the queue.
+    #[serde(default)]
+    pub was_queued: bool,
+    /// Resume was asked for; it goes when the scheduler has room.
+    #[serde(default)]
+    pub resuming: bool,
 }
 
 // --------------------------------------------------------------- workflows

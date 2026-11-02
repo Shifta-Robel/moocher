@@ -330,6 +330,14 @@ enum TaskCmd {
     Order { ids: Vec<i64> },
     /// Start now regardless of label.
     Run { id: i64 },
+    /// Stop its agents at their next model call, keeping everything.
+    Pause {
+        id: i64,
+        /// Stop them at once, cutting off what they are doing.
+        #[arg(long)]
+        now: bool,
+    },
+    Resume { id: i64 },
     Cancel { id: i64 },
     Rm { id: i64 },
 }
@@ -1090,6 +1098,14 @@ async fn run(cli: Cli) -> Result<()> {
             TaskCmd::Run { id } => {
                 api.post(&format!("/tasks/{id}/run"), json!({})).await?;
                 println!("task #{id} started");
+            }
+            TaskCmd::Pause { id, now } => {
+                let t = api.post(&format!("/tasks/{id}/pause"), json!({"now": now})).await?;
+                println!("task #{id} {}", t["status"].as_str().unwrap_or("pausing"));
+            }
+            TaskCmd::Resume { id } => {
+                let t = api.post(&format!("/tasks/{id}/resume"), json!({})).await?;
+                println!("task #{id} {}", if t["status"] == "queued" { "back in the queue" } else { "resuming" });
             }
             TaskCmd::Cancel { id } => {
                 api.post(&format!("/tasks/{id}/cancel"), json!({})).await?;

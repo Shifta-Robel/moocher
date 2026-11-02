@@ -156,6 +156,9 @@ pub enum NodeCommand {
     Registry {
         buckets: Vec<crate::model::RegistryBucket>,
         yields: Vec<crate::model::KeyYield>,
+        /// Sessions above or below normal urgency: who goes first at a rate limit.
+        #[serde(default)]
+        levels: std::collections::BTreeMap<String, u8>,
     },
     /// Encrypt a lendable key for `to` (the hub only passes the result on).
     LendKey { provider: String, key_id: String, to: String, public_key: String },
@@ -227,6 +230,8 @@ pub enum NodeCommand {
     Restart { session: String, prompt: String },
     /// Interrupt, harvest, and stop the container but keep it (state `halted`).
     Halt { session: String },
+    /// New model calls of this session wait (a task is pausing), or go on again.
+    Hold { session: String, hold: bool },
     /// Harvest a stopped/dead instance whose volumes are still here.
     Harvest { session: String, trigger: String },
     /// "Open in OpenCode": open a Tunnel RPC with `Accept { id }` and serve

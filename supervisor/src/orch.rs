@@ -349,6 +349,7 @@ impl Sup {
             started_at: None,
             finished_at: None,
             question_mode: c.question_mode,
+            pause: None,
         };
         self.db.insert_task(&mut t)?;
         let _ = self.stream.send(StreamEvent::Task(t.clone()));
@@ -401,8 +402,8 @@ impl Sup {
 
     pub async fn delete_task(&self, actor: &Actor, id: i64) -> Result<()> {
         let t = self.db.task(id).ok_or_else(|| anyhow!("no task {id}"))?;
-        if t.status == TaskStatus::Running {
-            bail!("task {id} is running; cancel it first");
+        if matches!(t.status, TaskStatus::Running | TaskStatus::Pausing | TaskStatus::Paused) {
+            bail!("task {id} is {}; cancel it first", t.status.as_str());
         }
         self.db.delete_task(id)?;
         self.audit(actor, "task.delete", &id.to_string(), json!({"title": t.title}), true);
@@ -501,6 +502,7 @@ impl Sup {
             let _ = self.db.put_halt(&h);
         }
         t.status = status;
+        t.pause = None;
         t.result = Some(result);
         t.finished_at = Some(now_ms());
         t.updated_at = now_ms();
@@ -574,7 +576,7 @@ impl Sup {
             }
         }
         // Short of room for right_now work: nothing lower starts.
-        let starved = self.db.tasks().iter().any(|t| t.label == TaskLabel::RightNow && t.status == TaskStatus::Queued) || self.queued_spawns().iter().any(|q| q.urgency == TaskLabel::RightNow);
+        let starved = self.db.tasks().iter().any(|t| t.label == TaskLabel::RightNow && t.status == TaskStatus::Queued) || self.right_now_queued();
         if starved {
             *idle_since = None;
             return;

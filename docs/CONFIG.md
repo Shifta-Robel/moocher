@@ -74,6 +74,7 @@ Complete examples for a hub, a remote worker and a relay are in [`examples/remot
 | `tasks.coordinator_node` | any | Pin coordinators to a node. |
 | `tasks.max_concurrent_tasks` | `2` | Running tasks at once (+1 reserved for `urgent`; `right_now` ignores it). |
 | `tasks.coordinator_agent_right_now` | `coordinator_agent` | Coordinator for `right_now` tasks, e.g. a stronger model. |
+| `tasks.pause_grace_secs` | `120` | How long a paused task's agents get to reach their next model call before they are cut off |
 | `tasks.preempt_operator_sessions` | `false` | `right_now` work may also pause sessions started by hand. |
 | `tasks.idle_grace_secs` | `30` | How long the cluster must be idle before a `when_free` task starts. |
 | `tasks.max_nudges` | `2` | Re-prompts for a coordinator that stops without finishing. |
@@ -192,6 +193,32 @@ The figures above are placeholders: take them from your provider's price list. A
 - **`opencode-free`** (`api: opencode`): OpenCode Zen's free models (`big-pickle`, `*-free`) through OpenCode's own built-in provider, with no key. OpenCode calls opencode.ai itself, so this traffic skips the keyproxy: no quota tracking, budgets or `max_tokens` enforcement there (token counts still come from OpenCode). The agent needs `container: { egress: allowlist, allow_hosts: [opencode.ai] }`.
 
 An entry with the same id overrides a built-in.
+
+#### Request rates and per-model limits — `quota.rate`, `quota.models`
+
+```yaml
+providers:
+  my-provider:
+    quota:
+      scope: key
+      limits:                       # shared by all models
+        - { kind: tokens, max: 20000000, window: 30d }
+      rate: { rps: 10, rpm: 300 }   # shared by all models
+      models:
+        big-model:                  # added to the shared settings, not replacing them
+          rate: { rps: 2, rpm: 60 }
+          limits:
+            - { kind: requests, max: 500, window: 1d }
+            - { kind: tokens, max: 1000000, window: 1d }
+```
+
+A call has to fit both the shared settings and its model's, per key, IP or account as `scope:` says.
+
+- **`rate`:** a call above the rate waits in the keyproxy, the most urgent session first, and the session is not parked. A wait over 2 s moves the call to another key if one has room. After 90 s the call goes back to OpenCode as rate limited, and it retries.
+- **`models.<m>.limits`:** the same `limits` as above, in the model's own bucket. When one is used up, that model parks or fails over and other models carry on. In `moo quota` these buckets show as `<scope id>|<model>`.
+- **Listing a model** (even as `big-model: {}`) also keeps its 429s and rate-limit headers to itself. A key-wide limit then costs one extra 429 per model. An unlisted model's 429 stops the whole key until it resets.
+- **Several nodes:** rates are counted per node, so each node on a key gets the whole rate. Set them lower if nodes share a key; the provider's 429s catch the rest.
+- **Token limits** are counted after a call finishes, so a short window can overshoot a little.
 
 ### Key pools — `keys:`
 

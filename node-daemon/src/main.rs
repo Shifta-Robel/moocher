@@ -11,6 +11,7 @@ mod gitops;
 mod link;
 mod manager;
 mod oneshot;
+mod pace;
 mod pool;
 mod obs;
 mod oc;
@@ -201,7 +202,7 @@ async fn run(dir: PathBuf) -> Result<()> {
     let obs = obs::Observer::new(&node_name, store.clone());
     let units = Arc::new(units::Units::new(&node_name, store.clone()));
     let pool = Arc::new(pool::Pool::default());
-    let deps = gateway::GatewayDeps { pool: pool.clone(), cfg: cfg.clone(), link: link.clone(), egress: egress.clone(), quotas: quotas.clone(), units: units.clone(), files, obs: obs.clone() };
+    let deps = gateway::GatewayDeps { pacer: Default::default(), pool: pool.clone(), cfg: cfg.clone(), link: link.clone(), egress: egress.clone(), quotas: quotas.clone(), units: units.clone(), files, obs: obs.clone() };
     let mgr = manager::Manager::new(cfg.clone(), store, rt, link.clone(), deps)?;
     tracing::info!(node = %node_name, supervisor = %supervisor, data = %mgr.data_root().display(), "starting");
 
@@ -289,7 +290,7 @@ async fn run(dir: PathBuf) -> Result<()> {
                 let (a, b) = (quotas.flush(), units.flush());
                 if a || b {
                     let s = cfg.get();
-                    let limits = s.providers.iter().map(|(k, p)| (k.clone(), quota::spec_for(p).limits)).collect();
+                    let limits = quota::limits_by_bucket(&s.providers);
                     let specs = s.providers.iter().map(|(k, p)| (k.clone(), quota::spec_for(p).units)).collect();
                     let mut buckets = quotas.snapshot(&limits, &s.overrides.quotas);
                     buckets.extend(units.snapshot(&specs));

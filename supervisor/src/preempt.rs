@@ -123,16 +123,21 @@ impl Sup {
         res
     }
 
+    /// Is a `right_now` spawn waiting? Not one from a paused task: it can wait.
+    pub fn right_now_queued(&self) -> bool {
+        self.queued_spawns().iter().any(|q| q.urgency == TaskLabel::RightNow && self.db.session(&q.from).is_none_or(|s| s.task_paused.is_none()))
+    }
+
     /// Is `right_now` work still around? Then nothing lower starts or resumes.
     pub fn right_now_active(&self) -> bool {
         self.db.tasks().iter().any(|t| t.label == TaskLabel::RightNow && t.status == TaskStatus::Queued)
-            || self.queued_spawns().iter().any(|q| q.urgency == TaskLabel::RightNow)
+            || self.right_now_queued()
             || self.db.sessions(false).iter().any(|s| s.report.state.is_live() && self.urgency_of(s) == TaskLabel::RightNow)
     }
 
     /// Bring back what was paused, most urgent first, where there is room.
     pub async fn resume_preempted(&self) {
-        let mut paused: Vec<SessionInfo> = self.db.sessions(false).into_iter().filter(|s| s.preempted.is_some() && s.report.state == SessionState::Halted).collect();
+        let mut paused: Vec<SessionInfo> = self.db.sessions(false).into_iter().filter(|s| s.preempted.is_some() && s.report.state == SessionState::Halted && !self.task_is_paused(s)).collect();
         if paused.is_empty() || self.right_now_active() {
             return;
         }

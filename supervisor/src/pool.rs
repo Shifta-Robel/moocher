@@ -30,7 +30,7 @@ pub struct PoolState {
     uses: HashMap<String, Vec<KeyUse>>,
     /// (provider, scope id) -> the right_now session that hit its limit.
     pressure: BTreeMap<(String, String), String>,
-    sent: HashMap<String, (Vec<RegistryBucket>, Vec<KeyYield>, Ts)>,
+    sent: HashMap<String, (Vec<RegistryBucket>, Vec<KeyYield>, BTreeMap<String, u8>, Ts)>,
 }
 
 impl Sup {
@@ -95,20 +95,21 @@ impl Sup {
         let now = now_ms();
         let views = self.quota_views();
         let yields = self.yields();
+        let levels: BTreeMap<String, u8> = self.db.sessions(false).iter().filter(|s| s.report.state.is_live()).map(|s| (s.report.id.clone(), self.urgency_of(s).level())).filter(|(_, l)| *l != TaskLabel::Normal.level()).collect();
         for n in self.node_views().into_iter().filter(|n| n.connected && !n.relay) {
             let buckets = self.registry_for(&n.name, &views);
             {
                 let mut p = self.pool.lock().unwrap();
-                if p.sent.get(&n.name).is_some_and(|(b, y, at)| *b == buckets && *y == yields && now - at < RESEND_MS) {
+                if p.sent.get(&n.name).is_some_and(|(b, y, l, at)| *b == buckets && *y == yields && *l == levels && now - at < RESEND_MS) {
                     continue;
                 }
-                p.sent.insert(n.name.clone(), (buckets.clone(), yields.clone(), now));
+                p.sent.insert(n.name.clone(), (buckets.clone(), yields.clone(), levels.clone(), now));
             }
             let live = yields.iter().cloned().map(|mut y| {
                 y.expires_at = now + YIELD_TTL_MS;
                 y
             });
-            let cmd = NodeCommand::Registry { buckets, yields: live.collect() };
+            let cmd = NodeCommand::Registry { buckets, yields: live.collect(), levels: levels.clone() };
             if let Err(e) = self.nodes.call(&n.name, cmd, REGISTRY_TIMEOUT).await {
                 tracing::debug!(node = %n.name, error = %format!("{e:#}"), "registry not delivered");
                 self.pool.lock().unwrap().sent.remove(&n.name);

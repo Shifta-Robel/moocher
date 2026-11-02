@@ -17,7 +17,7 @@ const LABELS = [
 ] as const;
 
 function statusTone(s: string) {
-  return ({ running: "emerald", done: "slate", failed: "red", cancelled: "slate", halted: "orange", queued: "sky" } as const)[s as "running"] ?? "slate";
+  return ({ running: "emerald", done: "slate", failed: "red", cancelled: "slate", halted: "orange", queued: "sky", pausing: "orange", paused: "orange" } as const)[s as "running"] ?? "slate";
 }
 
 export default function Tasks() {
@@ -120,6 +120,35 @@ export default function Tasks() {
           </For>
         </div>
       </Show>
+      <Show when={state.tasks.some((t) => t.status === "pausing" || t.status === "paused")}>
+        <h2 class="mb-2 font-semibold">Paused</h2>
+        <div class="mb-6 grid gap-3 md:grid-cols-2">
+          <For each={state.tasks.filter((t) => t.status === "pausing" || t.status === "paused")}>
+            {(t) => (
+              <Card class="min-w-0 p-3">
+                <div class="flex items-start justify-between gap-2">
+                  <div class="min-w-0">
+                    <div class="font-medium break-words">#{t.id} {t.title}</div>
+                    <div class="text-xs text-slate-500">
+                      <Pill tone={statusTone(t.status)}>{t.pause?.resuming ? "resuming" : t.status}</Pill> {t.pause ? `${ago(t.pause.at)} ago by ${t.pause.by}` : ""}
+                      {" · "}{state.sessions.filter((s) => s.task_id === t.id && s.task_paused).length} agents
+                    </div>
+                  </div>
+                  <div class="flex shrink-0 gap-1">
+                    <Show when={t.status === "pausing" && !t.pause?.now && !t.pause?.resuming}>
+                      <Button size="sm" variant="ghost" onClick={() => confirm(`Cut off task #${t.id}'s agents now?`) && act(() => post(`/tasks/${t.id}/pause`, { now: true }), "Stopping now")}>Stop now</Button>
+                    </Show>
+                    <Show when={!t.pause?.resuming}>
+                      <Button size="sm" variant="ghost" onClick={() => act(() => post(`/tasks/${t.id}/resume`), "Resuming")}>Resume</Button>
+                    </Show>
+                    <Button size="sm" variant="ghost" onClick={() => confirm(`Cancel task #${t.id}?`) && act(() => post(`/tasks/${t.id}/cancel`), "Cancelled")}>Cancel</Button>
+                  </div>
+                </div>
+              </Card>
+            )}
+          </For>
+        </div>
+      </Show>
       <Show when={state.tasks.some((t) => t.status === "running")}>
         <h2 class="mb-2 font-semibold">Running</h2>
         <div class="mb-6 grid gap-3 md:grid-cols-2">
@@ -131,9 +160,12 @@ export default function Tasks() {
                     <div class="font-medium break-words">#{t.id} {t.title}</div>
                     <div class="text-xs text-slate-500">started {ago(t.started_at ?? t.created_at)} ago</div>
                   </div>
-                  <Button size="sm" variant="ghost" onClick={() => confirm(`Cancel task #${t.id}?`) && act(() => post(`/tasks/${t.id}/cancel`), "Cancelled")}>
-                    Cancel
-                  </Button>
+                  <div class="flex shrink-0 gap-1">
+                    <Button size="sm" variant="ghost" onClick={() => act(() => post(`/tasks/${t.id}/pause`, {}), "Pausing")}>Pause</Button>
+                    <Button size="sm" variant="ghost" onClick={() => confirm(`Cancel task #${t.id}?`) && act(() => post(`/tasks/${t.id}/cancel`), "Cancelled")}>
+                      Cancel
+                    </Button>
+                  </div>
                 </div>
                 <Show when={t.coordinator_session}>
                   <A href={`/instances/${t.coordinator_session}`} class="text-xs text-indigo-600 underline dark:text-indigo-400">coordinator {t.coordinator_session}</A>

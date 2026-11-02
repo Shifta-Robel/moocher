@@ -268,7 +268,13 @@ impl Runtime {
     }
 
     fn launch_process(&self, s: &LaunchSpec<'_>) -> Result<()> {
+        // The config OpenCode keeps names this port, across a node restart too.
+        let port_file = s.paths.etc.join("gateway-port");
+        if let Some(kept) = std::fs::read_to_string(&port_file).ok().and_then(|v| v.trim().parse::<u16>().ok()) {
+            self.procs.lock().unwrap().entry(s.id.to_string()).or_insert((0, kept));
+        }
         let gw = self.gateway_port(s.id)?;
+        std::fs::write(&port_file, gw.to_string())?;
         let oc = free_port()?;
         let p = s.paths;
         let log = std::fs::File::create(p.home.join("opencode.log"))?;

@@ -21,6 +21,7 @@ mod resources;
 mod state;
 mod templates;
 mod retention;
+mod pause;
 mod pool;
 mod preempt;
 mod spawnq;
@@ -371,6 +372,7 @@ async fn run(dir: PathBuf, cfg: SupervisorConfig) -> Result<()> {
             let mut iv = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
                 iv.tick().await;
+                sup.pause_tick();
                 sup.schedule(&mut idle_since).await;
                 sup.resume_preempted().await;
             }

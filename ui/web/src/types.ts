@@ -13,7 +13,7 @@ export interface Session {
   context_tokens?: number; dead_reason?: string | null; turns?: number;
   title?: string | null; task_id?: number | null; parent?: string | null; run_id?: string | null; step?: string | null;
   verdict?: string | null; role?: string; placement?: string | null; waiting_on?: string[]; deaths?: number;
-  urgency?: string | null; preempted?: { by: string; at: number } | null; held?: number;
+  urgency?: string | null; preempted?: { by: string; at: number } | null; task_paused?: { at: number; cut_off: boolean } | null; held?: number;
   replaces?: string | null; prompt?: string | null; attached_by?: string | null; attached_until?: number | null;
 }
 
@@ -33,9 +33,10 @@ export interface NodeInfo {
 
 export interface Task {
   id: number; title: string; body: string; label: "right_now" | "urgent" | "normal" | "when_free" | "on_demand"; rank: number;
-  status: "queued" | "running" | "done" | "failed" | "cancelled" | "halted"; tags: string[];
+  status: "queued" | "running" | "done" | "failed" | "cancelled" | "halted" | "pausing" | "paused"; tags: string[];
   coordinator_session?: string | null; result?: string | null; notes: string[]; created_at: number;
   started_at?: number | null; finished_at?: number | null; question_mode?: string | null;
+  pause?: { at: number; by: string; now: boolean; deadline: number; was_queued: boolean; resuming: boolean } | null;
 }
 
 export interface Overview { nodes: NodeInfo[]; sessions: Session[]; tasks: Task[]; totals: Tokens }

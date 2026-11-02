@@ -503,7 +503,9 @@ impl Sup {
     pub async fn question_tick(self: &Arc<Self>) {
         let timeout = self.cfg.questions.answer_timeout_secs as i64 * 1000;
         for q in self.db.questions(true) {
-            let asker_live = self.db.session(&q.asker).is_some_and(|s| s.report.state.is_live());
+            // A paused agent keeps its questions; nobody runs out of time meanwhile.
+            let paused = |id: &str| self.db.session(id).is_some_and(|s| s.preempted.is_some() || s.task_paused.is_some());
+            let asker_live = self.db.session(&q.asker).is_some_and(|s| s.report.state.is_live()) || paused(&q.asker);
             if !asker_live {
                 let mut q = q;
                 q.status = QuestionStatus::Cancelled;
@@ -516,6 +518,9 @@ impl Sup {
                 continue;
             }
             let holder_live = self.db.session(&q.holder).is_some_and(|s| s.report.state.is_live());
+            if paused(&q.holder) {
+                continue;
+            }
             if q.holder == q.asker && holder_live {
                 continue;
             }

@@ -1092,6 +1092,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             question_mode: None,
+            pause: None,
         };
         for (t, r, s) in [("b", 2.0, TaskStatus::Queued), ("done", 0.5, TaskStatus::Done), ("a", 1.0, TaskStatus::Queued), ("run", 9.0, TaskStatus::Running)] {
             db.insert_task(&mut mk(t, r, s)).unwrap();

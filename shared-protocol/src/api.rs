@@ -171,7 +171,8 @@ impl QuotaView {
     pub fn gates(&self, model: &str) -> bool {
         match &self.unit {
             Some(u) => u.model.as_deref().is_none_or(|m| m == model),
-            None => self.kind == "requests",
+            // `<scope id>|<model>` is one model's own allowance (`quota.models`).
+            None => self.kind == "requests" && self.scope_id.split_once('|').is_none_or(|(_, m)| m == model),
         }
     }
 }

@@ -17,7 +17,7 @@ interface Placed { s: Session; x: number; y: number }
 interface Edge { from: Placed; to: Placed; replaced: boolean }
 interface Group { key: string; title: string; href?: string; label?: string; status?: string; sessions: Session[] }
 
-const away = (s: Session) => isLive(s) || !!s.preempted || s.state === "halted";
+const away = (s: Session) => isLive(s) || !!s.preempted || !!s.task_paused || s.state === "halted";
 
 /** Children to the right of their parent, each subtree on its own rows. */
 export function layout(sessions: Session[]) {
@@ -74,8 +74,8 @@ function Node(p: { at: Placed }) {
           <span class="truncate font-mono text-[11px] text-slate-600 dark:text-slate-300" title={`model ${s().model ?? "unknown"}`}>{s().model ?? "—"}</span>
         </div>
         <div class="min-h-0 flex-1 truncate text-slate-600 dark:text-slate-400" title={s().current_task || s().error || ""}>
-          <Show when={s().preempted} fallback={s().error || s().current_task || " "}>
-            paused for {s().preempted!.by}
+          <Show when={s().preempted || s().task_paused} fallback={s().error || s().current_task || " "}>
+            paused for {s().preempted?.by ?? "its task"}
           </Show>
         </div>
         <div class="flex items-center gap-2 text-[11px] text-slate-500">

@@ -31,6 +31,9 @@ pub struct Sup {
     pub orch_lock: tokio::sync::Mutex<()>,
     /// One delivery of held messages at a time, so they stay in order.
     pub held_lock: tokio::sync::Mutex<()>,
+    /// Tasks being worked on by the pause tick, and sessions with a call held.
+    pub pause_busy: std::sync::Mutex<std::collections::HashSet<i64>>,
+    pub pause_holding: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Key pools and who gives way (pool.rs).
     pub pool: std::sync::Mutex<crate::pool::PoolState>,
     /// Cluster CA (set at start when remote nodes are enabled).
@@ -115,6 +118,8 @@ impl Sup {
             stream,
             orch_lock: tokio::sync::Mutex::new(()),
             held_lock: Default::default(),
+            pause_busy: Default::default(),
+            pause_holding: Default::default(),
             pool: Default::default(),
             ca: std::sync::OnceLock::new(),
             rejections: Default::default(),
@@ -196,6 +201,7 @@ impl Sup {
                 attached_until: None,
                 urgency: None,
                 preempted: None,
+            task_paused: None,
                 overrides: Default::default(),
                 held: 0,
             },
@@ -299,6 +305,7 @@ impl Sup {
             attached_until: None,
             urgency: o.urgency,
             preempted: None,
+            task_paused: None,
             overrides: o.overrides.clone(),
             held: 0,
         };
@@ -456,6 +463,9 @@ impl Sup {
                 self.log("node.agents", Some(node), None, json!({}));
             }
             NodeEvent::Activity { session, kind, detail } if kind == "quota.pressure" => self.on_pressure(&session, &detail),
+            NodeEvent::Activity { session, kind, .. } if kind == "session.holding" => {
+                self.pause_holding.lock().unwrap().insert(session);
+            }
             NodeEvent::Pool { keys, in_use } => self.pool_report(node, keys, in_use),
             NodeEvent::Activity { session, kind, detail } => {
                 let who = self.db.session(&session).map(|s| format!("{} ({session})", s.report.agent)).unwrap_or(session.clone());
@@ -870,7 +880,7 @@ pub fn session_brief(s: &SessionInfo) -> Value {
         "cost_usd": s.report.billed().cost_usd,
         "parent": s.parent,
         "waiting_on": s.waiting_on,
-        "paused_for": s.preempted.as_ref().map(|p| &p.by),
+        "paused_for": s.preempted.as_ref().map(|p| p.by.clone()).or_else(|| s.task_paused.as_ref().map(|_| "its task being paused".to_string())),
         "held_messages": s.held,
     })
 }

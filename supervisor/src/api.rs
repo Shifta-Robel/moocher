@@ -150,6 +150,8 @@ pub fn router(sup: Arc<Sup>) -> Router {
         .route("/tasks/{id}", get(task).patch(patch_task).delete(delete_task))
         .route("/tasks/{id}/run", post(run_task))
         .route("/tasks/{id}/cancel", post(cancel_task))
+        .route("/tasks/{id}/pause", post(pause_task))
+        .route("/tasks/{id}/resume", post(resume_task))
         .route("/workflows", get(workflows))
         .route("/workflows/{name}/run", post(run_workflow))
         .route("/runs", get(runs))
@@ -422,6 +424,22 @@ async fn run_task(State(sup): S, Extension(c): Extension<Caller>, Path(id): Path
 async fn cancel_task(State(sup): S, Extension(c): Extension<Caller>, Path(id): Path<i64>) -> R<Task> {
     c.need(Scope::Operate)?;
     Ok(Json(sup.cancel_task(&c.actor(), id).await?))
+}
+
+#[derive(Deserialize, Default)]
+struct PauseReq {
+    #[serde(default)]
+    now: bool,
+}
+
+async fn pause_task(State(sup): S, Extension(c): Extension<Caller>, Path(id): Path<i64>, Json(r): Json<PauseReq>) -> R<Task> {
+    c.need(Scope::Operate)?;
+    Ok(Json(sup.pause_task(&c.actor(), id, r.now).await?))
+}
+
+async fn resume_task(State(sup): S, Extension(c): Extension<Caller>, Path(id): Path<i64>) -> R<Task> {
+    c.need(Scope::Operate)?;
+    Ok(Json(sup.resume_task(&c.actor(), id).await?))
 }
 
 async fn workflows(State(sup): S) -> Json<Value> {

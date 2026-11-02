@@ -184,8 +184,8 @@ impl Manager {
     pub async fn handle(self: &Arc<Self>, cmd: NodeCommand) -> Result<Value> {
         match cmd {
             NodeCommand::Spawn(spec) => self.spawn(spec).await,
-            NodeCommand::Registry { buckets, yields } => {
-                self.gw.pool.apply(buckets, yields);
+            NodeCommand::Registry { buckets, yields, levels } => {
+                self.gw.pool.apply(buckets, yields, levels);
                 Ok(serde_json::Value::Null)
             }
             NodeCommand::LendKey { provider, key_id, to, public_key } => crate::pool::lend(&self.cfg.get(), &provider, &key_id, &to, &public_key),
@@ -245,6 +245,11 @@ impl Manager {
             NodeCommand::Halt { session } => {
                 self.halt(&session).await?;
                 Ok(json!({"ok": true}))
+            }
+            NodeCommand::Hold { session, hold } => {
+                let inst = self.get(&session)?;
+                let gw = inst.gateway.lock().unwrap().clone().ok_or_else(|| anyhow!("session {session} is not up yet"))?;
+                Ok(json!({"holding": gw.set_hold(hold)}))
             }
             NodeCommand::OpenAttach { id, session, cookie_sha256, expires_at } => {
                 let inst = self.get(&session)?;

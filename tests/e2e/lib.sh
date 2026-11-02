@@ -84,6 +84,7 @@ link_listen: 127.0.0.1:${LINK_PORT:-7443}
 public_names: [localhost, 127.0.0.1]
 ${ENROLL_YAML:-}
 EOF
+  [ -n "${TASKS_YAML:-}" ] && sed -i "/^tasks:/a\\  $TASKS_YAML" "$W/hub/supervisor.yaml"
   export MOCK_API_KEY="mock-key-$RANDOM$RANDOM"
   # shellcheck disable=SC2086
   python3 -I "$REPO/examples/mock-llm/mock_llm.py" --port 8099 --scripts "$W/scripts" --require-key "$MOCK_API_KEY" ${MOCK_ARGS:-} > "$W/mock.log" 2>&1 &

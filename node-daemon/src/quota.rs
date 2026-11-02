@@ -71,9 +71,29 @@ pub struct Target {
     pub scope_id: String,
 }
 
+impl Target {
+    /// The same allowance as seen by one model (`quota.models`): its own buckets.
+    pub fn for_model(&self, model: &str) -> Target {
+        Target { scope_id: format!("{}|{model}", self.scope_id), ..self.clone() }
+    }
+}
+
+/// Configured limits by provider, and by `provider|model` for model buckets.
+pub fn limits_by_bucket(providers: &BTreeMap<String, ProviderDef>) -> BTreeMap<String, Vec<QuotaLimit>> {
+    let mut out = BTreeMap::new();
+    for (name, p) in providers {
+        let spec = spec_for(p);
+        for (m, q) in &spec.models {
+            out.insert(format!("{name}|{m}"), q.limits.clone());
+        }
+        out.insert(name.clone(), spec.limits);
+    }
+    out
+}
+
 /// Effective quota settings for a provider.
 pub fn spec_for(p: &ProviderDef) -> QuotaSpec {
-    p.quota.clone().unwrap_or(QuotaSpec { scope: None, limits: vec![], learn: vec![QuotaLearn::Headers, QuotaLearn::Http429], units: Default::default() })
+    p.quota.clone().unwrap_or(QuotaSpec { scope: None, limits: vec![], learn: vec![QuotaLearn::Headers, QuotaLearn::Http429], units: Default::default(), rate: None, models: Default::default() })
 }
 
 pub fn default_scope(p: &ProviderDef, has_key: bool) -> QuotaScope {
@@ -389,7 +409,11 @@ impl Quotas {
         let m = self.buckets.lock().unwrap();
         let mut out = vec![];
         for ((provider, scope_id, kind), b) in m.iter() {
-            let limits: Vec<&QuotaLimit> = provider_limits.get(provider).map(|v| v.iter().filter(|l| l.kind == *kind).collect()).unwrap_or_default();
+            let limits_of = match scope_id.split_once('|') {
+                Some((_, model)) => provider_limits.get(&format!("{provider}|{model}")),
+                None => provider_limits.get(provider),
+            };
+            let limits: Vec<&QuotaLimit> = limits_of.map(|v| v.iter().filter(|l| l.kind == *kind).collect()).unwrap_or_default();
             let mut q = QuotaBucket {
                 provider: provider.clone(),
                 scope: b.scope.clone(),

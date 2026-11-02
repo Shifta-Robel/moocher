@@ -414,6 +414,14 @@ moocher/
 | UI | SolidJS + Tailwind + Kobalte, dark/light, colour+icon status encoding, Open in OpenCode on a second port of your domain, notifications incl. Web Push, password login on your domain | 4 |
 | Containers | Live CPU/RAM/pids/disk per instance, soft or hard disk limits | 2 ✔ soft · 5 hard |
 
+## Task pause
+
+`supervisor/src/pause.rs` moves tasks through `running`, `pausing` and `paused` on a 2 s tick. Sessions are marked `task_paused` first, so their messages are held from then on. `NodeCommand::Hold` makes the keyproxy hold new model calls; the `session.holding` event, or the reply to `Hold`, tells the hub to halt the session cleanly. `task_paused` and `preempted` are separate reasons, and a session restarts only when neither applies. The hold lives in the session's gateway, so a restart clears it.
+
+## Request rates and model buckets
+
+`node-daemon/src/pace.rs` queues calls above a rate, most urgent first, with urgency from the registry (`levels`). It counts per node. Model limits use the normal quota buckets with `<scope id>|<model>` as the scope id, so storage, reports and the registry need no special handling; a model's exhausted bucket reaches other nodes that way too.
+
 ## Key pools and the registry
 
 Keyproxy tries key and route pairs in turn (`node-daemon/src/gateway.rs`, `pool.rs`). The hub's registry (`supervisor/src/pool.rs`) holds each node's keys, who uses what, and the merged allowances, and sends each node its view every few seconds. Choosing stays on the node, so calls keep working while the hub is away; the view can only lag, so counts can still overshoot a little.
